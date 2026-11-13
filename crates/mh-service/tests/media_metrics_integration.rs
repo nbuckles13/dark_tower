@@ -126,9 +126,9 @@ async fn a_forwarded_frame_increments_forwarded_and_leaves_every_drop_counter_fl
 /// may depend on how fast a machine is.
 #[tokio::test]
 async fn latency_is_observed_per_phase_with_the_catalogued_labels() {
-    // One snapshot per phase, deliberately: histogram assertions DRAIN the
-    // captured entries, so asserting two phases against one snapshot would
-    // read the second as unobserved for reasons unrelated to the code.
+    // One snapshot per phase, deliberately: each phase is its own window
+    // (a histogram query drains its own name+labels, so re-querying a phase
+    // in one snapshot would read 0).
     for phase in [
         MediaLatencyPhase::ReceiveBuffer,
         MediaLatencyPhase::Processing,

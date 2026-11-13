@@ -11,6 +11,13 @@
 //! it is NEVER read by routing, edges, slots or placement. Its consumers are
 //! the client-loss evidence (story 4 MC-E) and the credential re-push below.
 //!
+//! # Loss receipt time (story 4 MC-E)
+//!
+//! Each entry carries `loss_since`: the MC RECEIPT instant (the meeting
+//! actor's clock at intake, never any client field) of the first report of
+//! the current loss run. DISCONNECTED -> FAILED keeps it; CONNECTED clears
+//! it. The required loss metric's lead time reads it.
+//!
 //! # Resolution
 //!
 //! A report's ref is resolved by EXACT match against the meeting's CURRENT
@@ -54,6 +61,14 @@ pub enum ReportedState {
     Disconnected,
 }
 
+impl ReportedState {
+    /// Whether the client reports losing the handler.
+    #[must_use]
+    pub const fn is_loss(self) -> bool {
+        matches!(self, Self::Failed | Self::Disconnected)
+    }
+}
+
 /// One client report for one ref, as the connection forwards it. No
 /// client-controlled strings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +88,9 @@ pub struct LatestReport {
     pub state: ReportedState,
     /// The set version the client held (correlation only).
     pub handler_set_version: u64,
+    /// MC receipt of the first report of the current loss run; `None` unless
+    /// `state` is a loss.
+    pub loss_since: Option<tokio::time::Instant>,
 }
 
 /// What a batch of reports did.
@@ -115,14 +133,17 @@ impl ClientHandlerStatuses {
     /// Record a batch from `participant` (the connection's own identity).
     ///
     /// `in_set` is the exact-match membership test against the current set.
-    /// `now` drives the re-push limiter.
+    /// `now` is MC's receipt instant: it stamps `loss_since` and drives the
+    /// re-push limiter.
     pub fn intake(
         &mut self,
         participant: &str,
         reports: &[ClientHandlerReport],
         in_set: impl Fn(NonZeroU32) -> bool,
-        now: std::time::Instant,
+        received: tokio::time::Instant,
     ) -> Intake {
+        // The ONE tokio -> std conversion: the limiter keeps std time.
+        let now = received.into_std();
         let entry = self
             .by_participant
             .entry(participant.to_string())
@@ -142,11 +163,19 @@ impl ClientHandlerStatuses {
                 intake.ignored += 1;
                 continue;
             }
+            let loss_since = report.state.is_loss().then(|| {
+                entry
+                    .latest
+                    .get(&report.handler_ref)
+                    .and_then(|prev| prev.loss_since)
+                    .unwrap_or(received)
+            });
             entry.latest.insert(
                 report.handler_ref,
                 LatestReport {
                     state: report.state,
                     handler_set_version: report.handler_set_version,
+                    loss_since,
                 },
             );
             intake.recorded += 1;
@@ -182,6 +211,20 @@ impl ClientHandlerStatuses {
         self.by_participant.remove(participant);
     }
 
+    /// When `participant`'s LATEST status for `handler_ref` became a loss (MC
+    /// receipt), or `None` if its latest status is not a loss (or absent).
+    #[must_use]
+    pub fn loss_since(
+        &self,
+        participant: &str,
+        handler_ref: NonZeroU32,
+    ) -> Option<tokio::time::Instant> {
+        self.by_participant
+            .get(participant)
+            .and_then(|p| p.latest.get(&handler_ref))
+            .and_then(|r| r.loss_since)
+    }
+
     /// The latest report per in-set ref for `participant`.
     #[must_use]
     pub fn latest(&self, participant: &str) -> BTreeMap<NonZeroU32, LatestReport> {
@@ -196,7 +239,8 @@ impl ClientHandlerStatuses {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
+    use tokio::time::Instant;
 
     fn r(n: u32) -> NonZeroU32 {
         NonZeroU32::new(n).unwrap()
@@ -290,5 +334,51 @@ mod tests {
 
         s.forget("p1");
         assert!(s.latest("p1").is_empty());
+    }
+
+    /// `loss_since` is MC receipt time of the first report of the loss run:
+    /// DISCONNECTED -> FAILED keeps it, CONNECTED (a redial) clears it, a
+    /// fresh loss restarts it; a stale version on an in-set ref still counts.
+    #[test]
+    fn loss_since_spans_the_loss_run_and_connected_clears_it() {
+        let mut s = ClientHandlerStatuses::default();
+        let t0 = Instant::now();
+        let in_set = |x: NonZeroU32| x.get() == 1;
+        let sec = Duration::from_secs(1);
+        s.intake("p", &[report(1, 1, ReportedState::Connected)], in_set, t0);
+        assert_eq!(s.loss_since("p", r(1)), None);
+        s.intake(
+            "p",
+            &[report(1, 1, ReportedState::Disconnected)],
+            in_set,
+            t0 + sec,
+        );
+        s.intake(
+            "p",
+            &[report(1, 0, ReportedState::Failed)],
+            in_set,
+            t0 + sec * 2,
+        );
+        assert_eq!(
+            s.loss_since("p", r(1)),
+            Some(t0 + sec),
+            "the run's first receipt"
+        );
+        s.intake(
+            "p",
+            &[report(1, 1, ReportedState::Connected)],
+            in_set,
+            t0 + sec * 3,
+        );
+        assert_eq!(s.loss_since("p", r(1)), None, "a redial supersedes");
+        s.intake(
+            "p",
+            &[report(1, 1, ReportedState::Disconnected)],
+            in_set,
+            t0 + sec * 4,
+        );
+        assert_eq!(s.loss_since("p", r(1)), Some(t0 + sec * 4));
+        assert_eq!(s.loss_since("p", r(2)), None);
+        assert_eq!(s.loss_since("q", r(1)), None);
     }
 }

@@ -171,14 +171,17 @@ impl MeetingActor {
             _ if eligible.is_empty() => TargetKind::None,
             _ => TargetKind::Survivor,
         };
+        // Detection for a planned transfer: transfer start -> the cutover
+        // decision (measured before the removal transaction runs).
+        let detection = Instant::now().saturating_duration_since(transfer.started_at);
         let removed = self
-            .remove_handler_for(
-                id.as_str(),
+            .declare_and_remove(
+                id,
                 RemovalTrigger::PlannedTransfer,
                 StartReason::PlannedTransfer,
+                detection,
             )
             .await;
-        let now = Instant::now();
         if !removed {
             error!(
                 target: "mc.actor.meeting",
@@ -195,10 +198,6 @@ impl MeetingActor {
             );
             return;
         }
-        metrics::record_handler_declaration(
-            RemovalTrigger::PlannedTransfer,
-            now.saturating_duration_since(transfer.started_at),
-        );
         let outcome = if !eligible.is_empty() && coverage.is_complete() {
             MigrationOutcome::Completed
         } else {

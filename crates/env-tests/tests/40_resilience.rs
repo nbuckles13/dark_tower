@@ -181,6 +181,15 @@ const MC_DECLARATIONS_HT: &str =
     r#"sum by (instance) (mc_media_handler_declarations_total{trigger="heartbeat_timeout"})"#;
 const MC_DETECTION_COUNT_HT: &str =
     r#"sum by (instance) (mc_media_handler_detection_seconds_count{trigger="heartbeat_timeout"})"#;
+// Story 4 MC-E: the required loss metric. Summed over `reported` (the
+// before/not split depends on whether the clients noticed first — timing,
+// never pinned); A and B are MH-connected to the killed handler, so the SUM
+// rises only if the denominator was non-empty (non-vacuity).
+const MC_LOSS_CLIENTS: &str = "sum by (instance) (mc_media_handler_loss_clients_total)";
+const MC_LOSS_RATIO_COUNT: &str =
+    "sum by (instance) (mc_media_handler_loss_prior_report_ratio_count)";
+const MC_FIRST_DECLARATIONS_HT: &str =
+    r#"sum by (instance) (mc_media_handler_first_declarations_total{trigger="heartbeat_timeout"})"#;
 const GC_SUPERSEDED_BOTH: &str =
     r#"sum by (instance) (gc_mh_registrations_total{outcome="superseded",match="both"})"#;
 const GC_UNKNOWN_HANDLER: &str =
@@ -353,6 +362,29 @@ async fn crash_leg(pool: Arc<MhPool>, prom_url: &str) {
         "the heartbeat_timeout detection observation under test",
     )
     .await;
+    // Story 4 MC-E: the loss metric's observation and the handler-level
+    // first declaration (fleet-wide: rises only, never absolute values).
+    let loss_clients_before = settled_baseline(
+        &prom,
+        MC_LOSS_CLIENTS,
+        BASELINE_SETTLE_BOUND,
+        "the loss-metric clients under test",
+    )
+    .await;
+    let loss_ratio_before = settled_baseline(
+        &prom,
+        MC_LOSS_RATIO_COUNT,
+        BASELINE_SETTLE_BOUND,
+        "the loss-metric observation under test",
+    )
+    .await;
+    let first_declarations_before = settled_baseline(
+        &prom,
+        MC_FIRST_DECLARATIONS_HT,
+        BASELINE_SETTLE_BOUND,
+        "the first declaration under test",
+    )
+    .await;
     let gc_pods = live_gc_pods().await;
     let gc_names_before = gc_pods.names();
     let superseded_before = sum_over_pods(
@@ -461,6 +493,31 @@ async fn crash_leg(pool: Arc<MhPool>, prom_url: &str) {
         MC_DETECTION_COUNT_HT,
         &detections_before,
         "CRASH (detection-observed)",
+    )
+    .await;
+    // Story 4 MC-E (R-33): the required loss metric observed the declaration
+    // — the clients SUM (non-empty denominator: A and B were MH-connected to
+    // the killed handler) and the ratio count — and the handler-level first
+    // declaration counted.
+    rose(
+        &prom,
+        MC_LOSS_CLIENTS,
+        &loss_clients_before,
+        "CRASH (loss-metric clients counted)",
+    )
+    .await;
+    rose(
+        &prom,
+        MC_LOSS_RATIO_COUNT,
+        &loss_ratio_before,
+        "CRASH (loss-metric ratio observed)",
+    )
+    .await;
+    rose(
+        &prom,
+        MC_FIRST_DECLARATIONS_HT,
+        &first_declarations_before,
+        "CRASH (first declaration counted)",
     )
     .await;
 
@@ -987,12 +1044,16 @@ async fn stranded_leg(pool: Arc<MhPool>, prom_url: &str) {
 // evidence) or as "unchanged" for the negatives, which is sound only because
 // every pool-mutating leg is serialized (module doc).
 //
-// LOSS METRIC (R-33). The required loss metric does not exist yet (story 4
-// MC-E, which adds the real unobserved assertion). Until then, "no loss
-// observation" is proxied by its future snapshot site: no heartbeat_timeout
-// or apply_lag declaration and no detection observation for those triggers
-// across a planned transfer. Its positive arm is the crash leg above, where
-// the same heartbeat_timeout series rises.
+// LOSS METRIC (R-33; story 4 MC-E). A planned transfer produces NO
+// observation on the required loss metric: `mc_media_handler_loss_clients_total`
+// (zero-initialised, so "unchanged" has a presence check, and it moves on
+// every observation with anyone MH-connected — A and B are) does not move
+// across either planned leg. Its positive arm is the crash leg above, where
+// the same series rises. Supporting evidence, kept because it also pins the
+// snapshot SITE: no heartbeat_timeout / apply_lag declaration and no
+// detection observation for those triggers. (The ratio histogram's `_count`
+// is not read with `unchanged`: the crash leg reads it as "rose".) The
+// handler-level `first_declarations_total{trigger="planned_transfer"}` rises.
 
 const MC_PLANNED_COMPLETED: &str = r#"sum by (instance) (mc_media_handler_migrations_total{trigger="planned_transfer",outcome="completed"})"#;
 const MC_PLANNED_TIMED_OUT: &str = r#"sum by (instance) (mc_media_handler_migrations_total{trigger="planned_transfer",outcome="timed_out"})"#;
@@ -1000,6 +1061,8 @@ const MC_DECLARATIONS_PLANNED: &str =
     r#"sum by (instance) (mc_media_handler_declarations_total{trigger="planned_transfer"})"#;
 const MC_DECLARATIONS_LOSS: &str = r#"sum by (instance) (mc_media_handler_declarations_total{trigger=~"heartbeat_timeout|apply_lag"})"#;
 const MC_DETECTION_COUNT_LOSS: &str = r#"sum by (instance) (mc_media_handler_detection_seconds_count{trigger=~"heartbeat_timeout|apply_lag"})"#;
+const MC_FIRST_DECLARATIONS_PLANNED: &str =
+    r#"sum by (instance) (mc_media_handler_first_declarations_total{trigger="planned_transfer"})"#;
 const GC_PLANNED_GRANTED: &str = r#"sum by (instance) (gc_mh_replacement_requests_total{trigger="planned_transfer",outcome="granted"})"#;
 const GC_PLANNED_NO_CAPACITY: &str = r#"sum by (instance) (gc_mh_replacement_requests_total{trigger="planned_transfer",outcome="no_capacity"})"#;
 
@@ -1394,6 +1457,8 @@ struct PlannedBaselines {
     declarations: InstanceCounters,
     loss_declarations: InstanceCounters,
     loss_detections: InstanceCounters,
+    loss_clients: InstanceCounters,
+    first_declarations: InstanceCounters,
     gc_granted_map: InstanceCounters,
     gc_no_capacity_map: InstanceCounters,
 }
@@ -1429,15 +1494,26 @@ impl PlannedBaselines {
                 "the loss detections that must not move",
             )
             .await,
+            loss_clients: settled(
+                MC_LOSS_CLIENTS,
+                "the loss-metric clients that must not move",
+            )
+            .await,
+            first_declarations: settled(
+                MC_FIRST_DECLARATIONS_PLANNED,
+                "the planned first declaration under test",
+            )
+            .await,
             gc_granted_map: settled(GC_PLANNED_GRANTED, "GC's planned grants").await,
             gc_no_capacity_map: settled(GC_PLANNED_NO_CAPACITY, "GC's planned no_capacity").await,
         }
     }
 
-    /// MC's side of a COMPLETED planned transfer: `completed` and the planned
-    /// declaration rose; `timed_out` did not move (the make phase finished
-    /// before the cutover), and nothing was declared lost (the loss-metric
-    /// proxy, see the section doc).
+    /// MC's side of a COMPLETED planned transfer: `completed`, the planned
+    /// declaration and the planned first declaration rose; `timed_out` did
+    /// not move (the make phase finished before the cutover); the required
+    /// loss metric observed nothing and nothing was declared lost (see the
+    /// section doc).
     async fn completed(&self, prom: &PrometheusClient, phase: &str) {
         rose(
             prom,
@@ -1458,6 +1534,20 @@ impl PlannedBaselines {
             MC_PLANNED_TIMED_OUT,
             &self.timed_out,
             &format!("{phase} (timed-out)"),
+        )
+        .await;
+        rose(
+            prom,
+            MC_FIRST_DECLARATIONS_PLANNED,
+            &self.first_declarations,
+            &format!("{phase} (planned-first-declaration)"),
+        )
+        .await;
+        unchanged(
+            prom,
+            MC_LOSS_CLIENTS,
+            &self.loss_clients,
+            &format!("{phase} (no-loss-observation)"),
         )
         .await;
         unchanged(

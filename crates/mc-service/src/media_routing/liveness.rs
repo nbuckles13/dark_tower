@@ -112,6 +112,20 @@ impl HeartbeatTiming {
             .collect()
     }
 
+    /// `mc_media_handler_loss_client_lead_seconds` bucket bounds (story 4
+    /// MC-E), derived from N: N/4, N/2, N, 1.5N, 2N, 3N, 5N (seconds). A
+    /// client sees a dead handler about its QUIC idle timeout (~N) after the
+    /// crash, so the lead is usually under N; a lag-held Impaired is declared
+    /// past L = 2N, so a client may lead it by more than 2N.
+    #[must_use]
+    pub fn loss_lead_histogram_buckets(self) -> Vec<f64> {
+        let n = self.timeout().as_secs_f64();
+        [0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 5.0]
+            .iter()
+            .map(|f| n * f)
+            .collect()
+    }
+
     /// `mc_media_handler_heartbeat_interval_seconds` bucket bounds, derived
     /// from N: N/6, N/3, N/2, 2N/3, N, 1.5N, 2N (seconds). Around the healthy
     /// cadence (N/3), the half-way mark and the deadline.
@@ -666,6 +680,12 @@ mod tests {
         assert!(
             b.iter().any(|x| *x > t.apply_lag_limit().as_secs_f64()),
             "coverage above L"
+        );
+        let lead = t.loss_lead_histogram_buckets();
+        assert_eq!(lead, vec![1.5, 3.0, 6.0, 9.0, 12.0, 18.0, 30.0]);
+        assert!(
+            lead.iter().any(|x| *x > t.apply_lag_limit().as_secs_f64()),
+            "the lead can exceed L"
         );
     }
 

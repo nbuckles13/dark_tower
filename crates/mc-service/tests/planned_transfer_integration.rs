@@ -23,7 +23,6 @@ mod test_common;
 use std::time::Duration;
 
 use ::common::observability::testing::{MetricAssertion, MetricSnapshot};
-use mc_service::actors::MeetingActorHandle;
 use mc_service::media_routing::{HandlerId, MigrationOutcome, RemovalTrigger};
 use proto_gen::dark_tower::internal::v1::ReleaseCause;
 use test_common::replacement_rig::*;
@@ -83,11 +82,24 @@ fn declarations(snap: &MetricSnapshot, trigger: &str) -> u64 {
         .delta()
 }
 
-/// The R-33 proxy until MC-E lands the loss metric (hand-off recorded in the
-/// devloop output): a planned transfer never reaches the Dead/Impaired
-/// declaration site, so neither crash trigger is observed. Histograms drain on
-/// read, so this reads the histogram FIRST.
+/// A planned transfer produces NO observation on the required loss metric
+/// (story 4 MC-E; R-33 — the real assertion that replaced MC-F's proxy) and
+/// never reaches the Dead/Impaired declaration site. Hard form throughout:
+/// the loss counters are zero-initialised. The positive control (a crash in
+/// the same rig observes) is
+/// `handler_loss_metric_integration::a_planned_transfer_never_observes_while_a_crash_in_the_same_rig_does`.
 fn assert_no_crash_declaration(snap: &MetricSnapshot) {
+    for h in [
+        "mc_media_handler_loss_prior_report_ratio",
+        "mc_media_handler_loss_client_lead_seconds",
+    ] {
+        snap.histogram(h).with_labels(&[KC]).assert_unobserved();
+    }
+    for reported in ["before_declaration", "not_reported"] {
+        snap.counter("mc_media_handler_loss_clients_total")
+            .with_labels(&[("reported", reported), KC])
+            .assert_unobserved();
+    }
     for t in ["heartbeat_timeout", "apply_lag"] {
         snap.histogram("mc_media_handler_detection_seconds")
             .with_labels(&[("trigger", t), KC])
@@ -96,10 +108,6 @@ fn assert_no_crash_declaration(snap: &MetricSnapshot) {
             .with_labels(&[("trigger", t), KC])
             .assert_unobserved();
     }
-}
-
-async fn health(meeting: &MeetingActorHandle, h: &str) -> Option<&'static str> {
-    meeting.probe_handler_for_test(h).await.unwrap().health
 }
 
 /// The url lists of every set on `q` since the last read.

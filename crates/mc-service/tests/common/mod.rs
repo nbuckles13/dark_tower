@@ -980,15 +980,39 @@ pub fn heartbeat_timing() -> mc_service::media_routing::HeartbeatTiming {
 /// If `config.env` stops carrying a parseable `MC_MEDIA_DIAL_TOKEN_TTL_SECONDS`.
 #[must_use]
 pub fn media_dial_timing() -> mc_service::media_dial::MediaDialTiming {
-    const CONFIG_ENV: &str = include_str!("../../../../infra/services/mc-service/config.env");
-    let ttl = CONFIG_ENV
+    mc_service::media_dial::MediaDialTiming::from_ttl_seconds(shipped_int(
+        "MC_MEDIA_DIAL_TOKEN_TTL_SECONDS",
+    ))
+}
+
+/// The shipped MC ConfigMap, the ONE copy every fixture reads (MC has no
+/// in-code defaults).
+const CONFIG_ENV: &str = include_str!("../../../../infra/services/mc-service/config.env");
+
+/// `key`'s value AS SHIPPED in `config.env` (trimmed).
+///
+/// # Panics
+///
+/// If `config.env` stops carrying `key`.
+#[must_use]
+pub fn shipped(key: &str) -> &'static str {
+    CONFIG_ENV
         .lines()
-        .find_map(|l| l.trim().strip_prefix("MC_MEDIA_DIAL_TOKEN_TTL_SECONDS="))
-        .expect("config.env carries MC_MEDIA_DIAL_TOKEN_TTL_SECONDS")
+        .find_map(|l| l.trim().strip_prefix(key)?.strip_prefix('='))
+        .unwrap_or_else(|| panic!("config.env carries {key}"))
         .trim()
-        .parse::<u32>()
-        .expect("MC_MEDIA_DIAL_TOKEN_TTL_SECONDS in config.env is an integer");
-    mc_service::media_dial::MediaDialTiming::from_ttl_seconds(ttl)
+}
+
+/// [`shipped`] parsed as an integer.
+///
+/// # Panics
+///
+/// If the key is absent or not an integer.
+#[must_use]
+pub fn shipped_int(key: &str) -> u32 {
+    shipped(key)
+        .parse()
+        .unwrap_or_else(|e| panic!("{key} in config.env is an integer: {e}"))
 }
 
 fn join_media_with(mh_client: Arc<dyn MhRegistrationClient>) -> mc_service::actors::JoinMedia {
@@ -1028,19 +1052,9 @@ pub fn join_media_with_timing(
 /// If `config.env` stops carrying either key as an integer.
 #[must_use]
 pub fn replacement_timing() -> mc_service::media_routing::ReplacementTiming {
-    const CONFIG_ENV: &str = include_str!("../../../../infra/services/mc-service/config.env");
-    let read = |key: &str| -> u32 {
-        CONFIG_ENV
-            .lines()
-            .find_map(|l| l.trim().strip_prefix(key)?.strip_prefix('='))
-            .unwrap_or_else(|| panic!("config.env carries {key}"))
-            .trim()
-            .parse()
-            .unwrap_or_else(|e| panic!("{key} in config.env is an integer: {e}"))
-    };
     mc_service::media_routing::ReplacementTiming::from_config_ms(
-        read("MC_MH_REPLACEMENT_MIN_INTERVAL_MS"),
-        read("MC_MH_REPLACEMENT_BACKOFF_MAX_MS"),
+        shipped_int("MC_MH_REPLACEMENT_MIN_INTERVAL_MS"),
+        shipped_int("MC_MH_REPLACEMENT_BACKOFF_MAX_MS"),
     )
 }
 
@@ -1052,16 +1066,42 @@ pub fn replacement_timing() -> mc_service::media_routing::ReplacementTiming {
 /// If `config.env` stops carrying the key as an integer.
 #[must_use]
 pub fn planned_transfer_timing() -> mc_service::media_routing::PlannedTransferTiming {
-    const CONFIG_ENV: &str = include_str!("../../../../infra/services/mc-service/config.env");
-    let key = "MC_PLANNED_TRANSFER_MARGIN_MS";
-    let ms: u32 = CONFIG_ENV
-        .lines()
-        .find_map(|l| l.trim().strip_prefix(key)?.strip_prefix('='))
-        .unwrap_or_else(|| panic!("config.env carries {key}"))
-        .trim()
+    mc_service::media_routing::PlannedTransferTiming::from_margin_ms(shipped_int(
+        "MC_PLANNED_TRANSFER_MARGIN_MS",
+    ))
+}
+
+/// The client-loss disagreement threshold AS SHIPPED, read from `config.env`
+/// (story 4 MC-E) — the same single source as [`planned_transfer_timing`].
+///
+/// # Panics
+///
+/// If `config.env` stops carrying either key, or carries an invalid value.
+#[must_use]
+pub fn client_loss_disagreement() -> mc_service::media_routing::DisagreementThreshold {
+    let fraction: f64 = shipped("MC_CLIENT_LOSS_DISAGREEMENT_FRACTION")
         .parse()
-        .unwrap_or_else(|e| panic!("{key} in config.env is an integer: {e}"));
-    mc_service::media_routing::PlannedTransferTiming::from_margin_ms(ms)
+        .expect("MC_CLIENT_LOSS_DISAGREEMENT_FRACTION in config.env is a number");
+    disagreement_threshold(
+        fraction,
+        shipped_int("MC_CLIENT_LOSS_DISAGREEMENT_MIN_CLIENTS"),
+    )
+}
+
+/// A disagreement threshold from raw values (tests pass NON-default ones).
+///
+/// # Panics
+///
+/// If either value is out of range.
+#[must_use]
+pub fn disagreement_threshold(
+    fraction: f64,
+    min_clients: u32,
+) -> mc_service::media_routing::DisagreementThreshold {
+    mc_service::media_routing::DisagreementThreshold::new(
+        mc_service::media_routing::DisagreementFraction::new(fraction).expect("fraction in (0, 1]"),
+        std::num::NonZeroU32::new(min_clients).expect("min_clients >= 1"),
+    )
 }
 
 /// [`join_media_on`] answering replacement requests from `gc` (story 4 MC-C).
@@ -1081,6 +1121,24 @@ pub fn join_media_full(
     media_dial: mc_service::media_dial::MediaDialTiming,
     gc: Arc<mc_test_utils::ScriptedGc>,
 ) -> mc_service::actors::JoinMedia {
+    join_media_configured(
+        mh_client,
+        heartbeat,
+        media_dial,
+        gc,
+        client_loss_disagreement(),
+    )
+}
+
+/// [`join_media_full`] with an explicit disagreement threshold (story 4 MC-E
+/// tests use NON-default values, so a hardcoded default fails).
+pub fn join_media_configured(
+    mh_client: Arc<dyn MhRegistrationClient>,
+    heartbeat: mc_service::media_routing::HeartbeatTiming,
+    media_dial: mc_service::media_dial::MediaDialTiming,
+    gc: Arc<mc_test_utils::ScriptedGc>,
+    client_loss_disagreement: mc_service::media_routing::DisagreementThreshold,
+) -> mc_service::actors::JoinMedia {
     mc_service::actors::JoinMedia {
         deps: Arc::new(mc_service::actors::MediaRoutingDeps {
             mh_client,
@@ -1097,6 +1155,7 @@ pub fn join_media_full(
             acquirer: gc,
             replacement: replacement_timing(),
             planned_transfer: planned_transfer_timing(),
+            client_loss_disagreement,
         }),
         // The actor-driven suite joins as an audio publisher with no
         // join-carried declaration (it declares post-join), story 2's shape.

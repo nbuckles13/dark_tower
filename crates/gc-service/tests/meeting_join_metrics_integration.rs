@@ -246,9 +246,9 @@ fn meeting_join_histograms_disambiguate_by_participant() {
     // Both participants emit a histogram observation under the same status
     // value — verify they remain distinct under the participant axis (no
     // label-cardinality bleed). Two snapshots, one per participant, because
-    // `assert_observation_count` drains all histogram entries on a single
-    // snapshot per `crates/common/src/observability/testing.rs` §"Histograms
-    // DRAIN on snapshot."
+    // `assert_observation_count` drains the entries matching its name+labels
+    // per `crates/common/src/observability/testing.rs` §"Histograms DRAIN on
+    // their OWN read."
     {
         let snap = MetricAssertion::snapshot();
         record_meeting_join("user", "success", None, Duration::from_millis(150));

@@ -95,6 +95,7 @@ impl WebTransportServer {
         acquirer: Arc<dyn crate::grpc::gc_client::HandlerAcquirer>,
         replacement: crate::media_routing::ReplacementTiming,
         planned_transfer: crate::media_routing::PlannedTransferTiming,
+        client_loss_disagreement: crate::media_routing::DisagreementThreshold,
         max_connections: usize,
         quic_max_idle_timeout: Duration,
         cancel_token: CancellationToken,
@@ -135,6 +136,9 @@ impl WebTransportServer {
         // Same discipline: the published planned-transfer margin is the very
         // margin every meeting's cutover deadline subtracts (story 4 MC-F).
         metrics::set_planned_transfer_margin(planned_transfer);
+        // Same discipline: the published disagreement threshold is the very
+        // one every meeting's `assess` reads (story 4 MC-E).
+        metrics::set_client_loss_disagreement(client_loss_disagreement);
 
         Self {
             bind_address,
@@ -157,6 +161,7 @@ impl WebTransportServer {
                 acquirer,
                 replacement,
                 planned_transfer,
+                client_loss_disagreement,
             }),
             client_media_config,
             max_connections,

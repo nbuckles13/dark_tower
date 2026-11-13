@@ -81,8 +81,8 @@ async fn the_stranded_pair_hears_each_other_on_the_granted_replacement() {
     );
     let probe = meeting.probe_handler_for_test(H3).await.unwrap();
     assert_eq!(probe.health, Some("healthy"), "a Registering member");
-    // Histograms drain on EVERY snapshot read, so each phase is read at its
-    // own boundary, when only it has been observed since the previous read.
+    // A histogram query drains its own name+labels, so each phase is read at
+    // its own boundary, when only it has been observed since the previous read.
     snap.histogram("mc_media_handler_migration_duration_seconds")
         .with_labels(&[
             ("trigger", "heartbeat_timeout"),

@@ -687,7 +687,8 @@ mod tests {
         record_token_issuance("authorization_code", "success", Duration::from_millis(300));
         record_token_issuance("refresh_token", "error", Duration::from_millis(50));
 
-        // Histogram first (drain-on-read — single take_entries() per snapshot).
+        // One query of this histogram per snapshot (a query drains its own
+        // name+labels).
         snap.histogram("ac_token_issuance_duration_seconds")
             .assert_observation_count_at_least(4);
 
@@ -789,7 +790,8 @@ mod tests {
         record_db_query("delete", "signing_keys", "error", Duration::from_millis(3));
         record_db_query("select", "jwks_cache", "success", Duration::from_millis(2));
 
-        // Histogram first (drain-on-read — single take_entries() per snapshot).
+        // One query of this histogram per snapshot (a query drains its own
+        // name+labels).
         snap.histogram("ac_db_query_duration_seconds")
             .assert_observation_count_at_least(5);
 

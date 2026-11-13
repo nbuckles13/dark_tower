@@ -13,7 +13,9 @@
 //!   heartbeat timeout `MC_MH_HEARTBEAT_TIMEOUT_MS`, and the story 4 MC-C
 //!   replacement pacing `MC_MH_REPLACEMENT_MIN_INTERVAL_MS` /
 //!   `MC_MH_REPLACEMENT_BACKOFF_MAX_MS`, and the story 4 MC-F planned-transfer
-//!   margin `MC_PLANNED_TRANSFER_MARGIN_MS`), `media-codec-profile` for
+//!   margin `MC_PLANNED_TRANSFER_MARGIN_MS`, and the story 4 MC-E
+//!   client-loss disagreement threshold `MC_CLIENT_LOSS_DISAGREEMENT_FRACTION`
+//!   / `MC_CLIENT_LOSS_DISAGREEMENT_MIN_CLIENTS`), `media-codec-profile` for
 //!   the eight shared encoding keys.
 //!   Per workload, never union: a key on mc-0 missing from mc-1 crash-loops
 //!   mc-1 alone, because MC-A reads every one as REQUIRED.
@@ -146,6 +148,19 @@ const WIRED_KEYS: &[(&str, &str, ValueShape)] = &[
     // refused at boot outside [1000, 30000] (bounds stay with MC's reader).
     (
         "MC_PLANNED_TRANSFER_MARGIN_MS",
+        MC_CONFIGMAP,
+        ValueShape::PositiveInteger,
+    ),
+    // Client-loss disagreement threshold (ADR-0039 §8, story 4 MC-E):
+    // REQUIRED, refused at boot outside (0, 1] / [1, 1000] (bounds stay with
+    // MC's reader; UnitRatio admits 0, which MC refuses).
+    (
+        "MC_CLIENT_LOSS_DISAGREEMENT_FRACTION",
+        MC_CONFIGMAP,
+        ValueShape::UnitRatio,
+    ),
+    (
+        "MC_CLIENT_LOSS_DISAGREEMENT_MIN_CLIENTS",
         MC_CONFIGMAP,
         ValueShape::PositiveInteger,
     ),
@@ -339,7 +354,23 @@ const CONFIG_GAUGES: &[(&str, &str, Conversion)] = &[
         "mc_media_handler_planned_transfer_margin_seconds",
         Conversion::MsToSeconds,
     ),
+    // Story 4 MC-E: the client-loss disagreement minimum. Its fraction
+    // sibling is not an integer, so it is checked in `UNIT_FRACTION_GAUGES`.
+    (
+        "MC_CLIENT_LOSS_DISAGREEMENT_MIN_CLIENTS",
+        "mc_media_handler_client_loss_disagreement_min_clients",
+        Conversion::Identity,
+    ),
 ];
+
+/// `(mc-service-config key, published series)` for fractions the running MC
+/// publishes VERBATIM in `(0, 1]` (story 4 MC-E). Compared as the round trip
+/// at 1e-6, never as a float equality: the value crosses Prometheus text
+/// exposition and the query API's formatting.
+const UNIT_FRACTION_GAUGES: &[(&str, &str)] = &[(
+    "MC_CLIENT_LOSS_DISAGREEMENT_FRACTION",
+    "mc_media_handler_client_loss_disagreement_ratio",
+)];
 
 /// What the RUNNING MC process loaded equals its OWN ConfigMap generation, per
 /// instance, per [`CONFIG_GAUGES`] row. Three distinct outcomes, as in 01(c):
@@ -348,9 +379,7 @@ const CONFIG_GAUGES: &[(&str, &str, Conversion)] = &[
 #[tokio::test]
 async fn test_config_reported_by_running_mc_matches_configmap() {
     use env_tests::cluster::ClusterConnection;
-    use env_tests::fixtures::metrics::poll_until_pinned_instance;
     use env_tests::fixtures::PrometheusClient;
-    use std::time::Duration;
 
     let cluster = ClusterConnection::new()
         .await
@@ -372,22 +401,7 @@ async fn test_config_reported_by_running_mc_matches_configmap() {
         for &(key, series, conversion) in CONFIG_GAUGES {
             let deployed = parse_u64(key, &cm_value(&cm, MC_CONFIGMAP, key), MC_CONFIGMAP)
                 .unwrap_or_else(|e| panic!("{e}"));
-            let promql = format!("max by (instance) ({series})");
-            let value = poll_until_pinned_instance(
-                &prom,
-                &promql,
-                &pod_ip,
-                GAUGE_PRESENT_BOUND,
-                Duration::from_secs(2),
-                &format!(
-                    "PRESENCE ({instance}, pod {pod_name}): MC publishes {series} at process \
-                     start, so absence is a scrape/startup problem — NOT a configuration \
-                     mismatch"
-                ),
-                "present",
-                |_| true,
-            )
-            .await;
+            let value = present_gauge(&prom, series, &pod_ip, instance, &pod_name).await;
             match gauge_verdict(conversion, deployed, value) {
                 GaugeVerdict::Match => {}
                 GaugeVerdict::Shape => panic!(
@@ -403,7 +417,59 @@ async fn test_config_reported_by_running_mc_matches_configmap() {
                 ),
             }
         }
+        for &(key, series) in UNIT_FRACTION_GAUGES {
+            let raw = cm_value(&cm, MC_CONFIGMAP, key);
+            let deployed: f64 = raw.trim().parse().unwrap_or_else(|e| {
+                panic!("{MC_CONFIGMAP} carries {key}={raw:?}, not a number: {e}")
+            });
+            let value = present_gauge(&prom, series, &pod_ip, instance, &pod_name).await;
+            assert!(
+                value.is_finite() && value > 0.0 && value <= 1.0,
+                "{series} on {instance} (pod {pod_name}) is not a fraction in (0, 1] ({value}): \
+                 the publisher's shape changed in crates/mc-service/src/observability/metrics.rs"
+            );
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "both values are in (0, 1]; x 1e6 fits i64"
+            )]
+            let (got, want) = (
+                (value * 1e6).round() as i64,
+                (deployed * 1e6).round() as i64,
+            );
+            assert_eq!(
+                got, want,
+                "{instance} (pod {pod_name}) runs {series}={value}, but its {MC_CONFIGMAP} \
+                 generation carries {key}={deployed}. The process is not running the deployed \
+                 value; {REDEPLOY_HINT}."
+            );
+        }
     }
+}
+
+/// THE presence read of one MC config gauge on the pod at `pod_ip` (both
+/// echo tables use it; only the comparison differs per table).
+async fn present_gauge(
+    prom: &env_tests::fixtures::PrometheusClient,
+    series: &str,
+    pod_ip: &str,
+    instance: &str,
+    pod_name: &str,
+) -> f64 {
+    env_tests::fixtures::metrics::poll_until_pinned_instance(
+        prom,
+        &format!("max by (instance) ({series})"),
+        pod_ip,
+        GAUGE_PRESENT_BOUND,
+        std::time::Duration::from_secs(2),
+        &format!(
+            "PRESENCE ({instance}, pod {pod_name}): MC publishes {series} at process \
+             start, so absence is a scrape/startup problem — NOT a configuration \
+             mismatch"
+        ),
+        "present",
+        |_| true,
+    )
+    .await
 }
 
 /// MC-F O9 drift guard (operations): MC's planned-transfer margin leaves MC a

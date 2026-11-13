@@ -32,9 +32,30 @@
 //! liveness with its generation clamped to `sent` (`liveness.rs`).
 //!
 //! Precedence: Dead, then capacity refusal, then lag held. gRPC channel
-//! connectivity is NOT an input (not deterministically testable). Client loss
-//! reports ARE an input with weight 0 in this story (MC-E reads them; a
-//! future story may promote them by policy, not by a restructure).
+//! connectivity is NOT an input (not deterministically testable).
+//!
+//! # Client loss: a second opinion, never a trigger (story 4 MC-E)
+//!
+//! Client loss reports ARE an input ([`ClientLoss`]), but they never move a
+//! pair toward a declaration in this story (a future story may promote them
+//! by policy, not by a restructure). Their one output is the
+//! **client-loss disagreement**: while the pair stays Live (Lagging and
+//! Draining included — its heartbeats keep it from Dead), a quorum of its
+//! believed-connected clients ([`DisagreementThreshold::quorum`]) reporting
+//! loss for LONGER than N (the one [`expired`] boundary) marks the pair
+//! disagreeing. The `false -> true` edge ([`client_disagreement_began`]) is
+//! counted once per episode; the episode ends when an assessment no longer
+//! sees the quorum, or when the pair is declared or removed. The reports are
+//! client-ASSERTED: forgeable by `min_clients` colluding participants, so not
+//! a trust signal.
+//!
+//! **Not a full forged-heartbeat (S1b) detector.** The denominator is
+//! MH-reported connectivity, which a forged heartbeat can erase: an empty or
+//! wrong `connection_ids` list retires the believed-connected set through the
+//! remove-only reconcile, so the quorum can never hold and the counter stays
+//! 0. Only a forger that echoes the live connection ids is caught. Zero is NOT
+//! evidence of no forgery (a non-erasable denominator: `docs/TODO.md` §Media
+//! Path Obligations).
 //!
 //! # One boundary
 //!
@@ -73,23 +94,176 @@ pub fn expired(origin: Instant, span: Duration, now: Instant) -> bool {
     now >= expiry(origin, span)
 }
 
-/// The two spans `assess` judges against, both derived from N.
+/// The two spans `assess` judges against, both derived from N, and the
+/// client-loss disagreement threshold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HealthConfig {
-    /// N: silence longer than this is Dead.
+    /// N: silence longer than this is Dead (and a client-loss quorum held
+    /// longer than this is a disagreement).
     pub timeout: Duration,
     /// L = `APPLY_LAG_FACTOR` x N: lag held longer than this is Impaired.
     pub lag_limit: Duration,
+    /// When the client second opinion disagrees with the heartbeats.
+    pub disagreement: DisagreementThreshold,
 }
 
 impl HealthConfig {
-    /// The ONE derivation, from MC's heartbeat timing.
+    /// The ONE derivation, from MC's heartbeat timing and the configured
+    /// disagreement threshold.
     #[must_use]
-    pub fn from_timing(timing: HeartbeatTiming) -> Self {
+    pub fn new(timing: HeartbeatTiming, disagreement: DisagreementThreshold) -> Self {
         Self {
             timeout: timing.timeout(),
             lag_limit: timing.apply_lag_limit(),
+            disagreement,
         }
+    }
+}
+
+/// `MC_CLIENT_LOSS_DISAGREEMENT_FRACTION` as validated: finite and in
+/// `(0, 1]`. Constructed ONLY through [`Self::new`], so the invariant lives in
+/// the type (and NaN, which would make `PartialEq` non-reflexive, can never be
+/// held).
+#[derive(Debug, Clone, Copy)]
+pub struct DisagreementFraction(f64);
+
+impl DisagreementFraction {
+    /// `Some` iff `value` is finite and in `(0, 1]`. Written in the positive
+    /// form on purpose: a negated range test (`!(v <= 0.0 || v > 1.0)`) lets
+    /// NaN through. `-0.0` and an underflow to `0.0` are refused by `> 0.0`.
+    #[must_use]
+    pub fn new(value: f64) -> Option<Self> {
+        (value.is_finite() && value > 0.0 && value <= 1.0).then_some(Self(value))
+    }
+
+    /// The fraction.
+    #[must_use]
+    pub const fn get(self) -> f64 {
+        self.0
+    }
+}
+
+impl PartialEq for DisagreementFraction {
+    fn eq(&self, other: &Self) -> bool {
+        // Never NaN (constructor), so bit equality is value equality except
+        // for ±0, which the constructor also refuses.
+        self.0.to_bits() == other.0.to_bits()
+    }
+}
+
+impl Eq for DisagreementFraction {}
+
+/// The client-loss disagreement threshold
+/// (`MC_CLIENT_LOSS_DISAGREEMENT_FRACTION`,
+/// `MC_CLIENT_LOSS_DISAGREEMENT_MIN_CLIENTS`; story 4 MC-E). Both must be
+/// met. Observational only: it moves `mc_media_handler_client_loss_disagreements_total`
+/// and nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisagreementThreshold {
+    fraction: DisagreementFraction,
+    min_clients: std::num::NonZeroU32,
+}
+
+impl DisagreementThreshold {
+    /// The threshold.
+    #[must_use]
+    pub const fn new(fraction: DisagreementFraction, min_clients: std::num::NonZeroU32) -> Self {
+        Self {
+            fraction,
+            min_clients,
+        }
+    }
+
+    /// The configured fraction.
+    #[must_use]
+    pub const fn fraction(self) -> DisagreementFraction {
+        self.fraction
+    }
+
+    /// The configured minimum count of reporting clients.
+    #[must_use]
+    pub const fn min_clients(self) -> std::num::NonZeroU32 {
+        self.min_clients
+    }
+
+    /// Whether `loss` meets BOTH halves: at least `min_clients` reporting, and
+    /// reporting / connected at least `fraction`.
+    ///
+    /// The share is [`ClientLoss::ratio`] — the SAME division the loss
+    /// metric observes, and DIVIDED, never `reported >= fraction * connected`:
+    /// f64 division is correctly rounded, so `3 / 5` is the same double as
+    /// the literal `0.6` and an exactly-met fraction is met, while
+    /// `0.6 * 5.0 == 3.0000000000000004` would refuse it. Nobody connected has
+    /// no ratio, so no quorum.
+    #[must_use]
+    pub fn quorum(self, loss: ClientLoss) -> bool {
+        loss.reported >= self.min_clients.get()
+            && loss.ratio().is_some_and(|r| r >= self.fraction.get())
+    }
+}
+
+/// ONE snapshot of a handler's clients (story 4 MC-E; ADR-0039 §8): of the
+/// participants MC believes connected to it (MH-reported connectivity), how
+/// many have a LATEST client status for its ref that is a loss, received
+/// while the ref was in the set, and the earliest MC RECEIPT instant among
+/// those losses.
+///
+/// `reported <= connected` by construction ([`Self::tally`] is the only
+/// builder), so no caller ever subtracts unchecked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ClientLoss {
+    connected: u32,
+    reported: u32,
+    first_report_at: Option<Instant>,
+}
+
+impl ClientLoss {
+    /// Tally one item per BELIEVED-CONNECTED participant: `Some(since)` when
+    /// its latest status for the ref is a loss first received at `since`,
+    /// `None` otherwise.
+    pub fn tally(participants: impl IntoIterator<Item = Option<Instant>>) -> Self {
+        let mut loss = Self::default();
+        for since in participants {
+            loss.connected = loss.connected.saturating_add(1);
+            if let Some(since) = since {
+                loss.reported = loss.reported.saturating_add(1);
+                loss.first_report_at = Some(loss.first_report_at.map_or(since, |f| f.min(since)));
+            }
+        }
+        loss
+    }
+
+    /// Believed-connected participants (the denominator).
+    #[must_use]
+    pub const fn connected(self) -> u32 {
+        self.connected
+    }
+
+    /// Of those, the participants that reported loss (the numerator).
+    #[must_use]
+    pub const fn reported(self) -> u32 {
+        self.reported
+    }
+
+    /// Of those, the participants that did not.
+    #[must_use]
+    pub const fn not_reported(self) -> u32 {
+        self.connected - self.reported
+    }
+
+    /// `reported / connected`; `None` with nobody connected (never 0/0).
+    #[must_use]
+    pub fn ratio(self) -> Option<f64> {
+        (self.connected > 0).then(|| f64::from(self.reported) / f64::from(self.connected))
+    }
+
+    /// First counted loss report -> `now`; `None` with no report. Saturating:
+    /// a receipt instant is never after the assessment that reads it, and a
+    /// clock oddity reads as zero, never negative.
+    #[must_use]
+    pub fn lead(self, now: Instant) -> Option<Duration> {
+        self.first_report_at
+            .map(|first| now.saturating_duration_since(first))
     }
 }
 
@@ -198,9 +372,10 @@ pub struct Observations {
     pub refusal: RefusalClass,
     /// Whether the latest serving state is DRAINING.
     pub draining: bool,
-    /// Client loss reports for this handler. WEIGHT 0 in this story: read,
-    /// never acted on (MC-E computes its metric from them).
-    pub client_loss_reports: u32,
+    /// The client-loss snapshot for this handler: the second opinion (never a
+    /// trigger) and, on a declaration, the required loss metric's ONE
+    /// snapshot.
+    pub client_loss: ClientLoss,
 }
 
 impl Observations {
@@ -295,6 +470,18 @@ pub struct LiveHealth {
     pub contract_fault: Option<ContractFault>,
     /// When DRAINING was first seen (sticky: MH never un-drains).
     pub draining_since: Option<Instant>,
+    /// The open client-loss quorum episode, if any.
+    pub client_quorum: Option<ClientQuorum>,
+}
+
+/// One client-loss quorum episode on a Live pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientQuorum {
+    /// The first assessment that saw the quorum.
+    pub since: Instant,
+    /// The quorum has held LONGER than N: the client second opinion disagrees
+    /// with the heartbeats. Sticky for the episode.
+    pub disagreeing: bool,
 }
 
 /// One pair's health.
@@ -378,19 +565,44 @@ impl HandlerHealth {
                 lagging: false,
                 draining: false,
                 contract_fault: None,
+                client_disagreement: false,
             },
             Self::Live(l) => HealthShape {
                 declared: None,
                 lagging: l.lag_since.is_some(),
                 draining: l.draining_since.is_some(),
                 contract_fault: l.contract_fault,
+                client_disagreement: matches!(
+                    l.client_quorum,
+                    Some(ClientQuorum {
+                        disagreeing: true,
+                        ..
+                    })
+                ),
             },
         }
     }
 
+    /// Whether the client second opinion currently disagrees with the
+    /// heartbeats (a quorum held longer than N on a Live pair).
+    #[must_use]
+    pub const fn is_client_disagreement(&self) -> bool {
+        matches!(
+            self,
+            Self::Live(LiveHealth {
+                client_quorum: Some(ClientQuorum {
+                    disagreeing: true,
+                    ..
+                }),
+                ..
+            })
+        )
+    }
+
     /// Whether `previous` -> `next` is a health TRANSITION (the only thing
     /// the actor acts on and logs): lag entered or cleared, a contract fault
-    /// entered or cleared, DRAINING first seen, or a declaration.
+    /// entered or cleared, DRAINING first seen, a client disagreement begun or
+    /// ended, or a declaration.
     #[must_use]
     pub fn is_transition(previous: &Self, next: &Self) -> bool {
         previous.shape() != next.shape()
@@ -404,6 +616,15 @@ struct HealthShape {
     lagging: bool,
     draining: bool,
     contract_fault: Option<ContractFault>,
+    client_disagreement: bool,
+}
+
+/// `mc_media_handler_client_loss_disagreements_total`: whether this
+/// transition BEGAN a disagreement (the `false -> true` edge) — counted once
+/// per episode. Ending one (quorum lost, declared, removed) is not counted.
+#[must_use]
+pub const fn client_disagreement_began(previous: &HandlerHealth, next: &HandlerHealth) -> bool {
+    !previous.is_client_disagreement() && next.is_client_disagreement()
 }
 
 /// `mc_media_handler_suspicions_total{outcome}`: how a LAG suspicion ended.
@@ -468,9 +689,6 @@ pub fn assess(
         HandlerHealth::Declared(d) => return HandlerHealth::Declared(*d),
         HandlerHealth::Live(live) => *live,
     };
-    // Weight 0 in this story (ADR-0039 §2: a second opinion only).
-    let _ = obs.client_loss_reports;
-
     // Dead: age measured from the later of the first confirmation and the
     // last accepted heartbeat. Unconfirmed: never Dead.
     if let Some(origin) = silence_origin(obs) {
@@ -512,16 +730,28 @@ pub fn assess(
         }
     }
 
+    // The client second opinion (ADR-0039 §2): read AFTER every declaring
+    // check, so it can never produce or prevent a declaration.
+    let client_quorum = cfg.disagreement.quorum(obs.client_loss).then(|| {
+        let since = live.client_quorum.map_or(now, |q| q.since);
+        ClientQuorum {
+            since,
+            disagreeing: live.client_quorum.is_some_and(|q| q.disagreeing)
+                || expired(since, cfg.timeout, now),
+        }
+    });
+
     HandlerHealth::Live(LiveHealth {
         lag_since,
         contract_fault,
         draining_since,
+        client_quorum,
     })
 }
 
 /// When `assess` could next change its answer WITHOUT a new heartbeat: the
-/// earliest of the silence expiry and the lag expiry. `None` once declared
-/// (or with nothing to wait for).
+/// earliest of the silence expiry, the lag expiry and an open client-loss
+/// quorum's expiry. `None` once declared (or with nothing to wait for).
 #[must_use]
 pub fn next_deadline(
     health: &HandlerHealth,
@@ -533,10 +763,11 @@ pub fn next_deadline(
     };
     let silence = silence_origin(obs).map(|origin| expiry(origin, cfg.timeout));
     let lag = live.lag_since.map(|since| expiry(since, cfg.lag_limit));
-    match (silence, lag) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (a, b) => a.or(b),
-    }
+    let quorum = live
+        .client_quorum
+        .filter(|q| !q.disagreeing)
+        .map(|q| expiry(q.since, cfg.timeout));
+    [silence, lag, quorum].into_iter().flatten().min()
 }
 
 /// The silence clock's origin: the later of the first confirmation and the
@@ -554,8 +785,15 @@ fn declared(cause: DeclareCause, evidence_at: Instant) -> HandlerHealth {
 mod tests {
     use super::*;
 
+    fn threshold(fraction: f64, min: u32) -> DisagreementThreshold {
+        DisagreementThreshold::new(
+            DisagreementFraction::new(fraction).unwrap(),
+            std::num::NonZeroU32::new(min).unwrap(),
+        )
+    }
+
     fn cfg() -> HealthConfig {
-        HealthConfig::from_timing(HeartbeatTiming::from_timeout_ms(6_000))
+        HealthConfig::new(HeartbeatTiming::from_timeout_ms(6_000), threshold(0.5, 3))
     }
 
     /// One table row: an observation sequence and what it must yield.
@@ -577,7 +815,7 @@ mod tests {
             owed: Some(1),
             refusal: RefusalClass::None,
             draining: false,
-            client_loss_reports: 0,
+            client_loss: ClientLoss::default(),
         }
     }
 
@@ -733,7 +971,7 @@ mod tests {
                 steps: vec![(
                     n,
                     Observations {
-                        client_loss_reports: u32::MAX,
+                        client_loss: ClientLoss::tally(std::iter::repeat_n(Some(t0), 10_000)),
                         ..b
                     },
                     "healthy",
@@ -1033,5 +1271,152 @@ mod tests {
         assert!(!expired(t0, span, t0 + span));
         assert!(expired(t0, span, expiry(t0, span)));
         assert_eq!(expiry(t0, span), t0 + span + DEADLINE_RESOLUTION);
+    }
+
+    /// The pure loss snapshot (story 4 MC-E): k of n with values that show an
+    /// off-by-one; receipt instants injected; nobody connected has no ratio.
+    #[test]
+    fn client_loss_tally_counts_ratio_and_lead() {
+        let t0 = Instant::now();
+        let s = Duration::from_secs(1);
+        // n = 5 believed connected, k = 2 reported (first at t0 + 1s).
+        let loss = ClientLoss::tally([None, Some(t0 + s * 3), None, Some(t0 + s), None]);
+        assert_eq!(
+            (loss.connected(), loss.reported(), loss.not_reported()),
+            (5, 2, 3)
+        );
+        assert_eq!(loss.ratio(), Some(0.4));
+        assert_eq!(
+            loss.lead(t0 + s * 10),
+            Some(s * 9),
+            "from the EARLIEST receipt"
+        );
+        assert_eq!(
+            loss.lead(t0),
+            Some(Duration::ZERO),
+            "saturating, never negative"
+        );
+
+        let none_reported = ClientLoss::tally([None, None]);
+        assert_eq!(none_reported.ratio(), Some(0.0));
+        assert_eq!(none_reported.lead(t0), None, "lead only with >= 1 report");
+
+        let nobody = ClientLoss::tally(std::iter::empty());
+        assert_eq!((nobody.connected(), nobody.not_reported()), (0, 0));
+        assert_eq!(nobody.ratio(), None, "0/0 is never observed");
+    }
+
+    /// Both halves of the quorum, at NON-default values (0.6, 2), at their
+    /// exact boundaries — `3 of 5` at 0.6 is met (the division form).
+    #[test]
+    fn quorum_needs_both_the_fraction_and_the_minimum() {
+        let t = threshold(0.6, 2);
+        let of = |connected: usize, reported: usize| {
+            ClientLoss::tally(
+                std::iter::repeat_n(Some(Instant::now()), reported)
+                    .chain(std::iter::repeat_n(None, connected - reported)),
+            )
+        };
+        assert!(t.quorum(of(5, 3)), "fraction exactly met, min met");
+        assert!(t.quorum(of(2, 2)), "min exactly met, fraction met");
+        assert!(!t.quorum(of(5, 2)), "fraction just below (0.4), min met");
+        assert!(!t.quorum(of(1, 1)), "min - 1, fraction met (1.0)");
+        assert!(!t.quorum(of(0, 0)), "nobody connected");
+        assert!(
+            threshold(1.0, 1).quorum(of(1, 1)),
+            "the boundary positive arms"
+        );
+    }
+
+    #[test]
+    fn the_fraction_is_finite_and_in_zero_one() {
+        for ok in [1.0, 0.5, f64::MIN_POSITIVE] {
+            assert!(DisagreementFraction::new(ok).is_some(), "{ok}");
+        }
+        for bad in [
+            0.0,
+            -0.0,
+            -0.5,
+            1.000_001,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
+            assert!(DisagreementFraction::new(bad).is_none(), "{bad}");
+        }
+    }
+
+    /// The disagreement episode: a quorum held for N is not yet a
+    /// disagreement, N + 1 ms is (the ONE `expired` boundary); the edge is
+    /// counted once; losing the quorum ends the episode and a new one counts
+    /// again; it never declares, and a Dead declaration ends it.
+    #[test]
+    fn client_disagreement_episodes() {
+        let t0 = Instant::now();
+        let cfg = HealthConfig::new(HeartbeatTiming::from_timeout_ms(6_000), threshold(0.6, 2));
+        let n = cfg.timeout;
+        let ms = DEADLINE_RESOLUTION;
+        let quorum = ClientLoss::tally([Some(t0), Some(t0), Some(t0), None, None]);
+        let below = ClientLoss::tally([Some(t0), Some(t0), None, None, None]);
+        // Heartbeats keep arriving: last_accepted is always `at`.
+        let obs = |at: Instant, client_loss| Observations {
+            last_accepted: Some(at),
+            client_loss,
+            ..base(t0)
+        };
+        let step = |prev: &HandlerHealth, at: Instant, loss| assess(at, &obs(at, loss), prev, &cfg);
+
+        let h0 = step(&HandlerHealth::default(), t0, quorum);
+        assert!(!h0.is_client_disagreement());
+        assert!(
+            !HandlerHealth::is_transition(&HandlerHealth::default(), &h0),
+            "quorum entry is no transition"
+        );
+        // The quorum expiry is a wake, earlier than the silence expiry here.
+        let mid = t0 + n / 2;
+        let h1 = step(&h0, mid, quorum);
+        assert_eq!(
+            next_deadline(&h1, &obs(mid, quorum), &cfg),
+            Some(t0 + n + ms)
+        );
+        let at_n = step(&h1, t0 + n, quorum);
+        assert!(
+            !at_n.is_client_disagreement(),
+            "held for exactly N: not yet"
+        );
+        let past_n = step(&at_n, t0 + n + ms, quorum);
+        assert!(past_n.is_client_disagreement(), "held longer than N");
+        assert!(client_disagreement_began(&at_n, &past_n));
+        assert!(HandlerHealth::is_transition(&at_n, &past_n));
+        assert_eq!(past_n.state_label(), "healthy", "never a declaration");
+        let later = step(&past_n, t0 + n * 2, quorum);
+        assert!(later.is_client_disagreement());
+        assert!(
+            !client_disagreement_began(&past_n, &later),
+            "once per episode"
+        );
+
+        // Quorum lost (one client superseded): the episode ends.
+        let ended = step(&later, t0 + n * 2 + ms, below);
+        assert!(!ended.is_client_disagreement());
+        assert!(HandlerHealth::is_transition(&later, &ended));
+        // A new episode counts again, only after its own N.
+        let t1 = t0 + n * 3;
+        let again = step(&ended, t1, quorum);
+        let again_n = step(&again, t1 + n, quorum);
+        assert!(!again_n.is_client_disagreement());
+        let again_past = step(&again_n, t1 + n + ms, quorum);
+        assert!(client_disagreement_began(&again_n, &again_past));
+
+        // Silence ends it by declaring Dead (heartbeats stop).
+        let silent = Observations {
+            last_accepted: Some(t1 + n + ms),
+            client_loss: quorum,
+            ..base(t0)
+        };
+        let dead = assess(t1 + n * 2 + ms * 2, &silent, &again_past, &cfg);
+        assert_eq!(dead.state_label(), "dead");
+        assert!(!dead.is_client_disagreement());
+        assert!(!client_disagreement_began(&again_past, &dead));
     }
 }

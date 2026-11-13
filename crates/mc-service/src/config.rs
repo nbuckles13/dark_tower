@@ -143,6 +143,15 @@ pub const MIN_PLANNED_TRANSFER_MARGIN_MS: u32 = 1_000;
 /// guards the relation, this bound only stops absurd values.
 pub const MAX_PLANNED_TRANSFER_MARGIN_MS: u32 = 30_000;
 
+/// Smallest legal `MC_CLIENT_LOSS_DISAGREEMENT_MIN_CLIENTS` (story 4 MC-E):
+/// at least one reporting client.
+pub const MIN_CLIENT_LOSS_DISAGREEMENT_MIN_CLIENTS: u32 = std::num::NonZeroU32::MIN.get();
+
+/// Largest legal `MC_CLIENT_LOSS_DISAGREEMENT_MIN_CLIENTS`: the
+/// `MC_MAX_PARTICIPANTS` scale. Above it no meeting could ever reach the
+/// quorum and the counter would be silently dead.
+pub const MAX_CLIENT_LOSS_DISAGREEMENT_MIN_CLIENTS: u32 = 1_000;
+
 /// Smallest legal `MC_KEK_ROTATION_DEBOUNCE_SECONDS` (W).
 ///
 /// The floor is set by the CLIENT, not by MC: the client derives its
@@ -247,6 +256,24 @@ where
         )));
     }
     Ok(parsed)
+}
+
+/// A REQUIRED unit fraction in `(0, 1]`, finite (story 4 MC-E). The range
+/// test is the POSITIVE form inside `DisagreementFraction::new`
+/// (`is_finite() && > 0 && <= 1`): a negated form (`v <= 0 || v > 1`) lets NaN
+/// through. `-0.0` and an underflow to `0.0` (`1e-400`) are refused.
+fn parse_unit_fraction(
+    name: &str,
+    raw: &str,
+) -> Result<crate::media_routing::DisagreementFraction, ConfigError> {
+    let parsed = raw.trim().parse::<f64>().map_err(|e| {
+        ConfigError::InvalidValue(format!(
+            "{name} must be a number in (0, 1], got '{raw}': {e}"
+        ))
+    })?;
+    crate::media_routing::DisagreementFraction::new(parsed).ok_or_else(|| {
+        ConfigError::InvalidValue(format!("{name} must be finite and in (0, 1], got '{raw}'"))
+    })
 }
 
 /// An OPTIONAL seconds value: absent = `default`; present but unparseable or
@@ -476,6 +503,15 @@ pub struct Config {
     /// at load. Projected once through [`Config::planned_transfer`].
     pub planned_transfer_margin_ms: u32,
 
+    /// The client-loss disagreement threshold (story 4 MC-E; ADR-0039 §8):
+    /// `MC_CLIENT_LOSS_DISAGREEMENT_FRACTION` (finite, in `(0, 1]`) and
+    /// `MC_CLIENT_LOSS_DISAGREEMENT_MIN_CLIENTS`
+    /// ([`MIN_CLIENT_LOSS_DISAGREEMENT_MIN_CLIENTS`]`..=`
+    /// [`MAX_CLIENT_LOSS_DISAGREEMENT_MIN_CLIENTS`]). Both required, no Rust
+    /// default (the ConfigMap ships 0.5 and 3). Observational only: it moves
+    /// `mc_media_handler_client_loss_disagreements_total` and nothing else.
+    pub client_loss_disagreement: crate::media_routing::DisagreementThreshold,
+
     /// Maximum ACCEPTED receive-capability declarations per connection
     /// (`MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS`).
     ///
@@ -566,6 +602,7 @@ impl fmt::Debug for Config {
                 "planned_transfer_margin_ms",
                 &self.planned_transfer_margin_ms,
             )
+            .field("client_loss_disagreement", &self.client_loss_disagreement)
             .field(
                 "max_receive_capability_declarations",
                 &self.max_receive_capability_declarations,
@@ -947,6 +984,38 @@ impl Config {
             MAX_PLANNED_TRANSFER_MARGIN_MS,
         )?;
 
+        // ADR-0039 §8 client-loss disagreement threshold (story 4 MC-E).
+        // Required and bounded; same single-line `MissingEnvVar(` rule.
+        let client_loss_disagreement_fraction = parse_unit_fraction(
+            "MC_CLIENT_LOSS_DISAGREEMENT_FRACTION",
+            vars.get("MC_CLIENT_LOSS_DISAGREEMENT_FRACTION")
+                .ok_or_else(|| {
+                    ConfigError::MissingEnvVar("MC_CLIENT_LOSS_DISAGREEMENT_FRACTION".to_string())
+                })?,
+        )?;
+        let client_loss_disagreement_min_clients = bounded(
+            "MC_CLIENT_LOSS_DISAGREEMENT_MIN_CLIENTS",
+            vars.get("MC_CLIENT_LOSS_DISAGREEMENT_MIN_CLIENTS")
+                .ok_or_else(|| {
+                    ConfigError::MissingEnvVar(
+                        "MC_CLIENT_LOSS_DISAGREEMENT_MIN_CLIENTS".to_string(),
+                    )
+                })?,
+            MIN_CLIENT_LOSS_DISAGREEMENT_MIN_CLIENTS,
+            MAX_CLIENT_LOSS_DISAGREEMENT_MIN_CLIENTS,
+        )?;
+        let client_loss_disagreement = crate::media_routing::DisagreementThreshold::new(
+            client_loss_disagreement_fraction,
+            // Unreachable after `bounded` (its minimum IS `NonZeroU32::MIN`),
+            // kept as an error rather than a panic (ADR-0002).
+            std::num::NonZeroU32::new(client_loss_disagreement_min_clients).ok_or_else(|| {
+                ConfigError::InvalidValue(format!(
+                    "MC_CLIENT_LOSS_DISAGREEMENT_MIN_CLIENTS must be at least \
+                     {MIN_CLIENT_LOSS_DISAGREEMENT_MIN_CLIENTS}"
+                ))
+            })?,
+        );
+
         // Per-connection budget on ACCEPTED declarations (client-driven
         // meeting-actor work). Bounded on both sides by the same argument.
         let max_receive_capability_declarations = bounded(
@@ -1141,6 +1210,7 @@ impl Config {
             mh_replacement_min_interval_ms,
             mh_replacement_backoff_max_ms,
             planned_transfer_margin_ms,
+            client_loss_disagreement,
             max_receive_capability_declarations,
             audio_encoding,
             video_encoding,
@@ -1209,6 +1279,15 @@ impl Config {
     #[must_use]
     pub fn planned_transfer(&self) -> crate::media_routing::PlannedTransferTiming {
         crate::media_routing::PlannedTransferTiming::from_margin_ms(self.planned_transfer_margin_ms)
+    }
+
+    /// The client-loss disagreement threshold as validated at load (story 4
+    /// MC-E). The ONE value every meeting's `assess` and the published
+    /// `mc_media_handler_client_loss_disagreement_ratio` /
+    /// `_min_clients` gauges read.
+    #[must_use]
+    pub fn client_loss_disagreement(&self) -> crate::media_routing::DisagreementThreshold {
+        self.client_loss_disagreement
     }
 
     /// The KEK rotation lifecycle, built from W as validated at load.
@@ -1351,6 +1430,15 @@ mod tests {
                 "MC_PLANNED_TRANSFER_MARGIN_MS".to_string(),
                 "5000".to_string(),
             ),
+            // ADR-0039 §8 client-loss disagreement threshold (story 4 MC-E).
+            (
+                "MC_CLIENT_LOSS_DISAGREEMENT_FRACTION".to_string(),
+                "0.5".to_string(),
+            ),
+            (
+                "MC_CLIENT_LOSS_DISAGREEMENT_MIN_CLIENTS".to_string(),
+                "3".to_string(),
+            ),
         ])
     }
 
@@ -1384,6 +1472,8 @@ mod tests {
             "MC_MH_REPLACEMENT_MIN_INTERVAL_MS",
             "MC_MH_REPLACEMENT_BACKOFF_MAX_MS",
             "MC_PLANNED_TRANSFER_MARGIN_MS",
+            "MC_CLIENT_LOSS_DISAGREEMENT_FRACTION",
+            "MC_CLIENT_LOSS_DISAGREEMENT_MIN_CLIENTS",
         ] {
             let mut vars = base_vars();
             vars.remove(key);
@@ -1417,6 +1507,7 @@ mod tests {
             ("MC_MEDIA_CONNECT_SETTLE_MS", "99", "10001"),
             ("MC_MH_HEARTBEAT_TIMEOUT_MS", "0", "30001"),
             ("MC_KEK_ROTATION_DEBOUNCE_SECONDS", "29", "301"),
+            ("MC_CLIENT_LOSS_DISAGREEMENT_MIN_CLIENTS", "0", "1001"),
         ] {
             for value in [low, high] {
                 let mut vars = base_vars();
@@ -2467,6 +2558,62 @@ mod tests {
             match Config::from_vars(&vars) {
                 Err(ConfigError::InvalidValue(msg)) => assert!(
                     msg.contains("MC_PLANNED_TRANSFER_MARGIN_MS"),
+                    "{raw}: names the key: {msg}"
+                ),
+                other => panic!("{raw:?}: expected InvalidValue, got {other:?}"),
+            }
+        }
+    }
+
+    /// Story 4 MC-E: the disagreement fraction is accepted in `(0, 1]` (1.0
+    /// and the shipped 0.5 included) and refused at 0, -0, below, above 1,
+    /// NaN, infinities, an underflow to 0, empty and unparseable — with the
+    /// key named; the minimum is accepted at 1 and its max. The values reach
+    /// the threshold unchanged.
+    #[test]
+    fn client_loss_disagreement_bounds() {
+        for (fraction, min) in [("1.0", "1"), ("0.5", "3"), ("0.6", "1000")] {
+            let mut vars = base_vars();
+            vars.insert(
+                "MC_CLIENT_LOSS_DISAGREEMENT_FRACTION".to_string(),
+                fraction.to_string(),
+            );
+            vars.insert(
+                "MC_CLIENT_LOSS_DISAGREEMENT_MIN_CLIENTS".to_string(),
+                min.to_string(),
+            );
+            let t = Config::from_vars(&vars)
+                .expect("in range")
+                .client_loss_disagreement();
+            assert_eq!(t.fraction().get(), fraction.parse::<f64>().unwrap());
+            assert_eq!(t.min_clients().get(), min.parse::<u32>().unwrap());
+        }
+        for raw in [
+            "0", "0.0", "-0.0", "-0.5", "1.0001", "2", "NaN", "nan", "inf", "-inf", "1e-400", "",
+            "half",
+        ] {
+            let mut vars = base_vars();
+            vars.insert(
+                "MC_CLIENT_LOSS_DISAGREEMENT_FRACTION".to_string(),
+                raw.to_string(),
+            );
+            match Config::from_vars(&vars) {
+                Err(ConfigError::InvalidValue(msg)) => assert!(
+                    msg.contains("MC_CLIENT_LOSS_DISAGREEMENT_FRACTION"),
+                    "{raw}: names the key: {msg}"
+                ),
+                other => panic!("{raw:?}: expected InvalidValue, got {other:?}"),
+            }
+        }
+        for raw in ["0", "-1", "1001", "", "3.5", "abc"] {
+            let mut vars = base_vars();
+            vars.insert(
+                "MC_CLIENT_LOSS_DISAGREEMENT_MIN_CLIENTS".to_string(),
+                raw.to_string(),
+            );
+            match Config::from_vars(&vars) {
+                Err(ConfigError::InvalidValue(msg)) => assert!(
+                    msg.contains("MC_CLIENT_LOSS_DISAGREEMENT_MIN_CLIENTS"),
                     "{raw}: names the key: {msg}"
                 ),
                 other => panic!("{raw:?}: expected InvalidValue, got {other:?}"),

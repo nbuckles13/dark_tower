@@ -266,14 +266,18 @@ and planned transfer off a draining handler. Linked both ways with **MC Media Pa
 **Rows**: Handler Heartbeats (ADR-0039 §1, §2, §6), Handler Detection (ADR-0039 §2, §6), Handler
 Set & Dial Credential (ADR-0039 §5), Handler Replacement (ADR-0039 §3, §4; planned transfer split
 by `trigger`, and the Planned Transfer Margin config echo, read beside MH Media's Planned Drain
-Window).
+Window), Client-Loss Evidence & Handler Census (ADR-0039 §8; story 4 MC-E: the required loss
+metric as clients at declaration by prior loss report, the client-weighted share and the ratio
+distribution, the client lead vs N, the interpretability pair N vs MH's QUIC idle timeout,
+client-loss disagreements with their threshold echo, and first declarations vs handlers in use).
 
 **Why it is a separate file.** Split out of `mc-media.json` at story 4 MC-F, when that board's
 ConfigMap reached `dt-guard kustomize`'s 80% annotation headroom (the same split mc-media itself got
 from mc-overview). Story-4 handler panels land HERE; the ADR-0036 media path stays on MC Media.
 
 **When to Use**: a handler death or impairment, a migration that did not complete, a meeting
-awaiting a handler, a drain that shed meetings (`mc_media_handler_migrations_total{trigger="planned_transfer", outcome="timed_out"}`).
+awaiting a handler, a drain that shed meetings (`mc_media_handler_migrations_total{trigger="planned_transfer", outcome="timed_out"}`),
+whether clients saw a handler die before MC did, and whether one MC is declaring many distinct handlers (its own path).
 
 ---
 

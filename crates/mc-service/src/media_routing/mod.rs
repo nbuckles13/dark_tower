@@ -65,7 +65,8 @@ pub use confirm::{
 pub use connectivity::{ConnectionKey, ParticipantConnectivity, Phase, SettleOutcome, Unapplied};
 pub use generation::{GenerationSpaceExhausted, PolicyGenerations};
 pub use handler_health::{
-    assess, next_deadline, HandlerHealth, HealthConfig, Observations, RefusalClass,
+    assess, client_disagreement_began, next_deadline, ClientLoss, DisagreementFraction,
+    DisagreementThreshold, HandlerHealth, HealthConfig, Observations, RefusalClass,
     SuspicionOutcome,
 };
 pub use liveness::{

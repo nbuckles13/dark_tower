@@ -100,9 +100,9 @@ use crate::media_routing::pusher::{
     HandlerRegistration, RegistrationOutcome, RegistrationReporter,
 };
 use crate::media_routing::{
-    assess, next_deadline, Acceptance, ClientHandlerSet, ConnectionKey, HandlerEndpoint,
-    HandlerHealth, HandlerHeartbeat, HandlerId, HandlerLiveness, HandlerPusher, HealthConfig,
-    HeartbeatAnomaly, MeetingAssignment, MeetingHandlers, Observations, Observed,
+    assess, next_deadline, Acceptance, ClientHandlerSet, ClientLoss, ConnectionKey,
+    HandlerEndpoint, HandlerHealth, HandlerHeartbeat, HandlerId, HandlerLiveness, HandlerPusher,
+    HealthConfig, HeartbeatAnomaly, MeetingAssignment, MeetingHandlers, Observations, Observed,
     ParticipantConnectivity, PolicyGenerations, PushJob, PushTarget, RefusalClass, RemovalTrigger,
     SetChange, SlotTable, SourceMute, Unapplied, WorkerDrain,
 };
@@ -169,6 +169,10 @@ pub struct MediaRoutingDeps {
     /// The planned-transfer cutover margin (`MC_PLANNED_TRANSFER_MARGIN_MS`;
     /// story 4 MC-F).
     pub planned_transfer: crate::media_routing::PlannedTransferTiming,
+    /// The client-loss disagreement threshold
+    /// (`MC_CLIENT_LOSS_DISAGREEMENT_FRACTION` /
+    /// `MC_CLIENT_LOSS_DISAGREEMENT_MIN_CLIENTS`; story 4 MC-E).
+    pub client_loss_disagreement: crate::media_routing::DisagreementThreshold,
 }
 
 impl std::fmt::Debug for MediaRoutingDeps {
@@ -202,13 +206,14 @@ impl std::fmt::Debug for MediaRoutingDeps {
 ///
 /// The map key is the meeting id ONLY — never a participant, sender or
 /// handler id. A value equal to `V::default()` FORGETS the meeting (so a
-/// meeting at zero holds no entry).
+/// meeting at zero holds no entry). Nothing here copies a value (`set` moves
+/// it in, `fold` lends it out), so `V` may be a set ([`HandlerCensus`]).
 #[derive(Debug, Default)]
 pub struct MeetingCensus<V> {
     entries: std::sync::Mutex<HashMap<String, V>>,
 }
 
-impl<V: Copy + Default + PartialEq> MeetingCensus<V> {
+impl<V: Default + PartialEq> MeetingCensus<V> {
     /// Record `meeting_id`'s absolute value (the default forgets it).
     pub fn set(&self, meeting_id: &str, value: V) {
         let mut entries = self.lock();
@@ -288,6 +293,172 @@ impl MeetingCensus<bool> {
                 n
             }
         }));
+    }
+}
+
+/// The most recently-declared handler ids [`HandlerCensus`] remembers.
+///
+/// A memory bound, not a correctness one: the set is ALREADY bounded by the
+/// handlers in use (an id is held only while some meeting's set contains it),
+/// which is at most `MC_MAX_MEETINGS` x a handful. Past the cap a declaration
+/// is not remembered, so a later meeting declaring the same handler counts it
+/// AGAIN: overflow over-counts `mc_media_handler_first_declarations_total`,
+/// never grows the set.
+pub const MAX_RECENTLY_DECLARED: usize = 4_096;
+
+/// The pod's HANDLER census (story 4 MC-E; ADR-0039 §8 round 4): the
+/// distinct handler ids across this MC's meetings
+/// (`mc_media_handlers_in_use`) and a bounded set of recently-declared ids
+/// (`mc_media_handler_first_declarations_total`, once per handler per MC
+/// however many meetings declare it). Handler ids are NEVER labels.
+///
+/// # Recompute-and-set, on the [`MeetingCensus`] contract
+///
+/// The per-meeting sets are a `MeetingCensus<BTreeSet<HandlerId>>`: each
+/// meeting actor writes its ABSOLUTE set (Registering and Active members) on
+/// every membership change (freshness), and the controller's
+/// `check_meeting_health` walk prunes meetings that no longer exist and
+/// re-sets the gauge (LOAD-BEARING: a panicked actor never writes its empty
+/// set). Every write and the walk also prune the recently-declared set to the
+/// ids still in some meeting's set — "pruned when a handler leaves every
+/// meeting's set", so a handler re-added later and declared again counts
+/// again.
+///
+/// # Two locks, never nested
+///
+/// The recently-declared set has its own lock. Each operation reads the
+/// per-meeting sets (taking and releasing their lock) and THEN takes this
+/// one, so no lock order exists to invert. The residual is a stale entry
+/// (its handler left its last set between the read and the insert): it is
+/// pruned at the next write or walk, and it is under the cap meanwhile.
+///
+/// # Load-bearing order: claim BEFORE the removal's set write
+///
+/// The declaring actor calls [`Self::first_declaration`] BEFORE its removal
+/// writes the set without the handler (`MeetingActor::declare_and_remove`).
+/// So the handler is in the declaring meeting's own set at the claim, the
+/// entry is kept while any other meeting still holds it (deduping their
+/// declarations), and the actor's own write right after prunes it when no
+/// meeting does. Claiming AFTER the write would let that write prune the
+/// entry of an earlier meeting's declaration first — and the next meeting
+/// declaring the same handler would count it a second time.
+///
+/// Touched only at membership change, declaration and the walk; no await.
+#[derive(Debug)]
+pub struct HandlerCensus {
+    sets: MeetingCensus<BTreeSet<HandlerId>>,
+    declared: std::sync::Mutex<RecentlyDeclared>,
+    cap: usize,
+}
+
+#[derive(Debug, Default)]
+struct RecentlyDeclared {
+    ids: HashSet<HandlerId>,
+    /// The cap was hit and not yet left (the WARN is once per overflow).
+    overflowed: bool,
+}
+
+impl Default for HandlerCensus {
+    fn default() -> Self {
+        Self::with_cap(MAX_RECENTLY_DECLARED)
+    }
+}
+
+impl HandlerCensus {
+    /// A census remembering at most `cap` recently-declared handlers.
+    #[must_use]
+    pub fn with_cap(cap: usize) -> Self {
+        Self {
+            sets: MeetingCensus::default(),
+            declared: std::sync::Mutex::new(RecentlyDeclared::default()),
+            cap,
+        }
+    }
+
+    /// Record `meeting_id`'s ABSOLUTE handler set (empty forgets it), prune
+    /// and publish (freshness).
+    pub fn set(&self, meeting_id: &str, handlers: BTreeSet<HandlerId>) {
+        self.sets.set(meeting_id, handlers);
+        self.publish();
+    }
+
+    /// Forget every meeting `live` rejects, prune and publish (the
+    /// controller's walk: load-bearing).
+    pub fn retain(&self, live: impl Fn(&str) -> bool) {
+        self.sets.retain(live);
+        self.publish();
+    }
+
+    /// Recompute the distinct handlers in use, prune the recently-declared
+    /// set to them, and set `mc_media_handlers_in_use`.
+    pub fn publish(&self) {
+        let in_use = self.in_use();
+        {
+            let mut declared = self.lock_declared();
+            declared.ids.retain(|id| in_use.contains(id));
+            if declared.ids.len() < self.cap {
+                declared.overflowed = false;
+            }
+        }
+        metrics::set_handlers_in_use(u64::try_from(in_use.len()).unwrap_or(u64::MAX));
+    }
+
+    /// Claim `id`'s declaration: `true` iff it is the FIRST on this MC since
+    /// the handler last left every meeting's set (the caller counts
+    /// `mc_media_handler_first_declarations_total` once its removal happened).
+    /// Must precede the declaring meeting's removal write (see the type doc).
+    #[must_use]
+    pub fn first_declaration(&self, id: &HandlerId) -> bool {
+        let in_use = self
+            .sets
+            .fold(false, |found, set| found || set.contains(id));
+        let mut declared = self.lock_declared();
+        if declared.ids.contains(id) {
+            return false;
+        }
+        if in_use {
+            if declared.ids.len() < self.cap {
+                declared.ids.insert(id.clone());
+            } else if !std::mem::replace(&mut declared.overflowed, true) {
+                warn!(
+                    target: "mc.actor.controller",
+                    cap = self.cap,
+                    recently_declared = declared.ids.len(),
+                    "Recently-declared handler set is at its cap: further first declarations \
+                     are not remembered, so mc_media_handler_first_declarations_total \
+                     over-counts until handlers leave every meeting's set"
+                );
+            }
+        }
+        true
+    }
+
+    /// Release a claim whose removal was REFUSED (an MC invariant violation):
+    /// nothing was counted, so the handler must stay claimable — otherwise
+    /// every later declaration of it would be deduped against a claim that
+    /// never counted, and the handler would never count at all.
+    pub fn release_claim(&self, id: &HandlerId) {
+        let mut declared = self.lock_declared();
+        declared.ids.remove(id);
+        if declared.ids.len() < self.cap {
+            declared.overflowed = false;
+        }
+    }
+
+    /// The distinct handler ids across every recorded meeting.
+    fn in_use(&self) -> BTreeSet<HandlerId> {
+        self.sets.fold(BTreeSet::new(), |mut all, set| {
+            all.extend(set.iter().cloned());
+            all
+        })
+    }
+
+    fn lock_declared(&self) -> std::sync::MutexGuard<'_, RecentlyDeclared> {
+        // Same poison contract as `MeetingCensus::lock`: every write is a
+        // single insert, retain or flag flip, so a poisoned set is still valid.
+        self.declared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -427,6 +598,10 @@ pub(crate) fn test_join_media() -> JoinMedia {
             acquirer: Arc::new(NoCapacityGc),
             replacement: crate::media_routing::ReplacementTiming::from_config_ms(1_000, 30_000),
             planned_transfer: crate::media_routing::PlannedTransferTiming::from_margin_ms(5_000),
+            client_loss_disagreement: crate::media_routing::DisagreementThreshold::new(
+                crate::media_routing::DisagreementFraction::new(0.5).unwrap(),
+                std::num::NonZeroU32::new(3).unwrap(),
+            ),
         }),
         declared: crate::media_kind::ClientMediaStates::live(PublishSet::of(&[
             MediaKindLabel::Audio,
@@ -1002,7 +1177,8 @@ impl MeetingMedia {
         &self,
         member: &HandlerId,
     ) -> Option<crate::media_routing::handler_health::ContractFault> {
-        self.observations(member)
+        // The refusal gate reads no client input.
+        self.observations(member, ClientLoss::default())
             .effective_refusal()
             .contract_fault()
     }
@@ -1023,11 +1199,25 @@ impl MeetingMedia {
     fn health_config(&self) -> Option<HealthConfig> {
         self.deps
             .as_ref()
-            .map(|d| HealthConfig::from_timing(d.heartbeat))
+            .map(|d| HealthConfig::new(d.heartbeat, d.client_loss_disagreement))
     }
 
-    /// What the actor knows about one member, for `assess`.
-    fn observations(&self, id: &HandlerId) -> Observations {
+    /// The participants MC BELIEVES connected to `id`: at least one live
+    /// MH-reported connection key on it (server-observed, heartbeat-
+    /// reconciled; never a client report). The loss metric's denominator.
+    pub(super) fn believed_connected<'a>(
+        &'a self,
+        id: &'a HandlerId,
+    ) -> impl Iterator<Item = &'a str> + 'a {
+        self.views
+            .iter()
+            .filter(move |(_, v)| v.connectivity.keys_on(id).next().is_some())
+            .map(|(p, _)| p.as_str())
+    }
+
+    /// What the actor knows about one member, for `assess`, with the client
+    /// loss snapshot the actor built.
+    fn observations(&self, id: &HandlerId, client_loss: ClientLoss) -> Observations {
         let record = self.liveness.get(id);
         Observations {
             confirmed_at: self.handlers.confirmed_at(id),
@@ -1040,17 +1230,21 @@ impl MeetingMedia {
             draining: record.is_some_and(|l| {
                 crate::media_routing::handler_health::is_draining(l.serving_state)
             }),
-            // Weight 0 in this story: MC-E wires the client loss census here.
-            client_loss_reports: 0,
+            client_loss,
         }
     }
 
     /// Assess ONE member at `now` and store the result. `None` for a
     /// non-member, or before a join installed the deps (nothing confirmed).
-    pub(super) fn assess_handler(&mut self, id: &HandlerId, now: Instant) -> Option<HealthStep> {
+    pub(super) fn assess_handler(
+        &mut self,
+        id: &HandlerId,
+        now: Instant,
+        client_loss: ClientLoss,
+    ) -> Option<HealthStep> {
         let cfg = self.health_config()?;
         self.handlers.get(id)?;
-        let observations = self.observations(id);
+        let observations = self.observations(id, client_loss);
         let previous = self.health.get(id).copied().unwrap_or_default();
         let next = assess(now, &observations, &previous, &cfg);
         self.health.insert(id.clone(), next);
@@ -1060,14 +1254,6 @@ impl MeetingMedia {
             next,
             observations,
         })
-    }
-
-    /// Assess every member at `now` (the deadline arm).
-    pub(super) fn assess_all(&mut self, now: Instant) -> Vec<HealthStep> {
-        let ids: Vec<HandlerId> = self.handlers.ids().cloned().collect();
-        ids.iter()
-            .filter_map(|id| self.assess_handler(id, now))
-            .collect()
     }
 
     /// The earliest instant any member's health could change without a
@@ -1080,7 +1266,9 @@ impl MeetingMedia {
             .ids()
             .filter_map(|id| {
                 let health = self.health.get(id).copied().unwrap_or_default();
-                next_deadline(&health, &self.observations(id), &cfg)
+                // The wake reads the recorded health (an open client quorum
+                // included), never a fresh client snapshot.
+                next_deadline(&health, &self.observations(id, ClientLoss::default()), &cfg)
             })
             .min()
     }
@@ -1929,6 +2117,126 @@ mod census_tests {
         snap.gauge("mc_media_server_muted_sources")
             .with_labels(&[(MEDIA_KIND_LABEL, "audio")])
             .assert_value(0.0);
+    }
+
+    fn ids(names: &[&str]) -> BTreeSet<HandlerId> {
+        names.iter().map(|n| HandlerId::new(*n)).collect()
+    }
+
+    fn kc() -> (&'static str, &'static str) {
+        (
+            common::observability::labels::KEY_CUSTODY_LABEL,
+            common::observability::labels::KEY_CUSTODY_OPERATOR,
+        )
+    }
+
+    /// `mc_media_handlers_in_use` counts DISTINCT handlers across meetings
+    /// (two sharing H plus one other = 2), recompute-and-set; the walk's
+    /// prune recomputes it when a meeting dies without writing its empty set.
+    #[test]
+    fn handlers_in_use_is_distinct_and_recomputed_on_the_walk() {
+        let census = HandlerCensus::default();
+        let snap = MetricAssertion::snapshot();
+        census.set("m-1", ids(&["h"]));
+        census.set("m-2", ids(&["h", "k"]));
+        snap.gauge("mc_media_handlers_in_use")
+            .with_labels(&[kc()])
+            .assert_value(2.0);
+        census.retain(|id| id != "m-2"); // m-2's actor died without clearing
+        snap.gauge("mc_media_handlers_in_use")
+            .with_labels(&[kc()])
+            .assert_value(1.0);
+        census.set("m-1", BTreeSet::new());
+        snap.gauge("mc_media_handlers_in_use")
+            .with_labels(&[kc()])
+            .assert_value(0.0);
+    }
+
+    /// One handler declared by three meetings is ONE first declaration; once
+    /// it left every set (pruned) and is re-added and declared again, it is a
+    /// first declaration again — a never-pruned set would fail the last arm.
+    /// The claims follow the load-bearing order: each meeting claims BEFORE
+    /// writing its set without the handler.
+    #[test]
+    fn first_declaration_once_per_handler_and_again_after_it_left_every_set() {
+        let census = HandlerCensus::default();
+        let h = HandlerId::new("h");
+        for m in ["m-1", "m-2", "m-3"] {
+            census.set(m, ids(&["h"]));
+        }
+        assert!(census.first_declaration(&h), "m-1 declares first");
+        census.set("m-1", BTreeSet::new());
+        assert!(!census.first_declaration(&h), "m-2: deduped");
+        census.set("m-2", BTreeSet::new());
+        assert!(!census.first_declaration(&h), "m-3: deduped");
+        census.set("m-3", BTreeSet::new()); // h left every set: pruned
+        census.set("m-4", ids(&["h"]));
+        assert!(census.first_declaration(&h), "re-added and declared again");
+    }
+
+    /// Pins the load-bearing ORDER (see the type doc): two meetings hold H
+    /// and both declare it. Claim-then-write (what `declare_and_remove` does)
+    /// counts H once; write-then-claim lets the second meeting's own write
+    /// prune the first claim before its own, counting H twice.
+    #[test]
+    fn claiming_before_the_removal_write_is_what_dedupes() {
+        let h = HandlerId::new("h");
+
+        let right = HandlerCensus::default();
+        right.set("m-1", ids(&["h"]));
+        right.set("m-2", ids(&["h"]));
+        assert!(right.first_declaration(&h));
+        right.set("m-1", BTreeSet::new());
+        assert!(!right.first_declaration(&h), "claim, then write: once");
+        right.set("m-2", BTreeSet::new());
+
+        let wrong = HandlerCensus::default();
+        wrong.set("m-1", ids(&["h"]));
+        wrong.set("m-2", ids(&["h"]));
+        wrong.set("m-1", BTreeSet::new());
+        assert!(wrong.first_declaration(&h));
+        wrong.set("m-2", BTreeSet::new());
+        assert!(
+            wrong.first_declaration(&h),
+            "write, then claim: the second meeting counts H again"
+        );
+    }
+
+    /// A claim released after a refused removal (nothing counted) leaves the
+    /// handler claimable: the next meeting declaring it is a first declaration.
+    #[test]
+    fn a_released_claim_is_claimable_again() {
+        let census = HandlerCensus::default();
+        let h = HandlerId::new("h");
+        census.set("m-1", ids(&["h"]));
+        census.set("m-2", ids(&["h"]));
+        assert!(census.first_declaration(&h));
+        census.release_claim(&h); // m-1's removal was refused
+        assert!(census.first_declaration(&h), "m-2 counts it");
+        assert!(!census.first_declaration(&h), "and is remembered again");
+    }
+
+    /// At the cap a claim is not remembered, so a repeat declaration counts
+    /// again (over-count), and the set never exceeds the cap.
+    #[test]
+    fn the_recently_declared_set_over_counts_past_its_cap() {
+        let census = HandlerCensus::with_cap(2);
+        census.set("m-1", ids(&["a", "b", "c"]));
+        census.set("m-2", ids(&["a", "b", "c"]));
+        for id in ["a", "b", "c"] {
+            assert!(census.first_declaration(&HandlerId::new(id)));
+        }
+        assert!(!census.first_declaration(&HandlerId::new("a")), "a is held");
+        assert!(
+            census.first_declaration(&HandlerId::new("c")),
+            "c was over the cap: counted again"
+        );
+        assert_eq!(census.lock_declared().ids.len(), 2, "never above the cap");
+        // Below the cap again (a left every set): remembered once more.
+        census.set("m-1", ids(&["b", "c"]));
+        census.set("m-2", ids(&["b", "c"]));
+        assert!(census.first_declaration(&HandlerId::new("c")));
+        assert!(!census.first_declaration(&HandlerId::new("c")));
     }
 
     /// The awaiting-handler census: recompute-and-set, `false` forgets, and

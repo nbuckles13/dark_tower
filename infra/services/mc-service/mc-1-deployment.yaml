@@ -350,6 +350,20 @@ spec:
             configMapKeyRef:
               name: mc-service-config
               key: MC_PLANNED_TRANSFER_MARGIN_MS
+        # ---- Client-loss disagreement threshold (ADR-0039 §8; story 4 MC-E) ----
+        # Required by MC with no Rust default, deliberately NOT `optional:`:
+        # missing, unparseable or out of range refuses boot. Keep in lockstep
+        # with the other mc-N-deployment.yaml. See the keys' comment in config.env.
+        - name: MC_CLIENT_LOSS_DISAGREEMENT_FRACTION
+          valueFrom:
+            configMapKeyRef:
+              name: mc-service-config
+              key: MC_CLIENT_LOSS_DISAGREEMENT_FRACTION
+        - name: MC_CLIENT_LOSS_DISAGREEMENT_MIN_CLIENTS
+          valueFrom:
+            configMapKeyRef:
+              name: mc-service-config
+              key: MC_CLIENT_LOSS_DISAGREEMENT_MIN_CLIENTS
         # ---- Capacity caps (R-37; story 4 MC-A) ----
         # Required by MC with no Rust default, deliberately NOT `optional:`:
         # missing, unparseable or 0 refuses boot. Keep in lockstep with the

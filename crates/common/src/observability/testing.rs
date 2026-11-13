@@ -127,12 +127,18 @@
 //! can be called repeatedly on the same snapshot and will see the same
 //! result until new emissions land.
 //!
-//! **Histograms DRAIN on snapshot.** The recorder stores histogram
-//! observations in a buffer that is drained every time a snapshot is read.
-//! Every `assert_observation_count*` call takes a fresh snapshot, so two
-//! successive `assert_observation_count*` calls on the same histogram
-//! name+labels within one test will see the emitted observations on the
-//! first call and zero on the second. Assert each histogram name+labels
+//! **Histograms DRAIN on their OWN read.** The recorder stores histogram
+//! observations in a buffer. A histogram query (`assert_observation_count*`,
+//! `assert_unobserved`) drains exactly the entries matching ITS name and
+//! label filter, so two successive `assert_observation_count*` calls on the
+//! same histogram name+labels within one test will see the emitted
+//! observations on the first call and zero on the second. Every other
+//! histogram is read by copy, and counter/gauge queries drain nothing: a
+//! read of an unrelated metric never empties a histogram (pinned by
+//! `a_counter_read_does_not_drain_histograms` and
+//! `a_histogram_read_drains_only_its_own_name_and_labels`; before story 4
+//! MC-E every read drained every histogram, silently making later
+//! histogram assertions vacuous). Assert each histogram name+labels
 //! combination at most once per snapshot; emit more observations and/or
 //! take a new `MetricAssertion::snapshot()` if you need to check a
 //! subsequent window.
@@ -493,9 +499,12 @@ impl MetricSnapshot {
     }
 
     /// Read every entry from the per-test recorder. Counters and gauges are
-    /// loaded non-destructively; histograms are drained (see module doc
-    /// §"Histograms DRAIN on snapshot").
-    fn take_entries(&self) -> Vec<(EntryKey, EntryValue)> {
+    /// loaded non-destructively. Histograms are DRAINED only when they match
+    /// `drain` — the querying histogram's own name and label filter; every
+    /// other histogram is read by copy (see module doc §"Histograms DRAIN on
+    /// their OWN read"). Counter and gauge queries pass `None`, so they never
+    /// drain anything.
+    fn take_entries(&self, drain: Option<(&str, &[LabelFilter])>) -> Vec<(EntryKey, EntryValue)> {
         let mut out = Vec::new();
 
         {
@@ -547,7 +556,14 @@ impl MetricSnapshot {
                     .observations
                     .lock()
                     .expect("test recorder histogram observations poisoned");
-                let drained: Vec<f64> = obs.drain(..).collect();
+                let own = drain.is_some_and(|(name, filter)| {
+                    entry.name == name && labels_match(&entry.labels, filter)
+                });
+                let drained: Vec<f64> = if own {
+                    obs.drain(..).collect()
+                } else {
+                    obs.clone()
+                };
                 out.push((
                     EntryKey {
                         kind: MetricKind::Histogram,
@@ -720,7 +736,7 @@ impl CounterQuery<'_> {
             name,
             labels,
         } = self;
-        let entries = snapshot.take_entries();
+        let entries = snapshot.take_entries(None);
         ensure_no_kind_mismatch(&entries, name, MetricKind::Counter);
 
         let actual = counter_value(&entries, name, &labels).unwrap_or(0);
@@ -759,21 +775,18 @@ impl CounterQuery<'_> {
     /// them looks free. It is not, and the reason is a correctness constraint
     /// rather than a style preference: `assert_delta` calls
     /// `dump_failure_context` on mismatch, which needs the entries a SECOND
-    /// time. `take_entries` is non-destructive for counters and gauges but
-    /// **DRAINS histograms** (`obs.drain(..)`; see the module doc §"Histograms
-    /// DRAIN on snapshot"). A delegating `assert_delta` would therefore take
-    /// entries twice on its failure path and empty the histogram maps for any
-    /// later `HistogramQuery` in the same test — a failing counter assertion
-    /// would silently produce a confusing second failure that masks the first.
+    /// time. `take_entries` drains the histogram entries its caller names
+    /// (`obs.drain(..)`; see the module doc §"Histograms DRAIN on their OWN
+    /// read") — a counter query names none, so this read is non-destructive,
+    /// but the helper is not, and a delegation that ever passed a drain
+    /// target would take entries twice on its failure path.
     ///
-    /// Note the exact scope: **non-destructive for counters and gauges;
-    /// histograms drain.** The unqualified reading — "`take_entries` is
-    /// misleadingly named but non-destructive" — is false, and it is false in
-    /// the direction that licenses the collapse above. The genuinely shared
-    /// logic (`counter_value`, `ensure_no_kind_mismatch`) is already extracted
-    /// into free functions with one home each; what remains duplicated is a
-    /// preamble whose extraction would need a helper that hands back its own
-    /// inputs.
+    /// Note the exact scope: **non-destructive for counters, gauges and every
+    /// histogram the caller does not name; the named histogram drains.** The
+    /// genuinely shared logic (`counter_value`, `ensure_no_kind_mismatch`) is
+    /// already extracted into free functions with one home each; what remains
+    /// duplicated is a preamble whose extraction would need a helper that hands
+    /// back its own inputs.
     #[must_use]
     pub fn delta(self) -> u64 {
         let Self {
@@ -781,7 +794,7 @@ impl CounterQuery<'_> {
             name,
             labels,
         } = self;
-        let entries = snapshot.take_entries();
+        let entries = snapshot.take_entries(None);
         ensure_no_kind_mismatch(&entries, name, MetricKind::Counter);
         counter_value(&entries, name, &labels).unwrap_or(0)
     }
@@ -809,7 +822,7 @@ impl CounterQuery<'_> {
             name,
             labels,
         } = self;
-        let entries = snapshot.take_entries();
+        let entries = snapshot.take_entries(None);
         ensure_no_kind_mismatch(&entries, name, MetricKind::Counter);
         if let Some(val) = counter_value(&entries, name, &labels) {
             panic!("counter '{name}' with labels {labels:?}: expected unobserved, got value {val}");
@@ -854,7 +867,7 @@ impl GaugeQuery<'_> {
             name,
             labels,
         } = self;
-        let entries = snapshot.take_entries();
+        let entries = snapshot.take_entries(None);
         ensure_no_kind_mismatch(&entries, name, MetricKind::Gauge);
         match gauge_value(&entries, name, &labels) {
             Some(val) => assert!(
@@ -872,7 +885,7 @@ impl GaugeQuery<'_> {
             name,
             labels,
         } = self;
-        let entries = snapshot.take_entries();
+        let entries = snapshot.take_entries(None);
         ensure_no_kind_mismatch(&entries, name, MetricKind::Gauge);
         match gauge_value(&entries, name, &labels) {
             Some(val) => assert!(
@@ -901,7 +914,7 @@ impl GaugeQuery<'_> {
             name,
             labels,
         } = self;
-        let entries = snapshot.take_entries();
+        let entries = snapshot.take_entries(None);
         ensure_no_kind_mismatch(&entries, name, MetricKind::Gauge);
         if let Some(val) = gauge_value(&entries, name, &labels) {
             panic!("gauge '{name}' with labels {labels:?}: expected unobserved, got value {val}");
@@ -947,7 +960,7 @@ impl HistogramQuery<'_> {
             name,
             labels,
         } = self;
-        let entries = snapshot.take_entries();
+        let entries = snapshot.take_entries(Some((name, &labels)));
         ensure_no_kind_mismatch(&entries, name, MetricKind::Histogram);
         let count = histogram_count(&entries, name, &labels);
         if count != expected {
@@ -969,7 +982,7 @@ impl HistogramQuery<'_> {
             name,
             labels,
         } = self;
-        let entries = snapshot.take_entries();
+        let entries = snapshot.take_entries(Some((name, &labels)));
         ensure_no_kind_mismatch(&entries, name, MetricKind::Histogram);
         let count = histogram_count(&entries, name, &labels);
         if count < expected {
@@ -995,8 +1008,9 @@ impl HistogramQuery<'_> {
     /// adjacency case (ADR-0032).
     ///
     /// **Drain-on-read caveat (load-bearing):** each `assert_observation_count*`
-    /// call drains the histogram entries; a subsequent `assert_unobserved` on
-    /// the same name+labels would falsely pass. Either: (a) call
+    /// call drains the entries matching ITS name+labels (and only those); a
+    /// subsequent `assert_unobserved` on the same name+labels would falsely
+    /// pass. Reads of any other metric never drain this one. Either: (a) call
     /// `assert_unobserved` BEFORE any `assert_observation_count*` on the same
     /// histogram name+labels in this snapshot, or (b) take a fresh
     /// [`MetricAssertion::snapshot`] between assertions. The `CounterQuery` and
@@ -1011,7 +1025,7 @@ impl HistogramQuery<'_> {
             name,
             labels,
         } = self;
-        let entries = snapshot.take_entries();
+        let entries = snapshot.take_entries(Some((name, &labels)));
         ensure_no_kind_mismatch(&entries, name, MetricKind::Histogram);
         let count = histogram_count(&entries, name, &labels);
         assert!(
@@ -1331,7 +1345,7 @@ mod tests {
     // (name, labels) tuple FALSELY PASSES even though the histogram WAS
     // observed. This is intentional (lighter alternative to a runtime
     // tracking flag); the module doc-comment §"Unobserved semantics" and
-    // §"Histograms DRAIN on snapshot" document the constraint and the
+    // §"Histograms DRAIN on their OWN read" document the constraint and the
     // developer is expected to take a fresh MetricAssertion::snapshot()
     // between assertions. This test is non-panicking: it PASSES,
     // demonstrating the trap exists. A future refactor that makes
@@ -1386,5 +1400,38 @@ mod tests {
         counter!("testing_unobs_kind_mismatch_for_hist").increment(1);
         snap.histogram("testing_unobs_kind_mismatch_for_hist")
             .assert_unobserved();
+    }
+
+    // Story 4 MC-E (test review): a read of ANY other metric must not drain
+    // a histogram. Both of these FAILED before the fix (every read drained
+    // every histogram, so a later `assert_unobserved` on histogram B passed
+    // vacuously and its `assert_observation_count(1)` failed).
+    #[test]
+    fn a_counter_read_does_not_drain_histograms() {
+        let snap = MetricAssertion::snapshot();
+        histogram!("testing_trap_hist_a").record(1.0);
+        histogram!("testing_trap_hist_b").record(1.0);
+        counter!("testing_trap_counter").increment(1);
+        snap.counter("testing_trap_counter").assert_delta(1);
+        snap.histogram("testing_trap_hist_a")
+            .assert_observation_count(1);
+        snap.histogram("testing_trap_hist_b")
+            .assert_observation_count(1);
+    }
+
+    #[test]
+    fn a_histogram_read_drains_only_its_own_name_and_labels() {
+        let snap = MetricAssertion::snapshot();
+        histogram!("testing_trap_hist_c", "k" => "x").record(1.0);
+        histogram!("testing_trap_hist_c", "k" => "y").record(1.0);
+        histogram!("testing_trap_hist_d").record(1.0);
+        snap.histogram("testing_trap_hist_c")
+            .with_labels(&[("k", "x")])
+            .assert_observation_count(1);
+        snap.histogram("testing_trap_hist_d")
+            .assert_observation_count(1);
+        snap.histogram("testing_trap_hist_c")
+            .with_labels(&[("k", "y")])
+            .assert_observation_count(1);
     }
 }

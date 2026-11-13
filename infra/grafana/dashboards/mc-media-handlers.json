@@ -1622,6 +1622,709 @@
       ],
       "title": "Planned Transfer Margin",
       "type": "stat"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 68
+      },
+      "id": 218,
+      "panels": [],
+      "title": "Client-Loss Evidence & Handler Census (ADR-0039 \u00a78)",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Required loss metric, count (story 4 MC-E, R-33): at each heartbeat_timeout / apply_lag declaration (never planned_transfer), the clients MC believed connected to the handler (MH-reported connectivity), split by whether their LATEST status for its handler_ref was a loss received while the ref was in the set (before_declaration) or not (not_reported). MC receipt time only. Interpretable only when MH's QUIC idle timeout is about N (see the Interpretability panel). Client-asserted evidence: forgeable by >= MC_CLIENT_LOSS_DISAGREEMENT_MIN_CLIENTS colluding participants, not a trust signal. No meeting, participant or handler label. key_custody=operator.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 69
+      },
+      "id": 219,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (reported) (increase(mc_media_handler_loss_clients_total[$__rate_interval]))",
+          "legendFormat": "{{reported}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Clients at Declaration by Prior Loss Report",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Fleet client-weighted share of believed-connected clients that had reported losing the handler before MC declared it, over the SELECTED range: sum(increase(before_declaration)) / sum(increase(all)) (ADR-0029: a ratio of increases, never an average of rates). Empty when nothing was declared in the range. Low share with N about equal to MH's idle timeout = clients usually do not notice first; promoting client connectivity to a trigger needs a high share AND security review. Client-asserted evidence: forgeable by >= MC_CLIENT_LOSS_DISAGREEMENT_MIN_CLIENTS colluding participants, not a trust signal. No meeting, participant or handler label. key_custody=operator.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 12,
+        "x": 12,
+        "y": 69
+      },
+      "id": 220,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum(increase(mc_media_handler_loss_clients_total{reported=\"before_declaration\"}[$__range])) / sum(increase(mc_media_handler_loss_clients_total[$__range]))",
+          "legendFormat": "share",
+          "range": false,
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "title": "Client-Weighted Prior-Report Share (selected range)",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "The loss metric's interpretability condition (ADR-0039 \u00a78): MC's N (mc_media_handler_heartbeat_deadline_seconds) beside MH's QUIC max_idle_timeout (mh_media_transport_idle_timeout_seconds, how long a client takes to notice a dead MH). The prior-report share means something only when the two are about equal; otherwise a low share reads as 'clients don't notice' when clients were configured to notice later. CONFIG ECHOES.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 12,
+        "x": 12,
+        "y": 73
+      },
+      "id": 221,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max(mc_media_handler_heartbeat_deadline_seconds)",
+          "legendFormat": "MC N",
+          "range": false,
+          "refId": "A",
+          "instant": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max(mh_media_transport_idle_timeout_seconds)",
+          "legendFormat": "MH QUIC idle timeout",
+          "range": false,
+          "refId": "B",
+          "instant": true
+        }
+      ],
+      "title": "Interpretability: N vs MH QUIC Idle Timeout",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Required loss metric, percent (mc_media_handler_loss_prior_report_ratio, buckets 0 .1 .25 .5 .75 .9 1): reported / connected per (meeting, handler) declaration - meeting-weighted - p50/p95 over the SELECTED range, and the number of observations. NOT observed with nobody connected (no 0/0), so the count may trail the heartbeat_timeout+apply_lag declarations; the gap is 'declared with nobody connected'. Absent until the first declaration. Client-asserted evidence: forgeable by >= MC_CLIENT_LOSS_DISAGREEMENT_MIN_CLIENTS colluding participants, not a trust signal. No meeting, participant or handler label. key_custody=operator.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "C"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 77
+      },
+      "id": 222,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(mc_media_handler_loss_prior_report_ratio_bucket[$__range])))",
+          "legendFormat": "p50",
+          "range": false,
+          "refId": "A",
+          "instant": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(mc_media_handler_loss_prior_report_ratio_bucket[$__range])))",
+          "legendFormat": "p95",
+          "range": false,
+          "refId": "B",
+          "instant": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum(increase(mc_media_handler_loss_prior_report_ratio_count[$__range]))",
+          "legendFormat": "declarations observed",
+          "range": false,
+          "refId": "C",
+          "instant": true
+        }
+      ],
+      "title": "Prior-Report Share Distribution (selected range)",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "mc_media_handler_loss_client_lead_seconds: the earliest counted client loss report (MC receipt) -> the declaration, observed only when at least one client reported; p50/p95 over the SELECTED range beside N. Buckets derived from N (N/4 .. 5N). A crash lead is usually under N when MH's idle timeout is about N; an apply_lag declaration (Impaired past L = 2N) can be led by more than 2N. Client-asserted evidence: forgeable by >= MC_CLIENT_LOSS_DISAGREEMENT_MIN_CLIENTS colluding participants, not a trust signal. No meeting, participant or handler label. key_custody=operator.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 77
+      },
+      "id": 223,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(mc_media_handler_loss_client_lead_seconds_bucket[$__range])))",
+          "legendFormat": "p50",
+          "range": false,
+          "refId": "A",
+          "instant": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(mc_media_handler_loss_client_lead_seconds_bucket[$__range])))",
+          "legendFormat": "p95",
+          "range": false,
+          "refId": "B",
+          "instant": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max(mc_media_handler_heartbeat_deadline_seconds)",
+          "legendFormat": "N",
+          "range": false,
+          "refId": "C",
+          "instant": true
+        }
+      ],
+      "title": "Client Lead Before Declaration p50/p95 vs N (selected range)",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "mc_media_handler_client_loss_disagreements_total: (meeting, handler) EPISODES where at least the configured fraction AND minimum count of a handler's believed-connected clients reported losing it for longer than N while its heartbeats kept it Live (Lagging/Draining included). The false-negative half of the evidence; never a removal in this story. It detects a forged heartbeat ONLY when the forger echoes the live connection ids: an empty or wrong list retires the believed-connected set through the heartbeat reconcile, so this stays 0. Zero is NOT evidence of no forgery. A forged-heartbeat MH in k meetings yields k; re-entry after the quorum is lost counts again (at most one per N per pair). Threshold: Disagreement Threshold panel. No alert (evidence telemetry). Client-asserted evidence: forgeable by >= MC_CLIENT_LOSS_DISAGREEMENT_MIN_CLIENTS colluding participants, not a trust signal. No meeting, participant or handler label. key_custody=operator.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 85
+      },
+      "id": 224,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum(increase(mc_media_handler_client_loss_disagreements_total[$__rate_interval]))",
+          "legendFormat": "disagreements",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Client-Loss Disagreements",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "MC-own-path signal (ADR-0039 \u00a78 round 4): mc_media_handler_first_declarations_total counts a HANDLER once per MC however many meetings declare it (HandlerCensus; counts again after the handler left every meeting's set), against mc_media_handlers_in_use, both PER INSTANCE (the signature is one MC's own path), the distinct handlers across this MC's meetings (recompute-and-set). Many distinct handlers declared by ONE MC while they are a high share of its in-use handlers points at MC's own path, not the MHs (one MH death cannot). Over-counts past MAX_RECENTLY_DECLARED (a WARN is logged): a jump beside that WARN is the cap. The warning rule is OBS-ALERTS'. No handler label. key_custody=operator.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 85
+      },
+      "id": 225,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (instance, trigger) (increase(mc_media_handler_first_declarations_total[$__rate_interval]))",
+          "legendFormat": "first declarations {{trigger}} {{instance}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (instance) (mc_media_handlers_in_use)",
+          "legendFormat": "in use {{instance}}",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "First Declarations by Trigger vs Handlers in Use",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "mc_media_handler_client_loss_disagreement_ratio (MC_CLIENT_LOSS_DISAGREEMENT_FRACTION, (0, 1], shipped 0.5) and mc_media_handler_client_loss_disagreement_min_clients (MC_CLIENT_LOSS_DISAGREEMENT_MIN_CLIENTS, [1, 1000], shipped 3): both must be met for a disagreement. OBSERVATIONAL ONLY: tuning changes only Client-Loss Disagreements. A CONFIG ECHO, per instance. key_custody=operator.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 12,
+        "x": 0,
+        "y": 93
+      },
+      "id": 226,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max by (instance) (mc_media_handler_client_loss_disagreement_ratio)",
+          "legendFormat": "fraction {{instance}}",
+          "range": false,
+          "refId": "A",
+          "instant": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max by (instance) (mc_media_handler_client_loss_disagreement_min_clients)",
+          "legendFormat": "min clients {{instance}}",
+          "range": false,
+          "refId": "B",
+          "instant": true
+        }
+      ],
+      "title": "Disagreement Threshold",
+      "type": "stat"
     }
   ],
   "refresh": "1m",
