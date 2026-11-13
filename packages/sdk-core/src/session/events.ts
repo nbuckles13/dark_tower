@@ -31,6 +31,7 @@ import type { Vp8Profile } from '../media/setup/vp8.js';
 import type { WebTransportConnectFn } from '../signaling/SignalingClient.js';
 import type { HandlerSetView, MediaHandlerView } from '../media/handlerSet.js';
 import type { TransportScheduler } from '../media/events.js';
+import type { SlotReconnectingChangedEvent } from './slotContinuity.js';
 import type { MediaFault } from '../media/lifecycle/AudioPipeline.js';
 import type { MuteSnapshot } from '../media/lifecycle/muteState.js';
 import type {
@@ -253,6 +254,18 @@ export interface MeetingSessionEventMap {
    * string. Fires on transitions only.
    */
   cameraHealthChanged: CameraHealthChangedEvent;
+  /**
+   * A receive slot entered or left the client-local RECONNECTING state (ADR-0039
+   * §4 "Slot states"; story 4 C2 R-20): this client OBSERVED the loss of the
+   * handler the slot's latest assignment names, or that handler left the set
+   * while the slot still named it. Cleared when the slot's assignment names a
+   * connected handler, or at `media.handlers.reconnectingCapMs`. Never set by a
+   * planned transfer (the edge moves before the old handler is removed). NOT a
+   * wire state and never inferred from silence. TRANSITIONS ONLY. While set, a
+   * UI shows the previous occupant as a reconnecting avatar — never a frozen
+   * live frame, never a vanished participant.
+   */
+  slotReconnectingChanged: SlotReconnectingChangedEvent;
 }
 
 /** Payload of `cameraHealthChanged`. */

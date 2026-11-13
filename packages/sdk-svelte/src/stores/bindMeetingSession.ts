@@ -60,6 +60,11 @@ export function subscribeSession(store: MeetingStore, session: BoundMeetingSessi
     session.on('videoSlotRenderChanged', (event) => store.media.applyVideoRender(event)),
     session.on('captureResumedAfterServerMute', (event) => store.media.applyCaptureResumed(event)),
     session.on('cameraHealthChanged', (event) => store.media.applyCameraHealth(event)),
+    // Story 4 C2: the handler set (debug panel, "connecting media"), the
+    // non-fatal overdue notice, and the per-slot reconnecting state.
+    session.on('mediaHandlerSet', (view) => store.media.applyHandlerSet(view)),
+    session.on('mediaHandlersOverdue', () => store.media.applyHandlersOverdue()),
+    session.on('slotReconnectingChanged', (event) => store.media.applySlotReconnecting(event)),
   ];
   return () => {
     for (const unsubscribe of unsubscribes) unsubscribe();

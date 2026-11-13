@@ -162,6 +162,14 @@
       "spec_anchor": null
     },
     {
+      "token": "duplicate_cross_transport",
+      "layer": "crypto",
+      "drops_frame": true,
+      "has_vector": false,
+      "fleet_spelling": null,
+      "spec_anchor": "docs/debates/2026-10-28-mh-replacement-and-migration/telemetry-contract.md"
+    },
+    {
       "token": "wrap_key_id_mismatch",
       "layer": "crypto",
       "drops_frame": false,

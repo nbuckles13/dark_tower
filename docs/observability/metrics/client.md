@@ -68,7 +68,7 @@ prefix (ADR-0028 §9). They are emitted via the OTel JS `Meter` (production
 > end-to-end read-back predates them. `MCMediaMissingKeyMaterial`'s full expression returned `0.286` against
 > live data; it had never been able to match before.
 >
-> **The 5 ADR-0028 join-flow metrics are deliberately NOT exported.** They are the
+> **The 3 remaining ADR-0028 join-flow metrics are deliberately NOT exported.** They are the
 > only `dt_client_*` metrics carrying `meeting_id_hash`, and:
 >
 > > §11 grandfathers the label's presence on those metrics as emitted, not its
@@ -165,7 +165,7 @@ down, then polls is reliable where "join, then query" flakes.
      the compiled `{0,52}…[a-z0-9]` form is authoritative).
 - **Implicit labels — two sets, and the media-path set is not the join set.**
   - **Join-flow metrics** carry `client_version`, `meeting_id_hash`, `org_id`. This set is the **closed, enumerated ADR-0036 §11 exception**: it is grandfathered *as a set*, it is not extended, and nothing joins it.
-  - **Media-path metrics** (`dt_client_media_*` and `dt_client_time_to_first_media_frame_ms`) carry `client_version`, `org_id`, `key_custody=operator` — **and never a meeting, participant, or stream dimension, hashed or otherwise.** They are built by allow-list in `media/setup/mediaMetrics.ts`, never by spreading and pruning the join set.
+  - **Media-path metrics** (`dt_client_media_*`, `dt_client_mh_*`, `dt_client_time_to_first_media_frame_ms` and `dt_client_time_to_first_mh_connected_ms`; the `media-path-prefixes` block in `docs/observability/label-taxonomy.md` §R4 is the definition) carry `client_version`, `org_id`, `key_custody=operator` — **and never a meeting, participant, or stream dimension, hashed or otherwise.** They are built by allow-list in `media/setup/mediaMetrics.ts`, never by spreading and pruning the join set.
   - **No metric, log field, span attribute, or sentence in this file may carry an end-to-end or zero-trust boolean** (ADR-0036 §11: the default deployment is neither).
   - **Enforcement in TypeScript is PARTIAL, and it is on the pipe, not at the call site.** `dt-guard client-metrics-export` (story 2 task 16) extracts the label keys of every emission of an `Exported: yes` name across non-test sdk-core and fails if a key is not forwarded by GC (`ALLOWLIST` ∪ `MEDIA_DATAPOINT_EXTRA`) and kept by the collector (`label_key_not_forwarded`), and fails if any forwarded or kept key is identity-shaped per the `identity-label-policy` block in `docs/observability/label-taxonomy.md` §R4 (`identity_key_forwarded`). So an identity key cannot reach STORAGE silently. What stays unenforced: a non-exported name's labels (the name filter drops the whole series, so the rule does not apply to it), and the SDK-side shape itself — `dt-guard`'s media-path deny is Rust-only and `ts_pii.rs` scans only `console.*`/`logger.*` call sites. The rules are in `docs/observability/label-taxonomy.md` R1-R4 — **read them before adding a label here**; they are not restated in this file, because a second home drifts.
 
@@ -177,23 +177,30 @@ down, then polls is reliable where "join, then query" flakes.
   |---|---|
   | `dt_client_join_attempts_total` | one join attempt, at its outcome |
   | `dt_client_signaling_connection_total` | one signaling connection outcome |
-  | `dt_client_mh_connection_total` | one media-handler connection outcome, at handshake |
   | `dt_client_time_to_signaling_ready_ms` | join → signaling ready |
-  | `dt_client_time_to_first_mh_connected_ms` | join → first MH connected |
+
+  **The roster shrinks; it never grows.** Story 4 C2 (telemetry contract R-42) took
+  two members OUT, `dt_client_mh_connection_total` and
+  `dt_client_time_to_first_mh_connected_ms`. Both dropped `meeting_id_hash`, moved to
+  the media-path label set and are now exported (their entries are under §MH
+  connection lifecycle). Leaving is a deliberate roster edit with its own export
+  decision. Re-entry is closed like any other addition.
 
   **The test is what a metric OBSERVES, not which directory it lives in.**
   Connect-lifecycle — once per connection, at setup, before any frame exists — is
   grandfathered. Media-carrying — per frame, per stream, or on the media data
   path — is under the bar. A directory-shaped rule fails in BOTH directions, and
   the failure that will actually happen is permitting a media counter someone
-  places outside the media tree. `dt_client_mh_connection_total` lives in
-  `packages/sdk-core/src/media/MediaTransport.ts` and is grandfathered anyway,
-  for exactly that reason.
+  places outside the media tree. Membership is decided by this roster, never by a
+  file's location: `dt_client_mh_connection_total` was a member while it lived in
+  `packages/sdk-core/src/media/MediaTransport.ts`, and it left by an explicit roster
+  change (story 4 C2), not because of its directory.
 
-  **`dt_client_time_to_first_media_frame_ms` is the nearest neighbour to a
-  grandfathered member and is deliberately NOT one.** The difference is what it
-  observes, not what it is called — see its entry, and see
-  `dt_client_time_to_first_mh_connected_ms`'s.
+  **The `time_to_first_*` histograms are not members, despite the resemblance to
+  `dt_client_time_to_signaling_ready_ms`.** `dt_client_time_to_first_media_frame_ms`
+  and (since story 4 C2) `dt_client_time_to_first_mh_connected_ms` are media-path
+  series with no meeting dimension. The difference is what they observe and which label set they carry,
+  not what they are called. See their entries.
 
 - **Client-originated label conventions** (task #14 — the client ORIGINATES
   these; there is no server-side equivalent to mirror):
@@ -237,15 +244,16 @@ down, then polls is reliable where "join, then query" flakes.
 **Pre-existing label-key mismatch — harmless today, and why it will not stay silent.**
 The SDK emits these metrics with BARE label keys — `status`, `failure_stage`,
 `close_reason`, `retried` (`session/MeetingSession.ts`; `retried` since the
-2026-11-12 join-window devloop) and `mh_index_bucket` (`media/MediaTransport.ts`) —
-while GC's telemetry filter `ALLOWLIST`
+2026-11-12 join-window devloop) — while GC's telemetry filter `ALLOWLIST`
 (`crates/gc-service/src/services/telemetry_filter.rs`) carries only the `dt.`-dotted
-spellings (`dt.failure_stage`, `dt.close_reason`, `dt.mh_index_bucket`) and no
-`status` or `retried` at all. So GC strips all five today. That is harmless ONLY because every
+spellings (`dt.failure_stage`, `dt.close_reason`) and no
+`status` or `retried` at all. So GC strips all four today. That is harmless ONLY because every
 metric here is `Exported: no`: the collector's name allowlist drops the whole series
 anyway. The day any of them is exported, `dt-guard client-metrics-export` rule 1
 (`label_key_not_forwarded`) fires on the stripped key. Fix the spelling on one side
-then, deliberately; do not widen `keep_keys` to make the finding go away.
+then, deliberately; do not widen `keep_keys` to make the finding go away. (The two MH
+series that used to sit here left this section in story 4 C2. They no longer carry
+`status` or `mh_index_bucket`, and GC no longer forwards `dt.mh_index_bucket`.)
 
 ### `dt_client_join_attempts_total`
 - **Exported**: no — deliberately NOT exported. ADR-0036 §11 grandfathers `meeting_id_hash` on this metric AS EMITTED (browser-console log↔metric correlation); it does not grandfather exporting a per-meeting identifier into stored Prometheus series, which `docs/observability/label-taxonomy.md` R1 bars. Stripping the hash and exporting anyway would publish a series whose shape does not match this entry — a silently different metric.
@@ -338,23 +346,6 @@ then, deliberately; do not widen `keep_keys` to make the finding go away.
 - **Usage**: client-perceived time-to-signaling-ready; the join-latency SLI the
   server-side handler timing cannot capture (includes browser→MC RTT).
 
-### `dt_client_time_to_first_mh_connected_ms`
-- **Exported**: no — deliberately NOT exported. ADR-0036 §11 grandfathers `meeting_id_hash` on this metric AS EMITTED (browser-console log↔metric correlation); it does not grandfather exporting a per-meeting identifier into stored Prometheus series, which `docs/observability/label-taxonomy.md` R1 bars. Stripping the hash and exporting anyway would publish a series whose shape does not match this entry — a silently different metric.
-- **Type**: Histogram
-- **Description**: Wall-clock ms from `MeetingSession.join` to the first MH
-  connection being established.
-- **Labels**: the **join-flow** implicit set (`client_version`,
-  `meeting_id_hash`, `org_id`). A frozen-roster member.
-- **Buckets**: TBD (deferred).
-- **Usage**: client-perceived time-to-**connect**-readiness. It measures the
-  HANDSHAKE completing, **before any media frame exists** — it is not a
-  media-path measurement, and the earlier wording "time-to-media-path-ready"
-  invited exactly that reading.
-- **DO NOT COPY THIS LABEL SET TO `dt_client_time_to_first_media_frame_ms`.**
-  That metric is its nearest neighbour by name, is a media-path metric, and
-  carries `client_version`, `org_id`, `key_custody` and **no meeting dimension**.
-  The two are separated by what they observe, not by what they are called.
-
 ### `dt_client_signaling_connection_total`
 - **Exported**: no — deliberately NOT exported. ADR-0036 §11 grandfathers `meeting_id_hash` on this metric AS EMITTED (browser-console log↔metric correlation); it does not grandfather exporting a per-meeting identifier into stored Prometheus series, which `docs/observability/label-taxonomy.md` R1 bars. Stripping the hash and exporting anyway would publish a series whose shape does not match this entry — a silently different metric.
 - **Type**: Counter
@@ -386,21 +377,6 @@ then, deliberately; do not widen `keep_keys` to make the finding go away.
   carries no numeric `closeCode`, so the code-based mapping alone would collapse
   to `unknown`; the `SignalingErrorCode` mapping preserves the real signal on the
   common failure paths.
-
-### `dt_client_mh_connection_total`
-- **Exported**: no — deliberately NOT exported. ADR-0036 §11 grandfathers `meeting_id_hash` on this metric AS EMITTED (browser-console log↔metric correlation); it does not grandfather exporting a per-meeting identifier into stored Prometheus series, which `docs/observability/label-taxonomy.md` R1 bars. Stripping the hash and exporting anyway would publish a series whose shape does not match this entry — a silently different metric.
-- **Type**: Counter
-- **Description**: Client media-handler (browser→MH) connection outcomes.
-- **Labels**:
-  - `status`: `success`, `failure`
-  - `mh_index_bucket`: bounded bucket of the MH peer index — `0`, `1`, `2+`
-    (the raw index is bucketed so cardinality stays bounded as the MH fan-out
-    grows).
-- **Cardinality**: Low (2 statuses × 3 buckets = 6, before implicit labels).
-- **Since story 4 C1**: one outcome per DIAL — the join-time dials, a newly added
-  handler, a redial after a loss, and the one dial after a DECLINED park — with
-  `mh_index_bucket` = the handler's position in the set that triggered that dial.
-  A dial aborted because its handler left the set emits nothing.
 
 ---
 
@@ -438,13 +414,15 @@ identity gains a label, its counts do not change.
 
 | Class | Label set | Series |
 |---|---|---|
-| **Per-kind** | `client_version`, `org_id`, `key_custody=operator`, **`media_kind`**, **`content_kind`** (+ own discriminator) | `frames_sent`, `send_dropped`, `send_queue_depth`, `frames_received`, `frames_accepted`, `frames_dropped`, `key_wrap_outcomes`, `downlink_gap_frames`, `downlink_reorder`, `undeclared_stream_id`, `decoder_errors`, `mute_transitions`, `decode_queue_dropped`, `receive_source_deficit`, `capture_failures`, `keyframe_requests_received`, `send_directive_kind_missing`, `keyframes_produced`, `send_groups_abandoned`, `send_groups_stopped`, `encode_queue_dropped`, `keyframe_min_interval_clamped`, `encoder_errors`, `send_directive_encoding_refused`, `recovery_requests_sent` (+`source`), `incoming_streams_refused`, `slot_unfulfilled_duration_ms`, `slots_unfulfilled`, `active_source_intervals`, `time_to_first_render_ms`, `slot_active_to_first_render_ms` (all `dt_client_media_*`), and `dt_client_time_to_first_media_frame_ms` |
-| **Kind-free (session-level)** | `client_version`, `org_id`, `key_custody=operator` (+ own discriminator), **no `media_kind` or `content_kind` key at all** | `dt_client_media_kek_updates_total`, `_kek_retention_violations_total`, `_kek_retention_anomalies_total`, `_kek_install_refusals_total`, `_kek_generations_retained_total`, `_roster_key_rebinds_total`, `dt_client_media_capture_source`, `_send_directive_header_version_refused_total`, `_keyframe_requests_unattributed_total`, `_mh_control_channel_ended_total` |
+| **Per-kind** | `client_version`, `org_id`, `key_custody=operator`, **`media_kind`**, **`content_kind`** (+ own discriminator) | `frames_sent`, `send_dropped`, `send_queue_depth`, `frames_received`, `frames_accepted`, `frames_dropped`, `key_wrap_outcomes`, `downlink_gap_frames`, `downlink_reorder`, `undeclared_stream_id`, `decoder_errors`, `mute_transitions`, `decode_queue_dropped`, `receive_source_deficit`, `capture_failures`, `keyframe_requests_received`, `send_directive_kind_missing`, `keyframes_produced`, `send_groups_abandoned`, `send_groups_stopped`, `encode_queue_dropped`, `keyframe_min_interval_clamped`, `encoder_errors`, `send_directive_encoding_refused`, `recovery_requests_sent` (+`source`), `incoming_streams_refused`, `slot_unfulfilled_duration_ms`, `slots_unfulfilled`, `active_source_intervals`, `time_to_first_render_ms`, `slot_active_to_first_render_ms`, `resume_ms` (+`outcome`; story 4 C2) (all `dt_client_media_*`), and `dt_client_time_to_first_media_frame_ms` |
+| **Kind-free (session-level)** | `client_version`, `org_id`, `key_custody=operator` (+ own discriminator), **no `media_kind` or `content_kind` key at all** | `dt_client_media_kek_updates_total`, `_kek_retention_violations_total`, `_kek_retention_anomalies_total`, `_kek_install_refusals_total`, `_kek_generations_retained_total`, `_roster_key_rebinds_total`, `dt_client_media_capture_source`, `_send_directive_header_version_refused_total`, `_keyframe_requests_unattributed_total`, `_mh_control_channel_ended_total`; and (story 4 C2) `dt_client_mh_connection_total`, `dt_client_mh_dial_duration_ms`, `dt_client_mh_disconnects_total`, `dt_client_mh_reconnect_duration_ms`, `dt_client_mh_non_member_refs_total`, `dt_client_time_to_first_mh_connected_ms` |
 
 **Why the session-level series are kind-free.** A KEK arrival, a retention anomaly, an
 install refusal, a retained generation and a roster rebind each happen ONCE per session
 for every kind together; labelling them per kind would count one event twice.
-`capture_source` is a build-time property of the bundle. The split is by TYPE in the
+`capture_source` is a build-time property of the bundle. A media-handler transport
+(the `dt_client_mh_*` series and the first-MH histogram) carries every kind at once, so
+a dial, a disconnect or a reconnect is one event, not one per kind. The split is by TYPE in the
 SDK: per-kind series are methods of `MediaKindMetrics` (constructed with a kind), the
 session series of `MediaSessionMetrics` (which takes no kind), so emitting either on the
 wrong side does not compile.
@@ -516,10 +494,12 @@ caller cannot pass even by mistake, because no parameter could carry it. That is
 not a filter: a filter (`pick(labels, [...])` over an ambient bag) is a control that has
 to *notice*, and it fails open the moment a caller reaches the sink by a path that skips
 it — the type signature has nothing to notice. Keep it that way: an allow-list fails
-closed when a new label appears upstream, and a prune-list fails open. This matters
-specifically here because `MediaTransport`'s `#emitMetric` legitimately *does* spread the
-join label set for the one grandfathered metric, so a deletion-based helper would read as
-the local idiom to a future refactor — and the catalog is what that refactor consults.
+closed when a new label appears upstream, and a prune-list fails open. Until story 4 C2,
+`MediaTransport`'s `#emitMetric` spread the join label set into
+`dt_client_mh_connection_total`, which was then a grandfathered member. That spread and
+`MediaTransportOptions.metricLabels` are deleted, and **no join-label spread remains in the
+media tree**. Do not reintroduce one: a deletion-based helper would read as the local idiom
+to a future refactor, and the catalog is what that refactor consults.
 
 `meeting_id_hash` remains grandfathered for the ADR-0028 **join-flow** metrics as a
 **closed set**: it is grandfathered *as a set*, it is not extended, and nothing joins it.
@@ -818,6 +798,21 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
     `avatar_client_muted` / `avatar_no_video` slots (those senders are not
     server-muted). A frame dropped here is re-requested once at the unmute edge
     (`dt_client_media_recovery_requests_sent_total{source="server_mute_lifted"}`).
+- **`duplicate_cross_transport`** (story 4 C2; layer `crypto`, `drops_frame: true`,
+  `has_vector: false`, a multi-frame condition like `stream_partial_reset`). It is an exact
+  in-window duplicate of an already-accepted frame (the replay window's bit is set)
+  whose first copy arrived on a DIFFERENT handler transport. That transport is a
+  current set member, or was lost or removed within the reconnect window. This is the
+  make-before-break overlap of a handler transfer: during the overlap both the old and
+  the new handler forward the same frame. **Classification only**: the frame is still
+  dropped, and is decoded and played once. High-water and below-window drops, and
+  same-transport duplicates, stay `replay_detected`. **Replay alerts match
+  `reason="replay_detected"` EXACTLY and exclude this token.** It deliberately has no
+  `replay_` prefix, so `reason=~"replay.*"` never matches it. Not a key-delivery
+  reason (`NOT_KEY_DELIVERY` in `crates/dt-guard/src/client_metrics_export.rs`).
+  **Read it against handler-set changes**: a brief burst at a transfer is expected.
+  A sustained nonzero rate outside a set change is itself anomalous (a handler
+  duplicating forwards).
 
 ### `dt_client_media_frames_accepted_total`
 - **Alerts** (story 3 OBS-B; `docs/observability/alerts.md`): `ClientVideoDecodeErrorRatio`'s denominator and guard (`media_kind="video", content_kind="main"`).
@@ -1729,6 +1724,229 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
   Zero-initialised at join.
 - **Alert**: none, by decision (story 3 OBS-B; `docs/observability/alerts.md` §Deliberate absences). **Panel**: `infra/grafana/dashboards/client-media.json`.
 
+### MH connection lifecycle (story 4 C2, telemetry contract R-42)
+
+The client's per-handler transport lifecycle (`media/MediaTransport.ts`, per-ref
+tracker in `media/transportTelemetry.ts`) is the ONE source of every series in this
+group. The slot continuity tracker (`session/slotContinuity.ts`) drives
+`dt_client_media_resume_ms`. Every client-observed handler fact comes from transport
+events, never from frame silence. All names and vocabularies are declared in
+`packages/sdk-core/src/media/setup/mediaMetrics.ts`, which is the SSoT. The values
+below are listed for the reader and are not a second definition.
+
+**Labels.** The six `dt_client_mh_*` / `dt_client_time_to_first_mh_connected_ms`
+series are **kind-free session series**. They take the bag `client_version`,
+`org_id`, `key_custody=operator` from `MediaSessionMetrics` (wrappers
+`#sessionCounter` / `#sessionHistogram`), plus the listed discriminators, and carry
+no `media_kind` / `content_kind` key at all: a handler transport carries every kind
+at once. `dt_client_media_resume_ms` is **per kind** (per-kind base via
+`MediaKindMetrics`). None carries a handler ref, handler URL, slot id, sender or
+meeting dimension (`docs/observability/label-taxonomy.md` §No per-handler dimension
+on client media metrics). `phase` and `cause` are datapoint-only keys (GC
+`MEDIA_DATAPOINT_EXTRA`, collector `keep_keys` group 2, charset/length rewrite to
+`invalid` like `outcome`).
+
+**Local teardown emits nothing.** `disconnect()` / leave / SDK disposal records
+no `dt_client_mh_connection_total` outcome and no `dt_client_mh_disconnects_total`
+cause. An in-flight reconnect or resume episode at teardown ends `abandoned`. A
+user leaving is not a handler fault.
+
+**What a planned transfer looks like.** In a make-before-break transfer the
+client dials the new handler (`phase="added"` → `connected`). MC then sends the
+set WITHOUT the old handler FIRST and the moved assignments right after
+(`crates/mc-service/src/actors/meeting/health.rs` `remove_handler_for`:
+`broadcast_handler_set` then `flush_views`), so the old ref leaves the set
+(`dt_client_mh_disconnects_total{cause="directed_removal"}`) while slots still
+name it. The client HOLDS the overlay for that follow-up assignment
+(`media.handlers.removalGraceMs` — only for a still-connected ref with another
+member connected): it names the connected new handler, so **no slot shows the
+reconnecting overlay**. A `dt_client_media_resume_ms` episode
+**does** start at the removal (by contract) and ends `resumed` at the first frame
+via the new handler — it measures the planned **blip**. The client cannot tell a
+planned blip from crash darkness; read `mc_media_handler_migrations_total{trigger}`
+for the mix.
+Brief `dt_client_media_frames_dropped_total{reason="duplicate_cross_transport"}`
+may appear during the overlap. A crash looks different: `cause="transport_loss"`
+or `"handler_released"`, a `dt_client_mh_reconnect_duration_ms` timer and, for
+Active slots, a `dt_client_media_resume_ms` episode.
+
+**Rollout and stale tabs.** Server side (GC + collector) first, then the bundle.
+Revert in the opposite order: bundle first. GC's `phase`/`cause` keys, the collector
+allowlist and the bundle's label change revert as one unit, because a partial revert
+silently merges series. A tab still running a pre-C2 bundle emits
+`dt_client_mh_connection_total{status, mh_index_bucket, meeting_id_hash}`.
+`status` and `mh_index_bucket` are stripped (GC forwards neither) and
+`meeting_id_hash` is never kept (collector `keep_keys`). The datapoint would
+therefore arrive as a label-less count indistinguishable from "a dial happened".
+The collector's `filter/client_mh_connection_stale_tab` processor drops any
+`dt_client_mh_connection_total` datapoint lacking `outcome` or `phase`: **a stale
+browser bundle must be ABSENT, not WRONG** (same principle as the temporality gate;
+the processor's ANCHOR points here). `scripts/otel-collector/acceptance.sh` proves
+it in one run: an old-shaped writer is absent in storage and a new-shaped writer
+is present. Every panel over these series still groups `by (phase, outcome)` /
+`by (cause)` / `by (outcome)`, so a label-less row could never inflate a ratio.
+
+### `dt_client_mh_connection_total`
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
+- **Type**: Counter
+- **Description**: one outcome per DIAL of a media handler, every dial. The dials
+  are the join-time dials, a newly added handler, and redials (after a loss, after
+  a park release, or after an in-flight refresh).
+- **Labels**: kind-free session base +
+  - `phase` (`MH_DIAL_PHASES`): `join` (dials started by the initial arm), `added`
+    (a handler that joined the set after arm), `redial` (redial timer, park
+    release, in-flight-refresh dial).
+  - `outcome` (`MH_DIAL_OUTCOMES`): `connected`, `wrong_handler`,
+    `binding_conflict`, `mc_unavailable`, `handler_released`, `declined`,
+    `transport_failure`, `timeout`, `aborted_by_removal`, `contract_fault`.
+    Close-code outcomes come from `MhCloseCode` through one total projection
+    (`closeCodeToken`), the same lower-cased, prefix-stripped names MH's
+    `CloseCode::as_label()` uses. A zero or unknown code is `contract_fault`. A
+    failure with no close code is `transport_failure`. `timeout` is the connect
+    timeout. `aborted_by_removal` is a dial whose handler left the set before it
+    finalised.
+- **`connected` means "survived the admission window", not "handshook".** A
+  handshake is PROVISIONAL. The outcome finalises at the first of these:
+  - an MH close inside `media.handlers.admissionWindowMs` (default 2000 ms; clientConfig) gives
+    that close's code outcome, never a disconnect;
+  - the window elapsing gives `connected`, and the session is now ESTABLISHED.
+
+  The window is fixed because MH sends no admission ack, so a refusal arriving
+  AFTER the window shows as `connected` plus
+  `dt_client_mh_disconnects_total{cause=<code>}`. It is misattributed between the
+  two series, never lost. Removal, no-code loss and 0/unknown codes inside the
+  window give `aborted_by_removal`, `transport_failure` and `contract_fault`, with
+  no disconnect. The public `connected` event and status report timing are
+  unchanged: they fire at handshake.
+- **Cardinality**: 3 phases × 10 outcomes = **30** per `{client_version, org_id}`.
+  **Zero-initialised** at join (all 30), so a healthy fleet reads present-at-zero
+  failure cells.
+- **Read it**: `sum by (phase, outcome) (increase(...))`. Rising
+  `wrong_handler` / `binding_conflict` / `mc_unavailable` / `timeout` routes to the
+  server-side scenario in `docs/runbooks/client-dev-local.md` §F31.
+- **Stale tabs**: see §MH connection lifecycle. Old-shaped datapoints are dropped
+  at the collector (`filter/client_mh_connection_stale_tab`).
+- **Panel**: `infra/grafana/dashboards/client-media.json`.
+
+### `dt_client_mh_dial_duration_ms`
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
+- **Type**: Histogram. **Unit: ms**, one observation per dial.
+- **Description**: dial start → handshake (`outcome="connected"`), or dial start
+  → failure / MH close (`outcome="failed"`, including a provisional handshake
+  closed inside the admission window). The `connected|failed` projection is
+  derived from `MH_DIAL_OUTCOMES` (`MH_DIAL_DURATION_OUTCOMES`).
+- **Labels**: kind-free session base + `phase` (`MH_DIAL_PHASES`) + `outcome`
+  (`connected`, `failed`).
+- **Buckets**: `MH_DIAL_DURATION_BUCKETS_MS` (SSoT; reaches past connect timeout
+  + the admission window's range max — a provisional dial closed late in the
+  window is `failed`, measured to the close; pinned by test). Changing a boundary
+  splits the `le` series across client versions.
+- **Cardinality**: 3 × 2 = 6 label sets × (13 buckets + `+Inf`, `_sum`, `_count`).
+- **Panel**: `infra/grafana/dashboards/client-media.json`.
+
+### `dt_client_time_to_first_mh_connected_ms`
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
+- **Type**: Histogram. **Unit: ms**, at most one observation per session.
+- **Description**: `MeetingSession.join` start → handshake of the first dial
+  that FINALISES `connected` (survived the admission window). A refused first
+  dial is never observed here. A session that never establishes a handler emits
+  nothing. Includes join-retry time (user-perceived).
+- **Labels**: kind-free session base only. It is a media-path series and is no
+  longer a frozen-roster member (left in story 4 C2). It has no meeting dimension.
+- **Buckets**: `MH_TIME_TO_FIRST_CONNECTED_BUCKETS_MS` (SSoT).
+- **Usage**: client-perceived time-to-**connect**-readiness. It measures the
+  handshake, **before any media frame exists**. Read
+  `dt_client_time_to_first_media_frame_ms` for the wire boundary.
+- **Stale tabs**: no shape filter. Once stripped, an old tab's row has the same
+  labels, but a pre-C2 bundle observed the FIRST handshake even when that dial was
+  then refused, so it **reads low when the first dial was refused** (by up to the
+  redial time, not bounded by the admission window) — transient until old tabs
+  reload. **Rollout caveat:** pre-C2 bundles used
+  default OTel bucket boundaries, so until those tabs reload a `sum by (le)` mixes
+  two `le` sets and the quantile is approximate. This is a transient artifact
+  that ends when the last old tab reloads.
+- **Panel**: `infra/grafana/dashboards/client-media.json`.
+
+### `dt_client_mh_disconnects_total`
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
+- **Type**: Counter
+- **Description**: one count per end of an ESTABLISHED handler session (a dial
+  that survived the admission window). Local teardown emits nothing.
+- **Labels**: kind-free session base + `cause` (`MH_DISCONNECT_CAUSES`):
+  `transport_loss` (connection lost, no close code), `directed_removal` (the ref
+  left the handler set and the client closed it), `handler_released`,
+  `wrong_handler`, `binding_conflict`, `mc_unavailable`, `declined` (MH close
+  codes), `contract_fault` (code 0 or unknown).
+- **Lost-handler count = `cause=~"transport_loss|handler_released"`**: the ONE
+  `isHandlerLoss` predicate in `mediaMetrics.ts`, also the trigger for
+  `dt_client_mh_reconnect_duration_ms`. A `handler_released` close is observable
+  only while the ref is still in the set. After a directed removal the client has
+  already closed, and the server's later close is not a second event.
+- **Cardinality**: 8. **Zero-initialised** at join.
+- **Panel**: `infra/grafana/dashboards/client-media.json` (by cause, and lost
+  handlers).
+
+### `dt_client_mh_reconnect_duration_ms`
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
+- **Type**: Histogram. **Unit: ms**, one observation per disruption per handler.
+- **Description**: per handler ref, from the loss of an in-set ESTABLISHED handler
+  (`isHandlerLoss`) to one of:
+  - `reconnected`: the same ref's next dial FINALISES connected, valued to its
+    handshake;
+  - `removed`: the ref left the set;
+  - `abandoned`: session end, or the published cap
+    `media.handlers.reconnectAbandonMs` (clientConfig; default and inclusive range in the single table at `packages/web-app/README.md` §Media-handler set reconcile).
+- **Labels**: kind-free session base + `outcome` (`MH_RECONNECT_OUTCOMES`).
+- **Buckets**: `MH_DISRUPTION_BUCKETS_MS` (SSoT, shared with
+  `dt_client_media_resume_ms`; its top finite bound covers the cap range).
+- **Cardinality**: 3 label sets.
+- **Panel**: `infra/grafana/dashboards/client-media.json`.
+
+### `dt_client_mh_non_member_refs_total`
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
+- **Type**: Counter
+- **Description**: one count per non-member `handler_ref` in a FRESHLY received
+  message (ADR-0039 §4 "non-member counted + ignored"). Not counted: ref 0 on a
+  no-edge slot state (the proto's "no edge", not a fault), and re-checking a held
+  assignment after a set change (a removed ref is stale, not a fault). The
+  once-per-session `[dt-signaling-contract]` console WARN stays alongside it.
+- **Labels**: kind-free session base + `source` (`MH_NON_MEMBER_SOURCES`):
+  `send_directive`, `stream_assignment`. A per-metric vocabulary, never summed
+  by `source` with other `source` series.
+- **Any nonzero rate is an MC contract defect.** Zero-initialised at join (2).
+- **Panel**: `infra/grafana/dashboards/client-media.json`.
+
+### `dt_client_media_resume_ms`
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
+- **Type**: Histogram. **Unit: ms**, one observation per slot episode.
+- **Description**: the client-observed media-dark window per slot. It is the truth
+  for "how long did this slot go dark across a handler disruption". It starts at
+  transport loss, or at a set change removing the handler the slot's assignment
+  names, and **only for slots Active (with a ref) at episode start**. Solo and
+  receive-only clients start no episode. A planned transfer DOES start one (MC
+  removes the old handler before it moves the edges): it records the planned
+  blip, mixed with crash darkness in one series — split them with
+  `mc_media_handler_migrations_total{trigger}`. It ends with one of:
+  - `resumed`: first presentation via any transport other than the lost one
+    (another handler, or the same ref after it reconnects), same sender (audio:
+    first played frame; video: first decoded frame); a frame still draining from
+    the lost or removed transport never ends it;
+  - `reassigned_away`: the next assignment is not Active or names a different
+    sender;
+  - `abandoned`: session end, or the published cap
+    `media.handlers.resumeAbandonMs` (clientConfig; default and inclusive range in the single table at `packages/web-app/README.md` §Media-handler set reconcile).
+- **Not the overlay.** The UI's reconnecting overlay clears at
+  `media.handlers.reconnectingCapMs` (same table; must not exceed
+  `resumeAbandonMs`), and a planned-shape removal HOLDS it for
+  `media.handlers.removalGraceMs` (< `reconnectingCapMs`). Both are display
+  timings: the hold delays only the overlay, the resume episode still starts at
+  the removal.
+- **Labels**: per-kind base (`media_kind`, `content_kind`) + `outcome`
+  (`MEDIA_RESUME_OUTCOMES`). No slot id, no sender, no handler.
+- **Buckets**: `MH_DISRUPTION_BUCKETS_MS` (SSoT).
+- **Cardinality**: 3 outcomes × kinds (×2 once video is directed).
+- **Panel**: `infra/grafana/dashboards/client-media.json`.
+
 ### `dt_client_time_to_first_media_frame_ms`
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Histogram
@@ -1737,9 +1955,10 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
   session** — once video emits, one join yields one `audio` and one `video` sample,
   never two samples of one quantity; read it `by (media_kind, content_kind)`.
 - **Labels**: the **media-path per-kind** set (`client_version`, `org_id`,
-  `key_custody`, `media_kind`, `content_kind`). **NOT a frozen-roster member**, notwithstanding its
-  name's resemblance to `dt_client_time_to_first_mh_connected_ms` — the
-  difference is what it observes, not what it is called.
+  `key_custody`, `media_kind`, `content_kind`). **NOT a frozen-roster member**. Since story 4 C2
+  `dt_client_time_to_first_mh_connected_ms` is not one either. The two differ in what they
+  observe (wire boundary vs handshake) and in label class (per-kind vs kind-free). Neither
+  has a meeting dimension.
 - **Buckets**: OTel defaults (no boundaries declared; deferred with the media dashboards).
 - **OBSERVED, NEVER GATED (ADR-0036 §10).** No test asserts a wall-clock
   threshold against it, and none may: asserting an end-to-end latency target on a

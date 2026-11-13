@@ -6,9 +6,15 @@
 // negative gap, a counter reset, or a slot that appears or disappears.
 
 import { describe, expect, it } from 'vitest';
-import type { LocalMediaStats, LocalReceiveSlotStats } from '@darktower/sdk-core';
+import type { HandlerSetView, LocalMediaStats, LocalReceiveSlotStats } from '@darktower/sdk-core';
 
-import { formatRate, rates, statsView, type StatsSample } from '../src/lib/debugStats.js';
+import {
+  formatRate,
+  handlerSetRows,
+  rates,
+  statsView,
+  type StatsSample,
+} from '../src/lib/debugStats.js';
 
 const NO_DROPS = {} as LocalReceiveSlotStats['drops'];
 
@@ -93,5 +99,24 @@ describe('formatRate()', () => {
     expect(formatRate(Number.POSITIVE_INFINITY, 'kbit/s')).toBe('—');
     expect(formatRate(50, 'pkt/s')).toBe('50.0 pkt/s');
     expect(formatRate(96_000, 'kbit/s')).toBe('96.0 kbit/s');
+  });
+});
+
+describe('handlerSetRows() — R-20 (story 4 C2)', () => {
+  it('projects the version and each ref + url by name; a token-shaped extra field never survives', () => {
+    const SENTINEL = 'dial-token-SENTINEL';
+    const view = {
+      version: '12',
+      handlers: [{ ref: 9, url: 'https://mh-9', mediaDialToken: SENTINEL, token: SENTINEL }],
+      dialTokens: SENTINEL,
+    } as unknown as HandlerSetView;
+    const rows = handlerSetRows(view);
+    expect(rows).toEqual({ version: '12', handlers: [{ ref: 9, url: 'https://mh-9' }] });
+    expect(JSON.stringify(rows)).not.toContain(SENTINEL);
+  });
+
+  it('no set yet is undefined; an empty set is an empty list', () => {
+    expect(handlerSetRows(undefined)).toBeUndefined();
+    expect(handlerSetRows({ version: '0', handlers: [] })).toEqual({ version: '0', handlers: [] });
   });
 });

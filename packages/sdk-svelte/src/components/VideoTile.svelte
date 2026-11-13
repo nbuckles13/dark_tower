@@ -57,7 +57,9 @@
 
   let canvas: HTMLCanvasElement | undefined = $state(undefined);
 
-  const showsVideo = $derived(slot.render?.kind === 'active');
+  // A RECONNECTING slot (story 4 C2) never shows its last frame frozen: the
+  // embedder's reconnecting avatar replaces the canvas until it clears.
+  const showsVideo = $derived(slot.render?.kind === 'active' && slot.reconnecting === undefined);
 
   $effect(() => {
     const target = canvas;

@@ -11,6 +11,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { FakeScheduler, InMemoryMetricsSink, type MockWebTransport } from '@darktower/test-utils';
 
 import { MediaTransport } from '../MediaTransport.js';
+import { MediaSessionMetrics } from '../setup/mediaMetrics.js';
 import { handlerRef, type HandlerRef } from '../handlerSet.js';
 import type { MhConnectionStatusReport } from '../../signaling/events.js';
 import { MhCloseCode } from '../../proto/dark_tower/signaling/v1/signaling_pb.js';
@@ -34,6 +35,9 @@ const HANDLERS: HandlerSetConfig = {
   redialCapMs: 30_000,
   emptySetNoticeMs: 15_000,
   releasedGraceMs: 2_000,
+  // A distinctive delay, so the rig can tell the telemetry-only admission
+  // timer (story 4 C2) from a redial / grace / deadline timer.
+  admissionWindowMs: 1_234,
 };
 
 afterEach(() => {
@@ -69,7 +73,7 @@ function makeRig(random: () => number = () => 0): Rig {
     scheduler: sched,
     random,
     clock: sched.clock,
-    metricsSink: sink,
+    connectionMetrics: new MediaSessionMetrics({ clientVersion: 'v', orgId: 'o' }, sink),
     handlers: HANDLERS,
     connectTimeoutMs: CONNECT_TIMEOUT_MS,
   });
@@ -98,7 +102,10 @@ function makeRig(random: () => number = () => 0): Rig {
       await flushMicrotasks(50);
     },
     async fireNext() {
-      const t = sched.fireNext();
+      // The earliest TRANSPORT timer: the telemetry-only admission window is
+      // never what a reconcile test means to fire (it changes no behaviour).
+      const t = sched.pending().find((p) => p.delayMs !== HANDLERS.admissionWindowMs);
+      if (t) sched.fire(t.id);
       await flushMicrotasks(50);
       return t?.delayMs ?? -1;
     },
@@ -106,7 +113,7 @@ function makeRig(random: () => number = () => 0): Rig {
       sched
         .pending()
         .map((t) => t.delayMs)
-        .filter((d) => d !== CONNECT_TIMEOUT_MS),
+        .filter((d) => d !== CONNECT_TIMEOUT_MS && d !== HANDLERS.admissionWindowMs),
   };
 }
 
@@ -139,15 +146,17 @@ describe('G1 / T1 — join and add share ONE dial path; the dial token is the on
     // Same envelope shape: both carry only media_dial_token, from the held token.
     expect(connectRequestsOn(rig.dials.latest(A))).toEqual([{ mediaDialToken: 'tok-A1' }]);
     expect(connectRequestsOn(rig.dials.latest(B))).toEqual([{ mediaDialToken: 'tok-B1' }]);
-    // Same metric: one success per dial, bucket = position in the triggering set.
+    // Same metric, by phase: the join dial and the added dial each finalise
+    // `connected` once their admission windows pass.
+    rig.sched.advance(HANDLERS.admissionWindowMs);
     rig.sink.assertCounter(
       'dt_client_mh_connection_total',
-      { status: 'success', mh_index_bucket: '0' },
+      { phase: 'join', outcome: 'connected' },
       1,
     );
     rig.sink.assertCounter(
       'dt_client_mh_connection_total',
-      { status: 'success', mh_index_bucket: '1' },
+      { phase: 'added', outcome: 'connected' },
       1,
     );
     // Same report: CONNECTED, with ref + the version held at the transition.
@@ -243,12 +252,23 @@ describe('G2 — removal is a directed removal: closed, quiet, unreported', () =
 
     rig.mt.applyHandlerSet(intakeOf(3n, [{ ref: 1, url: A }]));
     expect(closeC).toHaveBeenCalledTimes(1);
-    // The aborted dial's deadline is gone too: nothing pending.
-    expect(rig.sched.size).toBe(0);
+    // The aborted dial's deadline is gone too: only A's (telemetry-only)
+    // admission window is pending.
+    expect(rig.redialDelays()).toEqual([]);
+    expect(rig.sched.pending().map((t) => t.delayMs)).toEqual([HANDLERS.admissionWindowMs]);
+    // The aborted dial reached exactly ONE outcome, at the removal (R-42)...
+    rig.sink.assertCounter(
+      'dt_client_mh_connection_total',
+      { phase: 'added', outcome: 'aborted_by_removal' },
+      1,
+    );
+    const metricsAfterAbort = rig.sink.getRecordedMetrics().length;
+    expect(metricsAfterAbort).toBe(metricsBefore + 2); // the counter + its dial duration
     cMock.simulateReady();
     await flushMicrotasks(50);
 
-    expect(rig.sink.getRecordedMetrics()).toHaveLength(metricsBefore);
+    // ...and NOTHING when it would have resolved.
+    expect(rig.sink.getRecordedMetrics()).toHaveLength(metricsAfterAbort);
     expect(rig.reports).toHaveLength(reportsBefore);
     expect(rig.mt.getState(R3)).toBeUndefined();
     rig.mt.disconnect();
@@ -680,12 +700,13 @@ describe('G9 — an empty join set is "media connecting"', () => {
   });
 });
 
-describe('G12 — mh_index_bucket is the position in the TRIGGERING set', () => {
-  it('ref B at index 0 at join, index 1 in a later set: its redial counts bucket 1', async () => {
+describe('R-42 phase — a redial of a ref is `redial`, whatever set triggered it', () => {
+  it('join-time B connects as `join`; its redial after a loss counts as `redial`', async () => {
     const rig = await joined([{ ref: 2, url: B }]);
+    rig.sched.advance(HANDLERS.admissionWindowMs);
     rig.sink.assertCounter(
       'dt_client_mh_connection_total',
-      { status: 'success', mh_index_bucket: '0' },
+      { phase: 'join', outcome: 'connected' },
       1,
     );
     rig.mt.applyHandlerSet(
@@ -699,17 +720,18 @@ describe('G12 — mh_index_bucket is the position in the TRIGGERING set', () => 
     await flushMicrotasks(50);
     await rig.fireNext();
     await rig.ready(B);
-    // A (index 0) and the join-time B: bucket 0 twice; B's redial at index 1.
+    rig.sched.advance(HANDLERS.admissionWindowMs);
     rig.sink.assertCounter(
       'dt_client_mh_connection_total',
-      { status: 'success', mh_index_bucket: '0' },
-      2,
-    );
-    rig.sink.assertCounter(
-      'dt_client_mh_connection_total',
-      { status: 'success', mh_index_bucket: '1' },
+      { phase: 'added', outcome: 'connected' },
       1,
     );
+    rig.sink.assertCounter(
+      'dt_client_mh_connection_total',
+      { phase: 'redial', outcome: 'connected' },
+      1,
+    );
+    rig.sink.assertCounter('dt_client_mh_disconnects_total', { cause: 'transport_loss' }, 1);
     rig.mt.disconnect();
   });
 });
@@ -780,5 +802,47 @@ describe('T7 / ops — session end leaves nothing behind', () => {
     await flushMicrotasks(50);
     expect(rig.dials.dials).toHaveLength(0);
     expect(rig.sched.size).toBe(0);
+  });
+});
+
+describe('story 4 C2 — `handlerLost`: a client-OBSERVED loss of an in-set handler', () => {
+  async function lostRefs(close: (m: MockWebTransport) => void): Promise<HandlerRef[]> {
+    const rig = await joined([{ ref: 1, url: A }]);
+    const lost: HandlerRef[] = [];
+    rig.mt.on('handlerLost', (ref) => lost.push(ref));
+    close(rig.dials.latest(A));
+    await flushMicrotasks(50);
+    rig.mt.disconnect();
+    return lost;
+  }
+
+  it('no code (transport loss) → handlerLost; HANDLER_RELEASED while in the set → handlerLost', async () => {
+    expect(await lostRefs((m) => m.simulateError(new Error('gone')))).toEqual([R1]);
+    expect(await lostRefs((m) => m.simulateClose(MhCloseCode.HANDLER_RELEASED))).toEqual([R1]);
+  });
+
+  it('retry codes, DECLINED and a 0 code are NOT a handler loss (same fixture, positive arm above)', async () => {
+    for (const code of [
+      MhCloseCode.WRONG_HANDLER,
+      MhCloseCode.BINDING_CONFLICT,
+      MhCloseCode.MC_UNAVAILABLE,
+      MhCloseCode.DECLINED,
+      0,
+    ]) {
+      expect(await lostRefs((m) => m.simulateClose(code))).toEqual([]);
+    }
+  });
+
+  it('a directed removal is NOT a loss — and the server close after it emits nothing', async () => {
+    const rig = await joined([{ ref: 1, url: A }]);
+    const lost: HandlerRef[] = [];
+    rig.mt.on('handlerLost', (ref) => lost.push(ref));
+    const mock = rig.dials.latest(A);
+    rig.mt.applyHandlerSet(intakeOf(2n, []));
+    mock.simulateClose(MhCloseCode.HANDLER_RELEASED);
+    await flushMicrotasks(50);
+    expect(lost).toEqual([]);
+    expect(rig.removed).toEqual([R1]);
+    rig.mt.disconnect();
   });
 });

@@ -34,6 +34,8 @@ import type { IdentityKeyResolver } from '../pipeline/receivePolicy.js';
 import type { VideoRenderState } from '../pipeline/renderDecision.js';
 import type { FrameAllocator } from '../pipeline/streamReader.js';
 import { VideoIngress } from '../pipeline/videoIngress.js';
+import type { SlotPresentedListener } from '../pipeline/ingress.js';
+import { TransportRecency } from './transportRecency.js';
 import { VideoSlotPipeline } from '../pipeline/videoSlotPipeline.js';
 import type { MhRecoveryRequest } from '../events.js';
 import { FirstMediaObserver } from '../setup/measurement.js';
@@ -122,6 +124,11 @@ export interface VideoReceiverOptions {
   readonly metricExportIntervalMs: number;
   readonly fault: (fault: MediaFault) => void;
   readonly onRenderChanged: (slotId: number, state: VideoRenderState) => void;
+  /**
+   * Slot-continuity evidence (story 4 C2): a VIDEO slot decoded a frame via a
+   * handler (`session/slotContinuity.ts`). Omitted: not reported.
+   */
+  readonly onSlotPresented?: SlotPresentedListener;
   /** Test-only receive verification (story 2 R-30). Absent in production. */
   readonly verification?: ReceiveVerificationRecorder;
   /** The stream reader's allocation seam. Tests only. */
@@ -136,6 +143,8 @@ export interface VideoReceiverOptions {
 export class VideoReceiver {
   readonly #o: VideoReceiverOptions;
   readonly #clock: () => number;
+  /** Arrival transports for the replay window's duplicate classification. */
+  readonly #recency: TransportRecency;
   readonly #teardown = new TeardownRegistry();
   readonly #faults = new FaultOnce();
   readonly #accounting: FrameAccounting;
@@ -158,6 +167,7 @@ export class VideoReceiver {
   constructor(options: VideoReceiverOptions) {
     this.#o = options;
     this.#clock = options.clock ?? Date.now;
+    this.#recency = new TransportRecency(options.config.handlers.reconnectAbandonMs, this.#clock);
     const { config, metrics } = options;
     this.#accounting = new FrameAccounting(metrics, options.verification, options.declaredSlotIds);
     this.#cache = new TransmitKeyCache(config.receiverState.maxTransmitKeysPerSender);
@@ -233,7 +243,10 @@ export class VideoReceiver {
               { slotId: event.slotId, senderId: event.senderId, gopCounter: event.gopCounter },
               event.reason,
             ),
-          onDecoded: (senderId) => this.#decodedThisInterval.add(senderId),
+          onDecoded: (senderId, ref) => {
+            this.#decodedThisInterval.add(senderId);
+            o.onSlotPresented?.(slotId, ref, senderId);
+          },
           onDrawn: (activeForMs) => this.#onDrawn(activeForMs),
           onDecoderFault: () => this.#fault(MediaFaultStage.Decoder, FAULT_DECODER),
           onSinkError: () => this.#fault(MediaFaultStage.Playback, FAULT_SINK),
@@ -252,6 +265,7 @@ export class VideoReceiver {
       slotFor: (slotId) => this.#slots.get(slotId),
       firstMedia: this.#firstMedia,
       isStopped: () => this.#stopped,
+      arrivalFor: (ref) => this.#recency.arrival(ref),
       ...(o.verification ? { verification: o.verification } : {}),
       ...(o.alloc ? { alloc: o.alloc } : {}),
     });
@@ -289,6 +303,7 @@ export class VideoReceiver {
     this.#mediaStartedAtMs = this.#clock();
     this.#firstMedia.start();
     this.#teardown.register('video-receive-bookkeeping', () => {
+      this.#recency.clear();
       this.#unfulfilled.stop();
       this.#recovery.stop();
       this.#firstMedia.clear();
@@ -330,11 +345,14 @@ export class VideoReceiver {
   /**
    * The handler `ref` LEFT THE SET (ADR-0039 §4 removal cleanup): end its
    * group-stream acceptor QUIETLY (no transportFault) and drop its recovery
-   * queue. Slot state is untouched (the client-local reconnecting overlay is C2).
+   * queue. Slot state (decoder, jitter, replay window — keyed by SLOT id) is
+   * untouched; the client-local reconnecting overlay is the session's
+   * (`session/slotContinuity.ts`).
    */
   forgetHandler(ref: HandlerRef): void {
     this.#loops?.stop(ref);
     this.#recovery.drop(ref);
+    this.#recency.forget(ref);
   }
 
   /** The handler `ref` (re)connected: start reading it if an assignment names it. */

@@ -54,6 +54,7 @@ describe('the token set matches the SSoT exactly', () => {
         'decode_over_bound',
         'stream_partial_reset',
         'stream_slot_mismatch',
+        'duplicate_cross_transport',
       ].sort(),
     );
     for (const token of unvectored) {

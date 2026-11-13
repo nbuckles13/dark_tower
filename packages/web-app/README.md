@@ -113,7 +113,18 @@ inclusive; an out-of-range value throws `ClientConfigError` at session build
 | `redialCapMs` | 30000 | 1000–300000 | Cap on the jitter window; must be ≥ `redialBaseMs` |
 | `emptySetNoticeMs` | 15000 | 1000–300000 | Empty join-time set: one `mediaHandlersOverdue` event if no handler arrives within this bound |
 | `releasedGraceMs` | 2000 | 0–30000 | After `HANDLER_RELEASED` for an in-set handler: wait for a set update before reporting DISCONNECTED and redialling |
+| `admissionWindowMs` | 2000 | 250–10000 | Telemetry only: a handshake is provisional this long; an MH close inside it is the dial's `dt_client_mh_connection_total{outcome}`, surviving it is `connected` (no behaviour change) |
+| `reconnectingCapMs` | 30000 | 5000–120000 | A slot whose handler was lost or removed shows "reconnecting" (previous occupant as an avatar) until it has a source on a connected handler or this expires — then the latest assignment renders. Must be ≤ `resumeAbandonMs` |
+| `removalGraceMs` | 2000 | 250–10000 | Planned-transfer overlay hold: MC sends the set without a removed handler BEFORE the moved assignments, so a directed removal of a still-connected ref (another member connected) holds the overlay this long; reassigned to a connected handler within it → no overlay, else reconnecting. Delays only the overlay (the `resume_ms` episode starts at the removal). Must be < `reconnectingCapMs` |
+| `resumeAbandonMs` | 60000 | 10000–300000 | `dt_client_media_resume_ms`: a per-slot media-dark episode still open this long is observed `abandoned` |
+| `reconnectAbandonMs` | 60000 | 10000–600000 | `dt_client_mh_reconnect_duration_ms`: a lost in-set handler neither redialled nor removed this long after its loss is observed `abandoned`. Must be ≥ `MH_KEEPALIVE_FLOOR_MS` + `redialCapMs` |
 <!-- handler-set-config:end -->
+
+The story-4 C2 caps sit on the ordinary replacement timeline: loss detection
+≈ MC's heartbeat timeout N (6 s) + GC acquire + the set push + the dial (≤ 10 s
+connect deadline) + one keyframe ≈ 10–25 s, so a 30 s overlay rarely expires in
+an ordinary crash and `abandoned` (60 s) means the replacement failed, not that
+it was slow. All are logged on the `[dt-media-handlers-config]` line.
 
 The **first** redial also waits `MH_KEEPALIVE_FLOOR_MS` (2000, compiled; must
 equal MH's `MH_KEEPALIVE_INTERVAL_MS`, pinned by

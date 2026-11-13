@@ -54,7 +54,10 @@
   import type { MeetingStore, TileSurface } from '@darktower/sdk-svelte';
   import { errorText } from '../lib/errorText.js';
   import {
-    AWAITING_ASSIGNMENT,
+    CONNECTING_MEDIA_TEXT,
+    HANDLERS_OVERDUE_TEXT,
+    displaySender,
+    displaySlotState,
     slotIsActive,
     slotStateText,
     type SlotStateAttr,
@@ -277,10 +280,12 @@
     senderId: number | undefined;
     pairedVideo: number | undefined;
   } {
-    const assignment = store.media.slot(slotId).assignment;
-    const senderId = assignment?.senderId;
+    const cell = store.media.slot(slotId);
+    const assignment = cell.assignment;
+    // Story 4 C2: while reconnecting, the row names its PREVIOUS occupant.
+    const senderId = displaySender(cell.reconnecting, () => assignment?.senderId);
     return {
-      state: assignment?.slotState ?? AWAITING_ASSIGNMENT,
+      state: displaySlotState(assignment, cell.reconnecting !== undefined),
       senderId,
       pairedVideo: senderId === undefined ? undefined : store.media.pairOf(senderId).videoSlotId,
     };
@@ -380,6 +385,20 @@
     </button>
   {/if}
 
+  <!--
+    Story 4 C2 (ADR-0039 §4, L4-2): an EMPTY handler set is "connecting media" —
+    no fault, no loss — and the SDK's one non-fatal overdue notice is shown
+    beside it (status, never an error; the session is kept).
+  -->
+  {#if store.media.mediaConnecting}
+    <p data-testid="media-connecting" role="status">{CONNECTING_MEDIA_TEXT}</p>
+  {/if}
+  {#if store.media.handlersOverdue}
+    <p data-testid="media-handlers-overdue" role="status" aria-live="polite">
+      {HANDLERS_OVERDUE_TEXT}
+    </p>
+  {/if}
+
   <p data-testid="media-status">
     {#if store.media.hasReceivedMedia}
       receiving media from other participants
@@ -434,7 +453,11 @@
   {#if mediaError}
     <p data-testid="media-error">{mediaError}</p>
   {/if}
-  <DebugPanel stats={() => localStatsOf(session)} tracks={() => localCaptureTracksOf(session)} />
+  <DebugPanel
+    stats={() => localStatsOf(session)}
+    tracks={() => localCaptureTracksOf(session)}
+    handlerSet={() => store.media.handlerSet}
+  />
 </section>
 
 <style>

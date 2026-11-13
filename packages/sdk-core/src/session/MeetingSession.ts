@@ -41,6 +41,7 @@ import { SignalingCodec } from '../signaling/codecMap.js';
 import type { SignalingClientOptions } from '../signaling/SignalingClient.js';
 import type { JoinedEvent } from '../signaling/events.js';
 import { MediaTransport } from '../media/MediaTransport.js';
+import { bindSlotContinuity, type SlotContinuity } from './slotContinuity.js';
 import type { MediaTransportOptions, TransportScheduler } from '../media/events.js';
 import { MeetingIdentity } from '../media/setup/identity.js';
 import type { AudioPipeline } from '../media/lifecycle/AudioPipeline.js';
@@ -286,6 +287,8 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
   #state: MeetingSessionState = MeetingSessionState.Idle;
   #signaling: SignalingClient | undefined;
   #media: MediaTransport | undefined;
+  /** Per-slot continuity across handler swaps (story 4 C2), per media-carrying attempt. */
+  #continuity: SlotContinuity | undefined;
   /** Status reports still being written to MC (flushed before a join rejection). */
   readonly #statusReports = new Set<Promise<void>>();
   #joinStartMs = 0;
@@ -420,6 +423,7 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
     this.#mediaMetrics = mediaMetrics;
     this.#kekSource.setObserver(kekObserver(mediaMetrics.session));
     zeroInitDirectiveSeries(mediaMetrics, this.#slots.publish);
+    mediaMetrics.session.zeroInitMhConnections();
     let stage: FailureStage = FailureStage.Internal;
     try {
       // --- fetching-token: auth + GC meeting token ---
@@ -692,7 +696,12 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
         muteChanged: (snapshot) => this.emit('muteChanged', snapshot),
         firstMediaFrame: (elapsedMs) => this.emit('firstMediaFrame', elapsedMs),
         mediaFault: (fault) => this.emit('mediaFault', fault),
-        videoSlotRenderChanged: (e) => this.emit('videoSlotRenderChanged', e),
+        videoSlotRenderChanged: (e) => {
+          this.#continuity?.videoRender(e.slotId, e.state);
+          this.emit('videoSlotRenderChanged', e);
+        },
+        slotPresented: (slotId, ref, senderId) =>
+          this.#continuity?.presented(slotId, ref, senderId),
         cameraHealthChanged: (e) => this.emit('cameraHealthChanged', e),
       },
       mediaState: this.#mediaState,
@@ -940,6 +949,7 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
       this.#setState(MeetingSessionState.Disconnecting);
     } finally {
       // Guard each teardown independently so a slow/throwing close can't abort the rest.
+      this.#continuity?.end(); // before the teardown removals (slotContinuity.ts)
       try {
         this.#media?.disconnect();
       } catch {
@@ -1074,6 +1084,8 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
       // Every handler set — WITH its dial tokens — goes from the decode boundary
       // straight into the transport; events carry the token-free view only.
       handlerSetSink: (intake) => this.#media?.applyHandlerSet(intake),
+      // ADR-0039 §4 "non-member counted + ignored" (story 4 C2).
+      onNonMemberRef: (source) => this.#mediaMetrics?.session.mhNonMemberRef(source),
     };
     const signaling = new SignalingClient(opts);
     // Signalling-derived media state first, so the pipeline sees an update no
@@ -1123,20 +1135,21 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
   }
 
   /**
-   * Bridge the transport's events (ADR-0039 §4). `time_to_first_mh_connected` is
-   * latched ONCE PER SESSION here — never reset by a set change, migration,
-   * redial or token refresh. Every per-ref transition goes to MC as one
-   * `MediaConnectionUpdate` (diagnostic only), best-effort.
+   * Bridge the transport's events (ADR-0039 §4). `time_to_first_mh_connected`
+   * is the transport tracker's (`onFirstEstablished`, once per session — never
+   * reset by a set change, migration, redial or token refresh). Every per-ref
+   * transition goes to MC as one `MediaConnectionUpdate` (diagnostic only),
+   * best-effort.
    */
   #wireMedia(signaling: SignalingClient, media: MediaTransport): void {
-    let firstMh = true;
-    media.on('connected', (view) => {
-      if (firstMh) {
-        firstMh = false;
-        this.#histogram('dt_client_time_to_first_mh_connected_ms');
-      }
-      this.emit('mediaConnected', view);
+    this.#continuity = bindSlotContinuity(media, signaling, {
+      handlers: this.#mediaConfig.handlers,
+      clock: this.#clock,
+      scheduler: this.#transportScheduler,
+      metricsFor: (kind) => this.#mediaMetrics?.[kind],
+      onReconnectingChanged: (e) => this.emit('slotReconnectingChanged', e),
     });
+    media.on('connected', (view) => this.emit('mediaConnected', view));
     media.on('status', (report) => {
       const sent = signaling.sendMediaConnectionUpdate([report]).catch(() => {
         // Diagnostic only: a report that cannot be sent (the signalling stream
@@ -1156,37 +1169,22 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
   }
 
   #createMedia(signaling: SignalingClient, metrics: MediaMetrics): MediaTransport {
-    const egress = this.#mediaConfig.egress;
-    const opts: MediaTransportOptions = {
-      clock: this.#clock,
-      handlers: this.#mediaConfig.handlers,
-      ...(this.#transportScheduler ? { scheduler: this.#transportScheduler } : {}),
-      ...(this.#transportRandom ? { random: this.#transportRandom } : {}),
-      metricLabels: this.#metricLabels,
-      // CHOSEN, not inherited (ADR-0036 §1). The transport queue is kept shallow
-      // so the bounded application queue above it makes — and counts — the drop
-      // decision; a drop inside the user agent's queue is uncountable by us and
-      // structurally invisible to MH.
-      datagramQueue: {
-        outgoingHighWaterMark: egress.transportOutgoingHighWaterMarkFrames,
-        outgoingMaxAgeMs: egress.transportOutgoingMaxAgeMs,
-        incomingHighWaterMark: this.#mediaConfig.ingress.transportIncomingHighWaterMarkFrames,
-      },
-      runInContext: (fn) => signaling.runInJoinContext(fn),
-      // The MH control channel's input (story 3): a keyframe request for the
-      // directed video stream reaches the video publisher's gate; everything
-      // else is refused and counted before any gate state is touched.
-      controlSink: mhControlSink({
-        metrics,
-        publish: this.#slots.publish,
-        latestDirective: () => this.#mediaState.latestDirective,
-        video: () => this.video,
+    return new MediaTransport(
+      mediaTransportOptions(this.#mediaConfig, signaling, metrics, {
+        clock: this.#clock,
+        joinStartMs: () => this.#joinStartMs,
+        scheduler: this.#transportScheduler,
+        random: this.#transportRandom,
+        connect: this.#connectFn,
+        connectTimeoutMs: this.#connectTimeoutMs,
+        controlSink: mhControlSink({
+          metrics,
+          publish: this.#slots.publish,
+          latestDirective: () => this.#mediaState.latestDirective,
+          video: () => this.video,
+        }),
       }),
-      ...(this.#connectFn ? { connect: this.#connectFn } : {}),
-      ...(this.#connectTimeoutMs !== undefined ? { connectTimeoutMs: this.#connectTimeoutMs } : {}),
-      ...(this.#metricsSink ? { metricsSink: this.#metricsSink } : {}),
-    };
-    return new MediaTransport(opts);
+    );
   }
 
   /** The ONE construction of the media handles (join and the startMedia fallback). */
@@ -1231,6 +1229,8 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
    * received. The meeting identity is kept: the retry joins the SAME meeting.
    */
   #releaseRejectedAttempt(media: MediaTransport, signaling: SignalingClient): void {
+    this.#continuity?.end();
+    this.#continuity = undefined;
     try {
       media.disconnect();
     } catch {
@@ -1271,4 +1271,51 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
   #emitSignalingConnection(status: 'success' | 'failure', closeReason: CloseReason): void {
     this.#counter('dt_client_signaling_connection_total', { status, close_reason: closeReason });
   }
+}
+
+/**
+ * The transport's options for one attempt — module-level so the session class
+ * stays a coordinator. The MH control channel's input (story 3): a keyframe
+ * request for the directed video stream reaches the video publisher's gate;
+ * everything else is refused and counted before any gate state is touched.
+ */
+function mediaTransportOptions(
+  config: MediaConfig,
+  signaling: SignalingClient,
+  metrics: MediaMetrics,
+  o: {
+    readonly clock: () => number;
+    readonly joinStartMs: () => number;
+    readonly scheduler: TransportScheduler | undefined;
+    readonly random: (() => number) | undefined;
+    readonly connect: WebTransportConnectFn | undefined;
+    readonly connectTimeoutMs: number | undefined;
+    readonly controlSink: MediaTransportOptions['controlSink'];
+  },
+): MediaTransportOptions {
+  const egress = config.egress;
+  return {
+    clock: o.clock,
+    handlers: config.handlers,
+    ...(o.scheduler ? { scheduler: o.scheduler } : {}),
+    ...(o.random ? { random: o.random } : {}),
+    // R-42 (story 4 C2): the connection series go through the media SESSION
+    // handle's allow-listed bag — never the join label set.
+    connectionMetrics: metrics.session,
+    onFirstEstablished: (handshakeAtMs) =>
+      metrics.session.timeToFirstMhConnectedMs(handshakeAtMs - o.joinStartMs()),
+    // CHOSEN, not inherited (ADR-0036 §1). The transport queue is kept shallow
+    // so the bounded application queue above it makes — and counts — the drop
+    // decision; a drop inside the user agent's queue is uncountable by us and
+    // structurally invisible to MH.
+    datagramQueue: {
+      outgoingHighWaterMark: egress.transportOutgoingHighWaterMarkFrames,
+      outgoingMaxAgeMs: egress.transportOutgoingMaxAgeMs,
+      incomingHighWaterMark: config.ingress.transportIncomingHighWaterMarkFrames,
+    },
+    runInContext: (fn) => signaling.runInJoinContext(fn),
+    ...(o.controlSink ? { controlSink: o.controlSink } : {}),
+    ...(o.connect ? { connect: o.connect } : {}),
+    ...(o.connectTimeoutMs !== undefined ? { connectTimeoutMs: o.connectTimeoutMs } : {}),
+  };
 }

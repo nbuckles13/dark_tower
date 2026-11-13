@@ -44,7 +44,14 @@ describe('the join label bag is spread only by grandfathered metrics (static)', 
       'EXTRACTION FAILURE: the Grandfathered member table in docs/observability/metrics/client.md ' +
         'parsed to nothing — fix the parser or the table, do not loosen this check',
     ).toBeGreaterThan(0);
-    expect(roster).toContain('dt_client_mh_connection_total');
+    expect(roster).toContain('dt_client_join_attempts_total');
+  });
+
+  it('the two MH connection series LEFT the roster (story 4 C2: exported, session bag)', () => {
+    // Positive arm above (`join_attempts` is still a member); these two were
+    // extended in place, dropped `meeting_id_hash` and are exported now.
+    expect(roster).not.toContain('dt_client_mh_connection_total');
+    expect(roster).not.toContain('dt_client_time_to_first_mh_connected_ms');
   });
 
   it('finds the known spread sites (scan control)', () => {
@@ -54,7 +61,7 @@ describe('the join label bag is spread only by grandfathered metrics (static)', 
     expect(
       spreading.map((f) => f.slice(SRC.length)).sort(),
       'EXTRACTION FAILURE: no join-bag spread site found — the scan is matching nothing',
-    ).toEqual(expect.arrayContaining(['media/MediaTransport.ts', 'session/MeetingSession.ts']));
+    ).toEqual(['session/MeetingSession.ts']);
   });
 
   it('every metric literal in a spreading file is on the roster', () => {

@@ -51,8 +51,21 @@ export type AvatarSlotState = SdkAvatarSlotState;
  */
 export const AWAITING_ASSIGNMENT = 'awaiting-assignment' as const;
 
+/**
+ * The client-local RECONNECTING state (story 4 C2; ADR-0039 §4 "Slot states").
+ * NOT a wire token: this client OBSERVED the loss of the handler carrying the
+ * slot (or MC removed it from the set while the slot still named it), per the
+ * SDK's `slotReconnectingChanged` — never inferred from silence. It renders the
+ * PREVIOUS occupant as a reconnecting avatar (never a frozen live frame, never
+ * a vanished participant) and overrides the wire state until it clears.
+ */
+export const RECONNECTING = 'reconnecting' as const;
+
+/** The client-local states (never on the wire). */
+export type ClientLocalSlotState = typeof AWAITING_ASSIGNMENT | typeof RECONNECTING;
+
 /** What a slot row's `data-slot-state` can carry. */
-export type SlotStateAttr = SlotStateToken | typeof AWAITING_ASSIGNMENT;
+export type SlotStateAttr = SlotStateToken | ClientLocalSlotState;
 
 /** What a slot's copy may say about its source: the participant's NAME (already resolved and bounded) and the slot's kind. */
 export interface SlotCopyContext {
@@ -118,12 +131,55 @@ export const SLOT_STATE_TEXT: Record<SlotStateToken, (ctx: SlotCopyContext) => s
  */
 export const WIRE_TOKENS = Object.keys(SLOT_STATE_TEXT) as readonly SlotStateToken[];
 
-/** Text for a slot the controller has not assigned yet. */
-const AWAITING_ASSIGNMENT_TEXT = 'waiting for the meeting controller to fill this slot';
+/**
+ * The client-local states' copy — EXHAUSTIVE over {@link ClientLocalSlotState}
+ * (a `Record`, no default arm), beside the wire table and never merged into it,
+ * so {@link WIRE_TOKENS} stays exactly the wire vocabulary.
+ */
+export const CLIENT_LOCAL_STATE_TEXT: Record<
+  ClientLocalSlotState,
+  (ctx: SlotCopyContext) => string
+> = {
+  [AWAITING_ASSIGNMENT]: () => 'waiting for the meeting controller to fill this slot',
+  // Story 4 C2: the previous occupant, by name; the media handler carrying
+  // them was lost or replaced.
+  [RECONNECTING]: ({ name, kind }) =>
+    kind === 'audio' ? `reconnecting to ${name}'s audio…` : `reconnecting to ${name}'s video…`,
+};
 
-/** Render one slot state — wire token or the awaiting-assignment case. */
+/** Derived from the exhaustive client-local table — never a hand list. */
+function isClientLocal(state: SlotStateAttr): state is ClientLocalSlotState {
+  return Object.hasOwn(CLIENT_LOCAL_STATE_TEXT, state);
+}
+
+/** Render one slot state — a wire token or a client-local state. */
 export function slotStateText(state: SlotStateAttr, ctx: SlotCopyContext): string {
-  return state === AWAITING_ASSIGNMENT ? AWAITING_ASSIGNMENT_TEXT : SLOT_STATE_TEXT[state](ctx);
+  return isClientLocal(state) ? CLIENT_LOCAL_STATE_TEXT[state](ctx) : SLOT_STATE_TEXT[state](ctx);
+}
+
+/**
+ * THE one derivation of what a slot DISPLAYS — used by the video tile and the
+ * audio rows alike: reconnecting overrides the wire state; no assignment yet is
+ * awaiting-assignment; otherwise the wire token, verbatim.
+ */
+export function displaySlotState(
+  assignment: { readonly slotState: SlotStateToken } | undefined,
+  isReconnecting: boolean,
+): SlotStateAttr {
+  if (isReconnecting) return RECONNECTING;
+  return assignment?.slotState ?? AWAITING_ASSIGNMENT;
+}
+
+/**
+ * The sender a slot DISPLAYS, beside {@link displaySlotState}: while
+ * reconnecting, its PREVIOUS occupant (never a vanished participant);
+ * otherwise the caller's own fallback chain, unchanged.
+ */
+export function displaySender(
+  reconnecting: { readonly previousSenderId: number | undefined } | undefined,
+  fallback: () => number | undefined,
+): number | undefined {
+  return reconnecting !== undefined ? reconnecting.previousSenderId : fallback();
 }
 
 /**
@@ -156,6 +212,26 @@ const RENDERED_KIND: Readonly<Record<VideoRenderState['kind'], RenderedKind>> = 
  * used by the tile (`VideoSlotTile.svelte`) and the test bus (`e2eBus.ts`), so
  * the DOM and the bus can never disagree. No state yet is `empty`.
  */
-export function renderedKind(kind: VideoRenderState['kind'] | undefined): RenderedKind {
+export function renderedKind(
+  kind: VideoRenderState['kind'] | undefined,
+  isReconnecting = false,
+): RenderedKind {
+  // A reconnecting slot shows its previous occupant's AVATAR — never the last
+  // live frame frozen (story 4 C2).
+  if (isReconnecting) return 'avatar';
   return kind === undefined ? 'empty' : RENDERED_KIND[kind];
 }
+
+/**
+ * "Connecting media" (story 4 C2; ADR-0039 §4, L4-2): the handler set this
+ * client holds is EMPTY — the meeting's media handler has not acknowledged
+ * yet. Not a fault, not a loss.
+ */
+export const CONNECTING_MEDIA_TEXT = 'connecting media…';
+
+/**
+ * The SDK's ONE non-fatal notice (`mediaHandlersOverdue`): no handler arrived
+ * within the configured bound. The session is kept; media starts when one does.
+ */
+export const HANDLERS_OVERDUE_TEXT =
+  'media is taking longer than usual to connect; you are still in the meeting and media will start when it is ready';

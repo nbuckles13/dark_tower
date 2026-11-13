@@ -372,3 +372,96 @@ describe('transmit key cache — one entry per key id (E-1) and F-8', () => {
     expect(kk.every((x) => x === 0x33)).toBe(true);
   });
 });
+
+describe('replay window — the arrival split (story 4 C2: duplicate_cross_transport)', () => {
+  const via = (transport: number, recent: (t: number) => boolean = () => true) => ({
+    transport,
+    isRecent: recent,
+  });
+
+  it('the DECISION is identical with or without an arrival (admit vs admitVia)', () => {
+    const plain = new ReplayWindow(8, 64);
+    const split = new ReplayWindow(8, 64);
+    for (const [seq, t] of [
+      [5, 1],
+      [5, 2],
+      [3, 2],
+      [3, 1],
+      [200, 1],
+      [10, 2],
+      [200, 2],
+    ] as const) {
+      expect(split.admitVia(G, parts(1n), seq, via(t)) === 'admitted').toBe(
+        plain.admit(G, parts(1n), seq),
+      );
+    }
+  });
+
+  it('same transport → replay; different recent transport → duplicate_cross_transport', () => {
+    const w = new ReplayWindow(8, 64);
+    expect(w.admitVia(G, parts(1n), 9, via(1))).toBe('admitted');
+    expect(w.admitVia(G, parts(1n), 9, via(1))).toBe('replay');
+    expect(w.admitVia(G, parts(1n), 9, via(2))).toBe('duplicate_cross_transport');
+  });
+
+  it('a first copy via a transport OUTSIDE the membership bound stays replay', () => {
+    const w = new ReplayWindow(8, 64);
+    w.admitVia(G, parts(1n), 9, via(1));
+    expect(
+      w.admitVia(
+        G,
+        parts(1n),
+        9,
+        via(2, (t) => t !== 1),
+      ),
+    ).toBe('replay');
+  });
+
+  it('a duplicate with NO arrival, or whose first copy recorded none, stays replay', () => {
+    const w = new ReplayWindow(8, 64);
+    w.admitVia(G, parts(1n), 4); // admitted with no arrival recorded
+    expect(w.admitVia(G, parts(1n), 4, via(2))).toBe('replay');
+    w.admitVia(G, parts(1n), 6, via(1));
+    expect(w.admitVia(G, parts(1n), 6)).toBe('replay');
+  });
+
+  it('a reused window POSITION never reads a stale transport id (the ring resets with the window)', () => {
+    const W = 64;
+    const w = new ReplayWindow(8, W);
+    // seq 1 arrives via transport 1; later seq 1+W (same ring position) via 2.
+    expect(w.admitVia(G, parts(1n), 1, via(1))).toBe('admitted');
+    expect(w.admitVia(G, parts(1n), 1 + W, via(2))).toBe('admitted');
+    // A duplicate of 1+W via transport 1: its first copy came via 2 — the
+    // position was REWRITTEN, so this is cross-transport (not stale "1").
+    expect(w.admitVia(G, parts(1n), 1 + W, via(1))).toBe('duplicate_cross_transport');
+    // ...and via 2 it is a same-transport replay.
+    expect(w.admitVia(G, parts(1n), 1 + W, via(2))).toBe('replay');
+    // seq 1 itself is now below the window: replay, never the stale id.
+    expect(w.admitVia(G, parts(1n), 1, via(3))).toBe('replay');
+  });
+
+  it('a jump of >= W clears the bitmap: a position with a stale id is admitted, not classified', () => {
+    const W = 64;
+    const w = new ReplayWindow(8, W);
+    w.admitVia(G, parts(1n), 5, via(1));
+    expect(w.admitVia(G, parts(1n), 5 + 10 * W, via(2))).toBe('admitted');
+    // Position (5 + 9W) % W === 5 % W holds a stale id 1, but its bit is clear:
+    expect(w.admitVia(G, parts(1n), 5 + 9 * W + 1, via(3))).toBe('admitted');
+    expect(w.admitVia(G, parts(1n), 5 + 10 * W - 1, via(2))).toBe('admitted');
+  });
+});
+
+describe('replay window — an admission WITHOUT an arrival clears its position (security Gate-3 F2)', () => {
+  it('a stale id from s-W is never read for s admitted without an arrival', () => {
+    const W = 64;
+    const via = (transport: number) => ({ transport, isRecent: () => true });
+    const w = new ReplayWindow(8, W);
+    expect(w.admitVia(G, parts(1n), 3, via(1))).toBe('admitted'); // allocates the ring
+    expect(w.admitVia(G, parts(1n), 3 + W)).toBe('admitted'); // same position, NO arrival
+    // Its first copy recorded no transport: a duplicate is a plain replay, never cross.
+    expect(w.admitVia(G, parts(1n), 3 + W, via(2))).toBe('replay');
+    // Positive arm: with an arrival recorded the split still fires.
+    expect(w.admitVia(G, parts(1n), 4 + W, via(1))).toBe('admitted');
+    expect(w.admitVia(G, parts(1n), 4 + W, via(2))).toBe('duplicate_cross_transport');
+  });
+});

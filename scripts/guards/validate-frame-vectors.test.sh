@@ -60,6 +60,15 @@ new_tree() {
   cp "$REPO"/docs/user-stories/*.md "$d/docs/user-stories/"
   mkdir -p "$d/docs/observability/metrics"
   cp "$REPO"/docs/observability/metrics/*.md "$d/docs/observability/metrics/"
+  # Every declared `spec_anchor` target, derived from the vectors (their SSoT)
+  # rather than enumerated here: a new anchor (e.g. the story-4 telemetry
+  # contract for `duplicate_cross_transport`) must not turn every case red for
+  # the wrong reason. Unmasked: an anchor missing from the REAL tree fails here.
+  local anchor
+  while IFS= read -r anchor; do
+    mkdir -p "$d/$(dirname "$anchor")"
+    cp "$REPO/$anchor" "$d/$anchor"
+  done < <(jq -r '[.reject_reasons[].spec_anchor // empty] | unique[]' "$REPO/$VEC")
 
   # The TypeScript codec sites g12 enumerates and the conformance marker g14
   # requires. COPIED from the real tree, never fabricated as stubs — for the same

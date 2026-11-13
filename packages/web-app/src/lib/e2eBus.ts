@@ -105,8 +105,32 @@ export interface BusHandlerSet {
   readonly handlers: readonly { readonly ref: number; readonly url: string }[];
 }
 
+/**
+ * One per-slot RECONNECTING overlay transition (story 4 C2; test-gates.md
+ * §Browser). Scalars only: the slot id and the new state — never a ref, url,
+ * sender id, token or close reason. C3's planned-transfer leg asserts NONE
+ * were set; its crash leg asserts one was.
+ */
+export interface BusReconnectingOverlay {
+  readonly slotId: number;
+  readonly reconnecting: boolean;
+}
+
+/**
+ * One media TRANSPORT fault the SDK raised (story 4 C2): its bounded stage
+ * token only — never the message, an `Error`, a cause chain, a url or a token.
+ * C3's planned-transfer leg asserts none occurred.
+ */
+export interface BusTransportFault {
+  readonly stage: 'transport';
+}
+
 interface InternalBus {
   events: BusEvent[];
+  /** Every reconnecting-overlay set/clear, in order (per slot id). */
+  reconnectingOverlays: BusReconnectingOverlay[];
+  /** Every media transport fault, in order. */
+  transportFaults: BusTransportFault[];
   /**
    * Every handler set this session held, in wire order: the join-time set
    * first, then every pushed set (both via `mediaHandlerSet`). THE source of
@@ -159,6 +183,8 @@ export function installE2EHooks(
     const bus: InternalBus = existing ?? {
       events: [],
       handlerSets: [],
+      reconnectingOverlays: [],
+      transportFaults: [],
       async flushMetrics() {
         // The SDK's ACTUAL state, not the config's intent: sdk-core's
         // `flushMetrics()` resolves having flushed nothing when no provider is
@@ -203,6 +229,27 @@ export function installE2EHooks(
     };
     // Every set in wire order, the join-time one included.
     session.on('mediaHandlerSet', recordHandlerSet);
+    // Story 4 C2: the per-slot reconnecting overlay (the SDK's ONE derivation,
+    // `slotReconnectingChanged` — never recomputed here) and transport faults.
+    // Scalars only; the slots currently reconnecting also feed `rendered` below.
+    const reconnectingSlots = new Set<number>();
+    session.on('slotReconnectingChanged', (e) => {
+      if (e.reconnecting) reconnectingSlots.add(e.slotId);
+      else reconnectingSlots.delete(e.slotId);
+      const overlay: BusReconnectingOverlay = { slotId: e.slotId, reconnecting: e.reconnecting };
+      bus.reconnectingOverlays.push(overlay);
+      bus.emit({
+        type: 'slotReconnecting',
+        slotId: overlay.slotId,
+        reconnecting: overlay.reconnecting,
+      });
+    });
+    session.on('mediaFault', (fault) => {
+      if (fault.stage !== 'transport') return;
+      const projected: BusTransportFault = { stage: 'transport' };
+      bus.transportFaults.push(projected);
+      bus.emit({ type: 'transportFault', stage: projected.stage });
+    });
     session.on('joined', (event) =>
       bus.emit({
         type: 'joined',
@@ -326,8 +373,9 @@ export function installE2EHooks(
     // wrapped keys, frame bytes, decrypted plaintext, decoded samples, per-frame
     // SIZES (ADR-0036 §11 — the time-ordered sequence of sizes for one stream IS
     // the voice-activity trace), microphone labels, `deviceId`s, participant
-    // names, the meeting code, and any token. `mediaFault` is also absent: it is
-    // a DOM-rendered operator signal, not a test observable.
+    // names, the meeting code, and any token. `mediaFault` is absent EXCEPT its
+    // transport stage, as a bare `{stage}` (story 4 C2, `transportFaults` above):
+    // never its message.
     //
     // THE ONE ANALYSED-AUDIO EXCEPTION (story 2 R-30, @security): `receiveAnalysis`
     // carries a per-lane, band-limited (`E2E_ANALYSIS_BAND_*_HZ`, at most
@@ -463,7 +511,7 @@ export function installE2EHooks(
         const slots: Record<string, unknown>[] = [];
         for (const e of evidence) {
           if (e.mcState === undefined) continue;
-          const rendered = renderedKind(e.render);
+          const rendered = renderedKind(e.render, reconnectingSlots.has(e.slotId));
           // Lumas are read only while the slot renders video (decided here, once).
           const surface = instrumentation.surface(e.slotId, { withLumas: rendered === 'video' });
           const framesRendered = surface?.framesRendered ?? 0;

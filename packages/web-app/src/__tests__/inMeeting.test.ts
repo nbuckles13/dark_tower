@@ -822,3 +822,102 @@ test('the debug toggle is present and the panel is HIDDEN by default; the overla
   await screen.getByTestId('debug-panel-toggle').click();
   localStorage.removeItem('darktower.debugPanel.v1');
 });
+
+// ---------------------------------------------------------------------------
+// Story 4 C2: reconnecting (R-20), connecting media and the overdue notice
+// ---------------------------------------------------------------------------
+
+test('R-20: a lost handler shows RECONNECTING with the previous occupant — never a frozen frame, never vanished — and clears', async () => {
+  const { session, screen } = await mount([], { audio: 1, video: 1, publish: ['video'] });
+  session.fire('joined', ROSTER_JOIN);
+  await screen.getByTestId('start-media').click();
+  await vi.waitFor(() => expect(session.sinks.get(1)).toBeDefined());
+  session.fire('streamAssignments', {
+    unreachableSenderIds: [],
+    assignments: [
+      slot({ slotId: 0, senderId: 258, slotState: 'active' }),
+      slot({ slotId: 1, mediaKind: 'video', senderId: undefined, slotState: 'active' }),
+    ],
+  });
+  session.fire('videoSlotRenderChanged', { slotId: 1, state: { kind: 'active', senderId: 258 } });
+  const tile = screen.getByTestId('video-slot-1');
+  const canvas = screen.getByTestId('video-canvas-1');
+  await expect.element(tile).toHaveAttribute('data-rendered', 'video');
+  await expect.element(canvas).toBeVisible(); // positive control: live
+  // The SDK observes the loss of the handler carrying both slots.
+  session.fire('slotReconnectingChanged', { slotId: 0, reconnecting: true, previousSenderId: 258 });
+  session.fire('slotReconnectingChanged', { slotId: 1, reconnecting: true, previousSenderId: 258 });
+  await expect.element(tile).toHaveAttribute('data-slot-state', 'reconnecting');
+  await expect.element(tile).toHaveAttribute('data-rendered', 'avatar');
+  await expect.element(canvas).not.toBeVisible(); // never the last frame frozen
+  await expect.element(tile).toHaveAttribute('data-participant-id', 'b'); // never vanished
+  await expect.element(tile).toMatchTextContent("reconnecting to Bea's video");
+  const audioRow = screen.getByTestId('slot-0');
+  await expect.element(audioRow).toHaveAttribute('data-slot-state', 'reconnecting');
+  await expect.element(audioRow).toMatchTextContent("reconnecting to Bea's audio");
+  await expect.element(screen.getByTestId('video-slot-audio-1')).toMatchTextContent('reconnecting');
+  // Cleared by the SDK (a source on a live handler, or the cap): the wire state renders again.
+  session.fire('slotReconnectingChanged', {
+    slotId: 1,
+    reconnecting: false,
+    previousSenderId: undefined,
+  });
+  session.fire('slotReconnectingChanged', {
+    slotId: 0,
+    reconnecting: false,
+    previousSenderId: undefined,
+  });
+  await expect.element(tile).toHaveAttribute('data-slot-state', 'active');
+  await expect.element(tile).toHaveAttribute('data-rendered', 'video');
+  await expect.element(canvas).toBeVisible();
+  await expect.element(audioRow).toHaveAttribute('data-slot-state', 'active');
+});
+
+test('a PLANNED transfer (edges move, no SDK reconnecting event) never shows reconnecting', async () => {
+  const { session, screen } = await mount([], { audio: 1, video: 0 });
+  session.fire('joined', ROSTER_JOIN);
+  session.fire('streamAssignments', {
+    unreachableSenderIds: [],
+    assignments: [slot({ slotId: 0, senderId: 258, handlerRef: 1 as HandlerRef })],
+  });
+  session.fire('mediaHandlerSet', {
+    version: '2',
+    handlers: [
+      { ref: 1 as HandlerRef, url: 'https://mh-a' },
+      { ref: 2 as HandlerRef, url: 'https://mh-b' },
+    ],
+  });
+  session.fire('streamAssignments', {
+    unreachableSenderIds: [],
+    assignments: [slot({ slotId: 0, senderId: 258, handlerRef: 2 as HandlerRef })],
+  });
+  session.fire('mediaHandlerSet', {
+    version: '3',
+    handlers: [{ ref: 2 as HandlerRef, url: 'https://mh-b' }],
+  });
+  const row = screen.getByTestId('slot-0');
+  await expect.element(row).toHaveAttribute('data-slot-state', 'active');
+  expect(row.element().textContent).not.toMatch(/reconnecting/);
+});
+
+test('an EMPTY handler set shows "connecting media"; the overdue notice is non-fatal; a set naming a handler clears both', async () => {
+  const { session, screen } = await mount();
+  // No set yet: neither shows.
+  expect(screen.getByTestId('media-connecting').query()).toBeNull();
+  session.fire('mediaHandlerSet', { version: '0', handlers: [] });
+  await expect
+    .element(screen.getByTestId('media-connecting'))
+    .toMatchTextContent('connecting media');
+  expect(screen.getByTestId('media-handlers-overdue').query()).toBeNull();
+  session.fire('mediaHandlersOverdue', undefined);
+  const notice = screen.getByTestId('media-handlers-overdue');
+  await expect.element(notice).toHaveAttribute('role', 'status'); // never an error/alertdialog
+  await expect.element(notice).toMatchTextContent('still in the meeting');
+  await expect.element(screen.getByTestId('in-meeting')).toBeVisible(); // the session is kept
+  session.fire('mediaHandlerSet', {
+    version: '1',
+    handlers: [{ ref: 1 as HandlerRef, url: 'https://mh-a' }],
+  });
+  await expect.element(screen.getByTestId('media-connecting')).not.toBeInTheDocument();
+  await expect.element(screen.getByTestId('media-handlers-overdue')).not.toBeInTheDocument();
+});

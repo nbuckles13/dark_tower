@@ -21,6 +21,7 @@ import {
 import { create, toBinary } from '@bufbuild/protobuf';
 
 import { MeetingSession } from '../MeetingSession.js';
+import { buildTestFrame, makeIdentity } from '../../media/pipeline/__tests__/frameFixtures.js';
 import { localCaptureTracksOf, localStatsOf } from '../localDebugSurface.js';
 import { encodeFrame } from '../../framing/length-prefix.js';
 import { RosterIdentityKeys } from '../../media/setup/rosterKeys.js';
@@ -438,7 +439,8 @@ describe('MeetingSession — join metrics (R-24/R-25 M2)', () => {
   it('emits all five metrics with the PII-clean label set on the happy path', async () => {
     const sink = new InMemoryMetricsSink();
     const mocks = new Map<string, MockWebTransport>();
-    const session = makeSession(mocks, { metricsSink: sink });
+    const sched = new FakeScheduler();
+    const session = makeSession(mocks, { metricsSink: sink, transportScheduler: sched });
     const joinP = session.join({
       orgSubdomain: 'demo',
       meetingCode: MEETING_CODE,
@@ -446,6 +448,8 @@ describe('MeetingSession — join metrics (R-24/R-25 M2)', () => {
     });
     await driveJoin(mocks, 'all');
     await joinP;
+    // The MH dials finalise `connected` once they survive the admission window.
+    sched.advance(DEFAULT_CLIENT_CONFIG.media.handlers.admissionWindowMs);
 
     sink.assertCounter(
       'dt_client_join_attempts_total',
@@ -459,7 +463,25 @@ describe('MeetingSession — join metrics (R-24/R-25 M2)', () => {
       { status: 'success', close_reason: 'normal' },
       1,
     );
-    sink.assertCounterAtLeast('dt_client_mh_connection_total', { status: 'success' }, 2);
+    sink.assertCounterAtLeast(
+      'dt_client_mh_connection_total',
+      { phase: 'join', outcome: 'connected' },
+      2,
+    );
+    // story 4 C2: the two MH connection series LEFT the join-flow roster —
+    // the media session bag, never `meeting_id_hash` / `status` / `mh_index_bucket`.
+    for (const m of sink
+      .getRecordedMetrics()
+      .filter(
+        (r) =>
+          r.name.startsWith('dt_client_mh_') ||
+          r.name === 'dt_client_time_to_first_mh_connected_ms',
+      )) {
+      expect(m.labels).not.toHaveProperty('meeting_id_hash');
+      expect(m.labels).not.toHaveProperty('status');
+      expect(m.labels).not.toHaveProperty('mh_index_bucket');
+      expect(m.labels['key_custody']).toBe('operator');
+    }
 
     // Label set: client_version + org_id + 16-hex meeting_id_hash; no PII.
     // The join-flow sample (media zero-initialisations carry the media set, not this one).
@@ -1429,6 +1451,160 @@ describe('MeetingSession.startMedia (ADR-0036 §5/§6)', () => {
     expect(pipeline.frameCounts.framesSent).toBeGreaterThanOrEqual(
       first.getOutboundDatagrams().length + second.getOutboundDatagrams().length,
     );
+    rig.session.disconnect();
+  });
+
+  // -------------------------------------------------------------------------
+  // story 4 C2 / R-16 — KEY CONTINUITY ACROSS A HANDLER SWAP (security pairs).
+  // The invariant: under one KEK a key id never maps to two transmit keys. A
+  // rebuild of the session media would restart at generation 0 with fresh keys
+  // under the same sender id — a wrap-nonce reuse. Asserted on key ids and key
+  // bytes INSIDE the test only (nothing new reaches an event, store or bus).
+  // -------------------------------------------------------------------------
+
+  /** Record every material the session's transmit-key manager hands out. */
+  function recordMaterials() {
+    const owners = new Set<TransmitKeyManager>();
+    const byKeyId = new Map<string, Set<string>>();
+    const generations: bigint[] = [];
+    const real = TransmitKeyManager.prototype.materialFor;
+    const spy = vi
+      .spyOn(TransmitKeyManager.prototype, 'materialFor')
+      .mockImplementation(async function (this: TransmitKeyManager, stream, kek) {
+        const m = await real.call(this, stream, kek);
+        owners.add(this);
+        const id = Buffer.from(m.keyId).toString('hex');
+        const keys = byKeyId.get(id) ?? new Set<string>();
+        keys.add(Buffer.from(m.key).toString('hex'));
+        byKeyId.set(id, keys);
+        generations.push(this.generation);
+        return m;
+      });
+    const clear = vi.spyOn(TransmitKeyManager.prototype, 'clear');
+    const collisions = () => [...byKeyId.values()].filter((keys) => keys.size > 1).length;
+    return { owners, byKeyId, generations, spy, clear, collisions, real };
+  }
+
+  async function sendUntil(rig: MediaRig, mh: MockWebTransport): Promise<void> {
+    const before = mh.getOutboundDatagrams().length;
+    await waitFor(() => {
+      rig.capture.emit(makeAudioData({ samples: Float32Array.of(1, 2, 3) }));
+      return mh.getOutboundDatagrams().length > before;
+    });
+  }
+
+  it('R-16 CRASH shape (set remove + add, directive empty → non-empty): ONE manager, no rebuild, key ids strictly increase, no key id reuse', async () => {
+    const rec = recordMaterials();
+    const rig = await joinedWithMedia();
+    const pipeline = await rig.session.startMedia();
+    const mc = rig.mocks.get(MC_ENDPOINT)!;
+    const A = rig.mocks.get(MEDIA_SERVERS[0]!)!;
+    // Get past generation 0 BEFORE the swap (at gen 0 a rebuild and a
+    // continuation are indistinguishable by generation alone).
+    mc.simulateServerMessage(0, framedSendDirective({ targets: [1] }));
+    await sendUntil(rig, A);
+    mc.simulateServerMessage(0, framedSendDirectiveWithoutStreams());
+    await flushMicrotasks(50);
+    mc.simulateServerMessage(0, framedSendDirective({ targets: [1] }));
+    await waitFor(() => rec.generations.some((g) => g > 0n));
+    await sendUntil(rig, A);
+    const preSwapMax = rec.generations.reduce((a, b) => (b > a ? b : a), 0n);
+    expect(preSwapMax).toBeGreaterThan(0n);
+
+    // Crash: the set drops ref 1 and adds ref 3; the directive empties, then names 3.
+    const C = 'https://mh-c.example:4433';
+    mc.simulateServerMessage(
+      0,
+      framedMediaHandlerSet({
+        version: 2n,
+        handlers: [
+          { ref: 2, url: MEDIA_SERVERS[1]! },
+          { ref: 3, url: C },
+        ],
+      }),
+    );
+    await waitFor(() => rig.mocks.has(C));
+    rig.mocks.get(C)!.simulateReady();
+    const postSwapStart = rec.generations.length;
+    mc.simulateServerMessage(0, framedSendDirectiveWithoutStreams());
+    // Let the EMPTY directive apply before the next one (the empty → non-empty
+    // edge is what rotates; two messages must not coalesce into one change).
+    await flushMicrotasks(50);
+    mc.simulateServerMessage(0, framedSendDirective({ targets: [3] }));
+    await sendUntil(rig, rig.mocks.get(C)!);
+    // A frame sealed BEFORE the swap may legitimately be fanned out to the new
+    // target (seal once, hop at write); keep capturing until a post-swap key is minted.
+    await waitFor(() => {
+      rig.capture.emit(makeAudioData({ samples: Float32Array.of(1, 2, 3) }));
+      return rec.generations.length > postSwapStart;
+    });
+
+    // (a) identity: the same pipeline, ONE manager for the whole run, never cleared.
+    expect(await rig.session.startMedia()).toBe(pipeline);
+    expect(rec.owners.size).toBe(1);
+    expect(rec.clear).not.toHaveBeenCalled();
+    // (c) strictly greater after the crash-shape swap (empty → non-empty rotates).
+    const post = rec.generations.slice(postSwapStart);
+    expect(post.length).toBeGreaterThan(0);
+    expect(post.every((g) => g > preSwapMax)).toBe(true);
+    // (b) no key id maps to two keys over the WHOLE run (pre-swap, swap, post-swap).
+    expect(rec.byKeyId.size).toBeGreaterThan(1);
+    expect(rec.collisions()).toBe(0);
+    rig.session.disconnect();
+    // Positive control: teardown DOES clear (the release is detached).
+    await waitFor(() => rec.clear.mock.calls.length > 0);
+  });
+
+  it('R-16 PLANNED shape (edges move, non-empty → non-empty): no rotation needed, generation non-decreasing, no key id reuse', async () => {
+    const rec = recordMaterials();
+    const rig = await joinedWithMedia();
+    const pipeline = await rig.session.startMedia();
+    const mc = rig.mocks.get(MC_ENDPOINT)!;
+    const A = rig.mocks.get(MEDIA_SERVERS[0]!)!;
+    const B = rig.mocks.get(MEDIA_SERVERS[1]!)!;
+    mc.simulateServerMessage(0, framedSendDirective({ targets: [1] }));
+    await sendUntil(rig, A);
+    mc.simulateServerMessage(0, framedSendDirectiveWithoutStreams());
+    await flushMicrotasks(50);
+    mc.simulateServerMessage(0, framedSendDirective({ targets: [1] }));
+    await waitFor(() => rec.generations.some((g) => g > 0n));
+    await sendUntil(rig, A);
+    const before = rec.generations.at(-1)!;
+    // Make-before-break: the edge moves 1 → 2, THEN ref 1 is removed.
+    mc.simulateServerMessage(0, framedSendDirective({ targets: [2] }));
+    await sendUntil(rig, B);
+    mc.simulateServerMessage(
+      0,
+      framedMediaHandlerSet({ version: 2n, handlers: [{ ref: 2, url: MEDIA_SERVERS[1]! }] }),
+    );
+    await sendUntil(rig, B);
+    expect(await rig.session.startMedia()).toBe(pipeline);
+    expect(rec.owners.size).toBe(1);
+    expect(rec.clear).not.toHaveBeenCalled();
+    for (let i = 1; i < rec.generations.length; i += 1) {
+      expect(rec.generations[i]!).toBeGreaterThanOrEqual(rec.generations[i - 1]!);
+    }
+    expect(rec.generations.at(-1)!).toBeGreaterThanOrEqual(before);
+    expect(rec.collisions()).toBe(0);
+    rig.session.disconnect();
+  });
+
+  it('R-16 POSITIVE ARM: the no-reuse detector FIRES on a simulated rebuild (a second manager, same sender id)', async () => {
+    const rec = recordMaterials();
+    const rig = await joinedWithMedia();
+    await rig.session.startMedia();
+    const mc = rig.mocks.get(MC_ENDPOINT)!;
+    mc.simulateServerMessage(0, framedSendDirective({ targets: [1] }));
+    await sendUntil(rig, rig.mocks.get(MEDIA_SERVERS[0]!)!);
+    expect(rec.collisions()).toBe(0);
+    // What a rebuild would do: a fresh manager under the SAME sender id and KEK.
+    const [stream, kek] = rec.spy.mock.calls[0]!;
+    const rebuilt = new TransmitKeyManager(258);
+    // Bring it to the generation the session's first key was minted at.
+    while (rebuilt.generation < rec.generations[0]!) rebuilt.rotate();
+    await rebuilt.materialFor(stream, kek);
+    expect(rec.owners.size).toBe(2);
+    expect(rec.collisions()).toBe(1);
     rig.session.disconnect();
   });
 
@@ -3159,6 +3335,85 @@ describe('MeetingSession — handler-set reconcile (story 4 C1)', () => {
     return { session, mc, dials, sched, sink, connected, sets, joined, overdue: () => overdue };
   }
 
+  it('story 4 C2: a crash sets the slot overlay through the session; the replacement clears it; resume_ms is observed', async () => {
+    const A = 'https://mh-a.example:4433';
+    const B = 'https://mh-b.example:4433';
+    const rig = await reconcileRig({ version: 1n, handlers: [{ ref: 1, url: A }] });
+    const overlay: { slotId: number; reconnecting: boolean }[] = [];
+    rig.session.on('slotReconnectingChanged', (e) =>
+      overlay.push({ slotId: e.slotId, reconnecting: e.reconnecting }),
+    );
+    rig.mc.simulateServerMessage(
+      0,
+      framedStreamAssignments({ slotId: 0, senderId: 300, handlerRef: 1 }),
+    );
+    await flushMicrotasks(50);
+    expect(overlay).toEqual([]); // negative before the loss
+    rig.dials.latest(A).simulateError(new Error('crash'));
+    await waitFor(() => overlay.length === 1);
+    expect(overlay).toEqual([{ slotId: 0, reconnecting: true }]);
+    // The replacement: a set naming ref 2, its dial, and the slot moved to it.
+    rig.mc.simulateServerMessage(
+      0,
+      framedMediaHandlerSet({ version: 2n, handlers: [{ ref: 2, url: B }] }),
+    );
+    await waitFor(() => rig.dials.count(B) === 1);
+    rig.dials.latest(B).simulateReady();
+    await waitFor(() => rig.connected.length === 2);
+    rig.mc.simulateServerMessage(
+      0,
+      framedStreamAssignments({ slotId: 0, senderId: 300, handlerRef: 2 }),
+    );
+    await waitFor(() => overlay.length === 2);
+    expect(overlay[1]).toEqual({ slotId: 0, reconnecting: false });
+    // No media was started, so the episode ends at session end: abandoned.
+    rig.session.disconnect();
+    expect(
+      rig.sink
+        .getRecordedMetrics()
+        .filter((m) => m.name === 'dt_client_media_resume_ms')
+        .map((m) => [m.labels['media_kind'], m.labels['outcome']]),
+    ).toEqual([['audio', 'abandoned']]);
+  });
+
+  it('story 4 C2: a non-member ref is COUNTED on the session bag (zero-initialised at join)', async () => {
+    const rig = await reconcileRig({
+      version: 1n,
+      handlers: [{ ref: 1, url: 'https://mh-a.example:4433' }],
+    });
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const nonMember = () =>
+      rig.sink
+        .getRecordedMetrics()
+        .filter(
+          (m) =>
+            m.name === 'dt_client_mh_non_member_refs_total' &&
+            m.labels['source'] === 'stream_assignment',
+        )
+        .map((m) => m.value);
+    expect(nonMember()).toEqual([0]); // zero-init
+    rig.mc.simulateServerMessage(
+      0,
+      framedStreamAssignments({ slotId: 0, senderId: 300, handlerRef: 1 }),
+    );
+    rig.mc.simulateServerMessage(
+      0,
+      framedStreamAssignments({ slotId: 0, senderId: 300, handlerRef: 77 }),
+    );
+    await waitFor(() => nonMember().length === 2);
+    expect(nonMember()).toEqual([0, 1]);
+    const sample = rig.sink
+      .getRecordedMetrics()
+      .find((m) => m.name === 'dt_client_mh_non_member_refs_total')!;
+    expect(Object.keys(sample.labels).sort()).toEqual([
+      'client_version',
+      'key_custody',
+      'org_id',
+      'source',
+    ]);
+    rig.session.disconnect();
+  });
+
   it('time_to_first_mh_connected is recorded ONCE per session — not on redial, not on migration', async () => {
     const A = 'https://mh-a.example:4433';
     const B = 'https://mh-b.example:4433';
@@ -3167,6 +3422,9 @@ describe('MeetingSession — handler-set reconcile (story 4 C1)', () => {
       rig.sink
         .getRecordedMetrics()
         .filter((m) => m.name === 'dt_client_time_to_first_mh_connected_ms').length;
+    // Observed only once the first dial FINALISES connected (admission window).
+    expect(count()).toBe(0);
+    rig.sched.advance(DEFAULT_CLIENT_CONFIG.media.handlers.admissionWindowMs);
     expect(count()).toBe(1);
 
     // Lose → redial → connect.
@@ -3296,6 +3554,9 @@ describe('MeetingSession — handler-set reconcile (story 4 C1)', () => {
     const A = 'https://mh-a.example:4433';
     const B = 'https://mh-b.example:4433';
     const codecs = new FakeAudioCodecs();
+    // story 4 C2 / R-16: the video slot's decoder (and with it its jitter
+    // buffer and the receiver's replay window, keyed by SLOT id) survive.
+    const videoDecoders = new FakeVideoDecoders();
     const rig = await reconcileRig(
       {
         version: 1n,
@@ -3312,7 +3573,7 @@ describe('MeetingSession — handler-set reconcile (story 4 C1)', () => {
         // Video published AND received, so all three per-ref consumers exist.
         publish: ['audio', 'video'],
         videoReceiveSlots: { count: 1, source: 'configured' },
-        videoDecoderFactory: new FakeVideoDecoders().factory as never,
+        videoDecoderFactory: videoDecoders.factory as never,
         videoEncoderFactory: async () => ({
           encode: () => undefined,
           encodeQueueSize: 0,
@@ -3342,6 +3603,9 @@ describe('MeetingSession — handler-set reconcile (story 4 C1)', () => {
     }
     // Same pipeline object: no rebuild on a set change.
     expect(await rig.session.startMedia()).toBe(pipeline);
+    // R-16: the slot's ONE decoder survived the swap — none built, none closed.
+    expect(videoDecoders.constructions).toBe(1);
+    expect(videoDecoders.decoders.every((d) => !d.closed)).toBe(true);
     rig.session.disconnect();
   });
 });
@@ -3667,5 +3931,147 @@ describe('MeetingSession.join — GC re-join on an ended meeting (join-window de
       expect(line).not.toContain('meeting-jwt');
       expect(line).not.toContain('https://');
     }
+  });
+});
+
+describe('MeetingSession — slot continuity end to end (story 4 C2)', () => {
+  const KEK = new Uint8Array(32).fill(0x11);
+  const A = MEDIA_SERVERS[0]!;
+  const B = MEDIA_SERVERS[1]!;
+
+  async function mediaRig() {
+    vi.spyOn(console, 'info').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const alice = await makeIdentity(0x71);
+    const mocks = new Map<string, MockWebTransport>();
+    const codecs = new FakeAudioCodecs();
+    const sink = new InMemoryMetricsSink();
+    // Injected so the overlay HOLD (removalGraceMs) and the cap run on test time.
+    const sched = new FakeScheduler();
+    const session = makeSession(mocks, {
+      metricsSink: sink,
+      transportScheduler: sched,
+      captureFactory: async () => new FakeCaptureSource() as never,
+      encoderFactory: codecs.encoderFactory as never,
+      decoderFactory: codecs.decoderFactory as never,
+      playbackFactory: new RecordingPlaybackSink().factory as never,
+      audioReceiveSlots: { count: 1, source: 'configured' },
+    });
+    const overlays: [number, boolean][] = [];
+    session.on('slotReconnectingChanged', (e) => overlays.push([e.slotId, e.reconnecting]));
+    const joining = session.join({
+      meetingCode: MEETING_CODE,
+      orgSubdomain: 'acme',
+      credentials: LOGIN,
+    });
+    await driveJoin(mocks, 'all', {
+      senderId: 258,
+      meetingKek: KEK,
+      participants: [
+        { participantId: 'p-a', name: 'Alice', senderId: 300, identityPublicKey: alice.publicKey },
+      ],
+    });
+    await joining;
+    const mc = mocks.get(MC_ENDPOINT)!;
+    const resumes = () =>
+      sink
+        .getRecordedMetrics()
+        .filter((m) => m.name === 'dt_client_media_resume_ms')
+        .map((m) => [m.labels['media_kind'], m.labels['outcome']]);
+    return { session, mocks, mc, alice, overlays, resumes, sched };
+  }
+
+  it('crash: overlay at the loss; the replacement clears it; a REAL frame via the replacement observes resume_ms{outcome="resumed"}', async () => {
+    const rig = await mediaRig();
+    const pipeline = await rig.session.startMedia();
+    rig.mc.simulateServerMessage(
+      0,
+      framedStreamAssignments({ slotId: 0, senderId: 300, handlerRef: 1 }),
+    );
+    await waitFor(() => pipeline.assignedSenders.includes(300));
+    rig.mocks.get(A)!.simulateError(new Error('crash'));
+    await waitFor(() => rig.overlays.length === 1);
+    expect(rig.overlays).toEqual([[0, true]]);
+    // MC's order: the set without ref 1 FIRST, then the moved assignment.
+    rig.mc.simulateServerMessage(
+      0,
+      framedMediaHandlerSet({ version: 2n, handlers: [{ ref: 2, url: B }] }),
+    );
+    rig.mc.simulateServerMessage(
+      0,
+      framedStreamAssignments({ slotId: 0, senderId: 300, handlerRef: 2 }),
+    );
+    await waitFor(() => rig.overlays.length === 2);
+    expect(rig.overlays[1]).toEqual([0, false]);
+    // A real, signed, decryptable frame from Alice via the replacement.
+    // Re-sent until it lands: the assignment and the read loop apply asynchronously.
+    for (let seq = 1; seq <= 50 && rig.resumes().length === 0; seq += 1) {
+      rig.mocks.get(B)!.simulateIncomingDatagram(
+        await buildTestFrame({
+          keyIdSenderId: 300,
+          kek: KEK,
+          signer: rig.alice,
+          plaintext: Uint8Array.of(1, 2, 3),
+          streamSequence: seq,
+          streamId: 0,
+        }),
+      );
+      await flushMicrotasks(50);
+    }
+    expect(rig.resumes()).toEqual([['audio', 'resumed']]);
+    rig.session.disconnect();
+  });
+
+  it("PLANNED transfer in MC's REAL order (health.rs remove_handler_for: set without OLD, then flush_views) sets NO overlay, even after the hold and the cap elapse; the crash on the same rig does", async () => {
+    const h = DEFAULT_CLIENT_CONFIG.media.handlers;
+    const rig = await mediaRig();
+    rig.mc.simulateServerMessage(
+      0,
+      framedStreamAssignments({ slotId: 0, senderId: 300, handlerRef: 1 }),
+    );
+    await flushMicrotasks(50);
+    // B (ref 2) is already connected: make-before-break. The set removes ref 1 FIRST...
+    rig.mc.simulateServerMessage(
+      0,
+      framedMediaHandlerSet({ version: 2n, handlers: [{ ref: 2, url: B }] }),
+    );
+    // ...then the moved assignment.
+    rig.mc.simulateServerMessage(
+      0,
+      framedStreamAssignments({ slotId: 0, senderId: 300, handlerRef: 2 }),
+    );
+    await flushMicrotasks(50);
+    // Past the hold AND the cap, on the injected clock: still nothing (not vacuous).
+    rig.sched.advance(h.removalGraceMs + h.reconnectingCapMs);
+    await flushMicrotasks(10);
+    expect(rig.overlays).toEqual([]);
+    // Positive arm: the handler now carrying the slot crashes.
+    rig.mocks.get(B)!.simulateError(new Error('crash'));
+    await waitFor(() => rig.overlays.length === 1);
+    expect(rig.overlays).toEqual([[0, true]]);
+    rig.session.disconnect();
+  });
+
+  it('positive control: the hold is LIVE at session level — a removal with NO follow-up assignment overlays exactly at removalGraceMs', async () => {
+    const grace = DEFAULT_CLIENT_CONFIG.media.handlers.removalGraceMs;
+    const rig = await mediaRig();
+    rig.mc.simulateServerMessage(
+      0,
+      framedStreamAssignments({ slotId: 0, senderId: 300, handlerRef: 1 }),
+    );
+    await flushMicrotasks(50);
+    // Ref 1 removed while still connected, ref 2 connected: a planned shape — held.
+    rig.mc.simulateServerMessage(
+      0,
+      framedMediaHandlerSet({ version: 2n, handlers: [{ ref: 2, url: B }] }),
+    );
+    await flushMicrotasks(50);
+    rig.sched.advance(grace - 1);
+    await flushMicrotasks(10);
+    expect(rig.overlays).toEqual([]);
+    rig.sched.advance(1);
+    await flushMicrotasks(10);
+    expect(rig.overlays).toEqual([[0, true]]);
+    rig.session.disconnect();
   });
 });

@@ -128,8 +128,10 @@ const OVERCLAIM_SUBSTRINGS: &[&str] =
 /// `docs/observability/label-taxonomy.md` §R4; this copy is pinned to it by
 /// [`tests::media_path_prefixes_match_the_taxonomy_block`]. It is a prefix list rather than a name list
 /// on purpose: a new `mh_media_*` series is in scope the day it lands, with no
-/// edit here. `dt_client_time_to_first_media_frame_ms` is listed whole because it
-/// is the one exported client media metric outside `dt_client_media_`.
+/// edit here. `dt_client_time_to_first_media_frame_ms` and
+/// `dt_client_time_to_first_mh_connected_ms` are listed whole because they are
+/// the exported client media-path metrics outside `dt_client_media_` /
+/// `dt_client_mh_`.
 pub const MEDIA_PATH_PREFIXES: &[&str] = &[
     "mh_media_",
     "mc_media_",
@@ -137,6 +139,8 @@ pub const MEDIA_PATH_PREFIXES: &[&str] = &[
     "mc_meeting_sender_ids_",
     "dt_client_media_",
     "dt_client_time_to_first_media_frame_ms",
+    "dt_client_mh_",
+    "dt_client_time_to_first_mh_connected_ms",
 ];
 
 /// The single permitted `key_custody` value. Mirrors

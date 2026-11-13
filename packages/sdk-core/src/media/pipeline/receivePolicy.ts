@@ -44,6 +44,7 @@ import {
   RECEIVE_PATH_REASONS,
   type OpenedFrame,
   type ReceiverKeys,
+  type ReplayArrival,
   type ReplayWindow,
   type TransmitKeyCache,
 } from '../frame/receivePath.js';
@@ -66,6 +67,12 @@ export interface IdentityKeyResolver {
 export interface KeyedFrame {
   readonly decoded: DecodedFrame;
   readonly senderId: number;
+  /**
+   * Where the frame arrived (story 4 C2) — classifies a replay-window
+   * rejection as `duplicate_cross_transport` vs `replay_detected`; never
+   * changes the decision. Absent: every rejection is `replay_detected`.
+   */
+  readonly arrival?: ReplayArrival;
 }
 
 /** Receiver state the policy reads. Per kind; see `lifecycle/receiverState.ts`. */
@@ -174,7 +181,10 @@ export async function receiveByKind(
         "the frame's sender is not assigned to any of this client's receive slots",
       );
     }
-    return { opened: await openVerifiedFrame(verified, ctx.cache, ctx.keys, ctx.replay), lane };
+    return {
+      opened: await openVerifiedFrame(verified, ctx.cache, ctx.keys, ctx.replay, keyed.arrival),
+      lane,
+    };
   }
   // The ONE sender classifier, ARRIVAL mapping (see `classifySender`): self and
   // muted drop; `unmapped` passes here and is refused at render.
@@ -188,5 +198,7 @@ export async function receiveByKind(
       "the frame's verified sender is server-muted for video",
     );
   }
-  return { opened: await openVerifiedFrame(verified, ctx.cache, ctx.keys, ctx.replay) };
+  return {
+    opened: await openVerifiedFrame(verified, ctx.cache, ctx.keys, ctx.replay, keyed.arrival),
+  };
 }

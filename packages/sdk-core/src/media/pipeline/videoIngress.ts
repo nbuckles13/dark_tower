@@ -51,6 +51,7 @@ import {
 } from './streamReader.js';
 import type { VideoSlotPipeline } from './videoSlotPipeline.js';
 import type { HandlerRef } from '../handlerSet.js';
+import type { ReplayArrival } from '../frame/receivePath.js';
 
 const { VerifyFailed, DecryptFailed } = MEDIA_RECOVERY_SOURCES;
 
@@ -85,6 +86,7 @@ export const RECOVERY_REASON_FOR: Readonly<Record<RejectReason, MediaRecoverySou
   decrypt_failed: DecryptFailed,
   unwrap_failed: DecryptFailed,
   replay_detected: null,
+  duplicate_cross_transport: null,
   wrap_key_id_mismatch: null,
   no_kek_for_generation: DecryptFailed,
   no_roster_entry: VerifyFailed,
@@ -108,6 +110,11 @@ export interface VideoIngressOptions {
   readonly verification?: ReceiveVerificationRecorder;
   /** The reader's allocation seam (tests prove MAX is checked before allocation). */
   readonly alloc?: FrameAllocator;
+  /**
+   * The arrival of a frame received via a handler ref (story 4 C2): classifies
+   * a replay-window rejection by transport. Absent: no classification.
+   */
+  readonly arrivalFor?: (ref: HandlerRef) => ReplayArrival;
 }
 
 /** One reader outcome, in stream order. */
@@ -308,7 +315,12 @@ export class VideoIngress {
     this.#o.verification?.keyed(slotId, senderId);
 
     try {
-      const { opened } = await receiveByKind({ decoded, senderId }, this.#o.gate, this.#o.ctx);
+      const arrival = this.#o.arrivalFor?.(state.ref);
+      const { opened } = await receiveByKind(
+        arrival ? { decoded, senderId, arrival } : { decoded, senderId },
+        this.#o.gate,
+        this.#o.ctx,
+      );
       // Layer 2 + the wrap outcome: the ONE accept tail (`frameAccounting.ts`).
       this.#o.accounting.accepted(opened.wrapOutcome, slotId, senderId);
       // Decode in ANY slot state: the video decode-before-live exception.

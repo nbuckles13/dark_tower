@@ -40,8 +40,16 @@ const KEYS = Object.keys(HANDLER_SET_CONFIG_RANGES) as (keyof HandlerSetConfig)[
 
 /** Overrides that keep the base <= cap relationship out of the way of a range arm. */
 function neutral(key: keyof HandlerSetConfig): Partial<HandlerSetConfig> {
-  if (key === 'redialBaseMs') return { redialCapMs: HANDLER_SET_CONFIG_RANGES.redialCapMs[1] };
-  if (key === 'redialCapMs') return { redialBaseMs: HANDLER_SET_CONFIG_RANGES.redialBaseMs[0] };
+  const R = HANDLER_SET_CONFIG_RANGES;
+  if (key === 'redialBaseMs') {
+    return { redialCapMs: R.redialCapMs[1], reconnectAbandonMs: R.reconnectAbandonMs[1] };
+  }
+  if (key === 'redialCapMs') {
+    return { redialBaseMs: R.redialBaseMs[0], reconnectAbandonMs: R.reconnectAbandonMs[1] };
+  }
+  if (key === 'reconnectingCapMs') return { resumeAbandonMs: R.resumeAbandonMs[1] };
+  if (key === 'resumeAbandonMs') return { reconnectingCapMs: R.reconnectingCapMs[0] };
+  if (key === 'reconnectAbandonMs') return { redialCapMs: R.redialCapMs[0] };
   return {};
 }
 
@@ -61,6 +69,49 @@ describe('media.handlers — inclusive ranges, throw-never-clamp', () => {
     }
   });
 
+  it('reconnectingCapMs > resumeAbandonMs is rejected; equal is accepted (story 4 C2)', () => {
+    const err = rejection(withHandlers({ reconnectingCapMs: 40_000, resumeAbandonMs: 39_999 }));
+    expect(err?.configKey).toBe('media.handlers.reconnectingCapMs');
+    expect(
+      rejection(withHandlers({ reconnectingCapMs: 40_000, resumeAbandonMs: 40_000 })),
+    ).toBeUndefined();
+  });
+
+  it('removalGraceMs must be LESS than reconnectingCapMs (equal is rejected; one less accepted)', () => {
+    const err = rejection(withHandlers({ reconnectingCapMs: 9_000, removalGraceMs: 9_000 }));
+    expect(err?.configKey).toBe('media.handlers.removalGraceMs');
+    expect(
+      rejection(withHandlers({ reconnectingCapMs: 9_000, removalGraceMs: 8_999 })),
+    ).toBeUndefined();
+  });
+
+  it('reconnectAbandonMs below one full redial window is rejected; equal is accepted', () => {
+    const window = MH_KEEPALIVE_FLOOR_MS + 20_000;
+    const err = rejection(withHandlers({ redialCapMs: 20_000, reconnectAbandonMs: window - 1 }));
+    expect(err?.configKey).toBe('media.handlers.reconnectAbandonMs');
+    expect(
+      rejection(withHandlers({ redialCapMs: 20_000, reconnectAbandonMs: window })),
+    ).toBeUndefined();
+  });
+
+  it('every pair of range extremes stays jointly satisfiable (the ranges cannot contradict the relations)', () => {
+    const R = HANDLER_SET_CONFIG_RANGES;
+    expect(R.reconnectAbandonMs[1]).toBeGreaterThanOrEqual(
+      MH_KEEPALIVE_FLOOR_MS + R.redialCapMs[1],
+    );
+    expect(R.resumeAbandonMs[1]).toBeGreaterThanOrEqual(R.reconnectingCapMs[1]);
+    expect(R.removalGraceMs[0]).toBeLessThan(R.reconnectingCapMs[0]);
+  });
+
+  it('the shipped caps sit inside the server replacement timeline arithmetic (defaults documented)', () => {
+    const h = DEFAULT_CLIENT_CONFIG.media.handlers;
+    expect(h.admissionWindowMs).toBe(2_000);
+    expect(h.reconnectingCapMs).toBe(30_000);
+    expect(h.removalGraceMs).toBe(2_000);
+    expect(h.resumeAbandonMs).toBe(60_000);
+    expect(h.reconnectAbandonMs).toBe(60_000);
+  });
+
   it('redialBaseMs > redialCapMs is rejected; equal is accepted', () => {
     const err = rejection(withHandlers({ redialBaseMs: 5_000, redialCapMs: 4_999 }));
     expect(err?.configKey).toBe('media.handlers.redialBaseMs');
@@ -75,6 +126,9 @@ describe('the [dt-media-handlers-config] line', () => {
       'media handler-set config (default): ' +
         `redialBaseMs=${h.redialBaseMs}; redialCapMs=${h.redialCapMs}; ` +
         `emptySetNoticeMs=${h.emptySetNoticeMs}; releasedGraceMs=${h.releasedGraceMs}; ` +
+        `admissionWindowMs=${h.admissionWindowMs}; reconnectingCapMs=${h.reconnectingCapMs}; ` +
+        `removalGraceMs=${h.removalGraceMs}; ` +
+        `resumeAbandonMs=${h.resumeAbandonMs}; reconnectAbandonMs=${h.reconnectAbandonMs}; ` +
         `firstRedialFloorMs=${MH_KEEPALIVE_FLOOR_MS} (compiled)`,
     );
     expect(handlerSetConfigLogLine(withHandlers({ redialBaseMs: 250 }), 'configured')).toMatch(

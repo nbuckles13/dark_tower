@@ -52,6 +52,8 @@ import type {
   ParticipantMuteEvent,
   PublishKind,
   RosterParticipant,
+  HandlerSetView,
+  SlotReconnectingChangedEvent,
   StreamAssignmentEvent,
   StreamAssignmentsEvent,
   UnmuteRequestedEvent,
@@ -139,6 +141,22 @@ export class MediaStore {
   #audioResumeNotice = $state(false);
   #videoResumeNotice = $state(false);
 
+  /**
+   * The participant's CURRENT media-handler set (story 4 C2), token-free by
+   * construction: an explicit `{version, handlers:[{ref, url}]}` projection of
+   * the SDK's `mediaHandlerSet` (the SDK's view carries no token either; the
+   * projection keeps a later field from reaching a reader by accident).
+   * `undefined` before the join-time set arrives. Its own cell.
+   */
+  #handlerSet = $state<HandlerSetView | undefined>(undefined);
+
+  /**
+   * The SDK's ONE non-fatal "no media handler yet" notice
+   * (`mediaHandlersOverdue`, at most once per session). Latched; it renders
+   * only while the set is still empty (`mediaConnecting`).
+   */
+  #handlersOverdue = $state(false);
+
   /** Per-slot cells (assignment, video render). */
   readonly #slotCells = new CellRegistry<number, SlotCell, SlotView>(
     () => new SlotCell(),
@@ -200,6 +218,25 @@ export class MediaStore {
   /** Reactive getter for `$cameraFailure` (R-19). */
   get cameraFailure(): MediaCaptureFailureOutcome | undefined {
     return this.#cameraFailure;
+  }
+
+  /** The current handler set (refs + urls, never a token); `undefined` before the join-time set. */
+  get handlerSet(): HandlerSetView | undefined {
+    return this.#handlerSet;
+  }
+
+  /**
+   * "Connecting media" (ADR-0039 §4, L4-2): the set this client holds is EMPTY —
+   * no handler has acked yet. No fault, no loss; media connects when a set
+   * naming a handler arrives.
+   */
+  get mediaConnecting(): boolean {
+    return this.#handlerSet !== undefined && this.#handlerSet.handlers.length === 0;
+  }
+
+  /** The non-fatal overdue notice, while the set is still empty. */
+  get handlersOverdue(): boolean {
+    return this.#handlersOverdue && this.mediaConnecting;
   }
 
   /** ONE slot's cells. Reading it tracks only that slot. */
@@ -341,6 +378,31 @@ export class MediaStore {
     if (event.state.kind === 'active') this.#liveVideo.set(event.slotId, event.state.senderId);
     else this.#liveVideo.delete(event.slotId);
     if (before !== this.#liveVideo.get(event.slotId)) this.#recomputePairs();
+  }
+
+  /**
+   * Apply a `mediaHandlerSet` event: an EXPLICIT projection (version, and per
+   * handler its ref and url) — nothing is spread out of the SDK object.
+   */
+  applyHandlerSet(view: HandlerSetView): void {
+    this.#handlerSet = {
+      version: view.version,
+      handlers: view.handlers.map((h) => ({ ref: h.ref, url: h.url })),
+    };
+  }
+
+  /** Apply the SDK's `mediaHandlersOverdue` (once per session): latch the notice. */
+  applyHandlersOverdue(): void {
+    this.#handlersOverdue = true;
+  }
+
+  /** Apply a `slotReconnectingChanged` event to THAT slot's cell only. */
+  applySlotReconnecting(event: SlotReconnectingChangedEvent): void {
+    this.#slotCells
+      .ensure(event.slotId)
+      .setReconnecting(
+        event.reconnecting ? { previousSenderId: event.previousSenderId } : undefined,
+      );
   }
 
   /** Apply a `mediaFault` event. Bounded and SDK-authored; never a platform string. */

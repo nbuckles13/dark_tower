@@ -216,10 +216,16 @@ impl TestTelemetryServer {
 
     /// Mint a valid user token for the given subject.
     fn user_token(&self, sub: &str) -> String {
+        self.user_token_for_org(sub, &Uuid::new_v4().to_string())
+    }
+
+    /// Mint a valid user token for the given subject in a known org, for tests
+    /// that assert the server-stamped `org_id`.
+    fn user_token_for_org(&self, sub: &str, org_id: &str) -> String {
         let now = Utc::now().timestamp();
         let claims = TestUserClaims {
             sub: sub.to_string(),
-            org_id: Uuid::new_v4().to_string(),
+            org_id: org_id.to_string(),
             email: "user@example.com".to_string(),
             roles: vec!["user".to_string()],
             iat: now,
@@ -1181,6 +1187,186 @@ async fn media_kind_survives_on_a_metric_datapoint_and_is_stripped_from_spans_an
         assert!(
             !span.attributes.iter().any(|kv| kv.key == key),
             "{key} is datapoint-only and must be stripped from spans; got {:?}",
+            span.attributes
+        );
+    }
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn mh_lifecycle_phase_and_cause_survive_on_datapoints_and_are_stripped_elsewhere(
+    pool: PgPool,
+) -> Result<()> {
+    // Story 4 C2: `phase` and `cause` join the DATAPOINT-ONLY tier
+    // (`MEDIA_DATAPOINT_EXTRA`), and `dt.mh_index_bucket` leaves ALLOWLIST.
+    // Real user-JWT path, asserted on the bytes GC forwards: the new keys
+    // survive byte-identical on the two `dt_client_mh_*` datapoints with
+    // `org_id` stamped from the claim; they are stripped from an exemplar and a
+    // span; a stale tab's legacy `status` / `mh_index_bucket` (both spellings)
+    // never leave GC.
+    use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+    use opentelemetry_proto::tonic::metrics::v1::{Exemplar, Sum};
+    use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+
+    let server = TestTelemetryServer::spawn(pool, TelemetryServerOpts::default()).await?;
+    let claims_org_id = Uuid::new_v4().to_string();
+    let token = server.user_token_for_org("user-mh-lifecycle", &claims_org_id);
+
+    let sum_metric = |name: &str, attributes: Vec<KeyValue>| Metric {
+        name: name.to_string(),
+        data: Some(Data::Sum(Sum {
+            data_points: vec![NumberDataPoint {
+                attributes,
+                exemplars: vec![Exemplar {
+                    filtered_attributes: vec![
+                        str_kv("phase", "redial"),
+                        str_kv("cause", "declined"),
+                    ],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    let metrics = ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            resource: None,
+            scope_metrics: vec![ScopeMetrics {
+                scope: None,
+                metrics: vec![
+                    sum_metric(
+                        "dt_client_mh_connection_total",
+                        vec![
+                            str_kv("phase", "redial"),
+                            str_kv("outcome", "wrong_handler"),
+                            str_kv("org_id", "spoofed-org"),
+                            // A stale tab's pre-story-4 bag.
+                            str_kv("status", "failure"),
+                            str_kv("mh_index_bucket", "2+"),
+                            str_kv("dt.mh_index_bucket", "1"),
+                        ],
+                    ),
+                    sum_metric(
+                        "dt_client_mh_disconnects_total",
+                        vec![str_kv("cause", "directed_removal")],
+                    ),
+                ],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    };
+    let traces = ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource: None,
+            scope_spans: vec![ScopeSpans {
+                scope: None,
+                spans: vec![Span {
+                    name: "join".to_string(),
+                    attributes: vec![
+                        str_kv("phase", "join"),
+                        str_kv("cause", "transport_loss"),
+                        str_kv("dt.mh_index_bucket", "0"),
+                    ],
+                    ..Default::default()
+                }],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    };
+
+    let client = reqwest::Client::new();
+    for (signal, body) in [
+        ("metrics", metrics.encode_to_vec()),
+        ("traces", traces.encode_to_vec()),
+    ] {
+        let resp = client
+            .post(server.url(signal))
+            .bearer_auth(&token)
+            .header("Content-Type", PROTOBUF)
+            .body(body)
+            .send()
+            .await?;
+        assert_eq!(resp.status(), 202, "{signal} must be accepted");
+    }
+
+    // Positive control: a forward that never happened must not let "stripped"
+    // pass vacuously.
+    let m_bodies = server.forwarded_bodies("/v1/metrics").await;
+    let m_body = m_bodies.last().expect(
+        "GC forwarded NO metrics body to the collector; the assertions below would be vacuous",
+    );
+    let t_bodies = server.forwarded_bodies("/v1/traces").await;
+    let t_body = t_bodies.last().expect(
+        "GC forwarded NO traces body to the collector; the span-strip assertion would be vacuous",
+    );
+
+    let fwd = ExportMetricsServiceRequest::decode(m_body.as_slice())?;
+    let fwd_metrics = &fwd.resource_metrics[0].scope_metrics[0].metrics;
+    let dp_of = |name: &str| {
+        let m = fwd_metrics.iter().find(|m| m.name == name)?;
+        let Some(Data::Sum(sum)) = m.data.as_ref() else {
+            unreachable!("payload was built with a Sum; the filter never changes the data kind");
+        };
+        Some(sum.data_points[0].clone())
+    };
+    let str_of = |attrs: &[KeyValue], key: &str| -> Option<String> {
+        attrs
+            .iter()
+            .find(|kv| kv.key == key)
+            .and_then(|kv| kv.value.as_ref())
+            .and_then(|v| match v.value.as_ref() {
+                Some(Value::StringValue(s)) => Some(s.clone()),
+                _ => None,
+            })
+    };
+
+    let conn = dp_of("dt_client_mh_connection_total")
+        .expect("dt_client_mh_connection_total was not forwarded");
+    let disc = dp_of("dt_client_mh_disconnects_total")
+        .expect("dt_client_mh_disconnects_total was not forwarded");
+    for (dp, key, value) in [
+        (&conn, "phase", "redial"),
+        (&conn, "outcome", "wrong_handler"),
+        (&disc, "cause", "directed_removal"),
+    ] {
+        assert_eq!(
+            str_of(&dp.attributes, key).as_deref(),
+            Some(value),
+            "{key} must survive on the datapoint byte-identical; got {:?}",
+            dp.attributes
+        );
+    }
+    for dp in [&conn, &disc] {
+        assert_eq!(
+            str_of(&dp.attributes, "org_id").as_deref(),
+            Some(claims_org_id.as_str()),
+            "org_id must be stamped from the authenticated claim; got {:?}",
+            dp.attributes
+        );
+        assert!(
+            dp.exemplars[0].filtered_attributes.is_empty(),
+            "exemplars take the BASE tier; phase/cause must be stripped there; got {:?}",
+            dp.exemplars[0].filtered_attributes
+        );
+    }
+    for legacy in ["status", "mh_index_bucket", "dt.mh_index_bucket"] {
+        assert!(
+            !conn.attributes.iter().any(|kv| kv.key == legacy),
+            "stale-tab key {legacy} must not leave GC; got {:?}",
+            conn.attributes
+        );
+    }
+
+    let fwd_t = ExportTraceServiceRequest::decode(t_body.as_slice())?;
+    let span = &fwd_t.resource_spans[0].scope_spans[0].spans[0];
+    for key in ["phase", "cause", "dt.mh_index_bucket"] {
+        assert!(
+            !span.attributes.iter().any(|kv| kv.key == key),
+            "{key} must be stripped from spans; got {:?}",
             span.attributes
         );
     }

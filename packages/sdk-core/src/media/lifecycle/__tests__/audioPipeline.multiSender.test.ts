@@ -129,6 +129,8 @@ async function makeReceiver(opts: { declared?: number[] } = {}) {
   }
   const identity = await MeetingIdentity.create();
   const ref: { pipeline?: AudioPipeline } = {};
+  /** Slot-continuity evidence (story 4 C2): [slotId, arriving ref, sender]. */
+  const presented: [number, HandlerRef, number][] = [];
   const intervals: { fn: () => void; ms: number }[] = [];
   // The SAME wiring the session installs, from the SAME module.
   roster.setTransmitKeyInvalidationListener(
@@ -152,6 +154,7 @@ async function makeReceiver(opts: { declared?: number[] } = {}) {
     metricExportIntervalMs: 10_000,
     senderFor: () => undefined,
     readableFor: (url) => transports.get(url)?.datagrams.readable,
+    onSlotPresented: (slotId, handler, sender) => presented.push([slotId, handler, sender]),
     reportMute: () => {},
     captureFactory: async () => new FakeCaptureSource() as never,
     encoderFactory: codecs.encoderFactory as never,
@@ -180,6 +183,7 @@ async function makeReceiver(opts: { declared?: number[] } = {}) {
 
   const rig = {
     pipeline,
+    presented,
     holder,
     roster,
     codecs,
@@ -1129,5 +1133,38 @@ describe('receive-source deficit against REAL decode activity (story 2 R-28)', (
     // Now A falls silent while MC still says it is active.
     r.tickExport();
     expect(r.deficit()).toBe(1);
+  });
+});
+
+describe('story 4 C2 / R-16 — a slot survives a handler swap (audio)', () => {
+  it('presentation carries the ARRIVING ref; the replay window survives forget: an A-seen frame via B is duplicate_cross_transport, played once', async () => {
+    const r = await makeReceiver({ declared: [0] });
+    const a = await makePeer(11, 0xa1, 0, HANDLER_A);
+    r.install(0, 'join_response');
+    await r.admit(a);
+    await r.assign(a);
+    const first = await send(r, a);
+    await r.drain();
+    expect(r.presented).toEqual([[0, HANDLER_A, 11]]);
+    const decoders = r.codecs.decoders.length;
+
+    // The swap: A leaves the set; the edge moves to B.
+    r.pipeline.forgetHandler(HANDLER_A);
+    const moved: Peer = { ...a, handler: HANDLER_B };
+    r.pipeline.setReceiveAssignments([
+      { slotId: 0, senderId: a.id, handlerRef: HANDLER_B, active: true },
+    ]);
+    // The same frame via B: dropped as the overlap, never played twice.
+    r.deliver(HANDLER_B, first);
+    await r.drain();
+    expect(r.drops('duplicate_cross_transport')).toBe(1);
+    expect(r.drops('replay_detected')).toBe(0);
+    expect(r.decodedFor(a)).toBe(1);
+    // The next frame via B plays on the SAME decoder; presentation names B.
+    await send(r, moved);
+    await r.drain();
+    expect(r.decodedFor(a)).toBe(2);
+    expect(r.presented.at(-1)).toEqual([0, HANDLER_B, 11]);
+    expect(r.codecs.decoders.length).toBe(decoders); // no decoder rebuilt
   });
 });

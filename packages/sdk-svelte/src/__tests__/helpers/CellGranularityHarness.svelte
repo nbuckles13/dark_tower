@@ -25,7 +25,10 @@
 
   function tileText(slotId: number): string {
     const cell = store.media.slot(slotId);
-    return `${cell.assignment?.slotState ?? 'none'}/${cell.render?.kind ?? 'none'}`;
+    const reconnecting = cell.reconnecting
+      ? `/reconnecting:${String(cell.reconnecting.previousSenderId)}`
+      : '';
+    return `${cell.assignment?.slotState ?? 'none'}/${cell.render?.kind ?? 'none'}${reconnecting}`;
   }
   const tile3 = $derived.by(() => {
     counts.tile3 += 1;

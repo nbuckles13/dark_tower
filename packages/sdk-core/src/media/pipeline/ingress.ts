@@ -82,7 +82,13 @@
 
 import { decodeFrame } from '../frame/frameCodec.js';
 import { keyIdSenderOf } from '../frame/sframe.js';
-import type { ReceiverKeys, ReplayWindow, TransmitKeyCache } from '../frame/receivePath.js';
+import type {
+  ReceiverKeys,
+  ReplayArrival,
+  ReplayWindow,
+  TransmitKeyCache,
+} from '../frame/receivePath.js';
+import type { HandlerRef } from '../handlerSet.js';
 import { FrameRejectedError } from '../frame/rejectReason.js';
 import type { RejectReason } from '../frame/rejectReason.js';
 import type { MediaKindMetrics } from '../setup/mediaMetrics.js';
@@ -128,7 +134,21 @@ export interface IngressPipelineOptions {
   readonly verification?: ReceiveVerificationRecorder;
   /** The AUDIO slot ids this client declared: the per-slot local tallies (R-35). */
   readonly declaredSlotIds?: readonly number[];
+  /**
+   * The arrival of a frame received via a handler ref (story 4 C2): classifies
+   * a replay-window rejection by transport. Absent: no classification.
+   */
+  readonly arrivalFor?: (ref: HandlerRef) => ReplayArrival;
+  /** Slot-continuity evidence: a declared slot presented a frame via `ref` (story 4 C2). */
+  readonly onPresented?: SlotPresentedListener;
 }
+
+/**
+ * A declared receive slot presented a frame from the verified `senderId` via
+ * the handler `ref` (audio: accepted and handed to its decoder; video: a
+ * decoded output). Slot-continuity evidence only (`session/slotContinuity.ts`).
+ */
+export type SlotPresentedListener = (slotId: number, ref: HandlerRef, senderId: number) => void;
 
 /**
  * Drives one datagram through the receive path.
@@ -148,6 +168,8 @@ export class IngressPipeline {
   readonly #firstMedia: FirstMediaObserver;
   readonly #onAccepted: ((frame: AcceptedFrame) => void) | undefined;
   readonly #verify: ReceiveVerificationRecorder | undefined;
+  readonly #arrivalFor: ((ref: HandlerRef) => ReplayArrival) | undefined;
+  readonly #onPresented: SlotPresentedListener | undefined;
 
   /**
    * `received = accepted + sum(drops by reason)`, kept by the ONE accounting
@@ -174,6 +196,8 @@ export class IngressPipeline {
     this.#firstMedia = options.firstMedia;
     this.#onAccepted = options.onAccepted;
     this.#verify = options.verification;
+    this.#arrivalFor = options.arrivalFor;
+    this.#onPresented = options.onPresented;
   }
 
   /**
@@ -241,7 +265,11 @@ export class IngressPipeline {
    * a bug cannot hide as a silent frame loss. The read loop catches it, surfaces
    * it once as a typed media error, and continues; see the caller.
    */
-  async accept(datagram: Uint8Array, hopMonitor: HopSequenceMonitor): Promise<void> {
+  async accept(
+    datagram: Uint8Array,
+    hopMonitor: HopSequenceMonitor,
+    ref?: HandlerRef,
+  ): Promise<void> {
     // AT THE WIRE — which, for a datagram, is the parse boundary. First
     // statement, before any parse.
     this.#accounting.received();
@@ -297,12 +325,17 @@ export class IngressPipeline {
 
       // THE ONE RECEIVE POLICY (`receivePolicy.ts`), audio branch: resolve,
       // verify, slot-edge gate BEFORE open, open.
-      const { opened, lane } = await receiveByKind({ decoded, senderId }, this.#gate, {
-        roster: this.#roster,
-        keys: this.#keys,
-        cache: this.#cache,
-        replay: this.#replay,
-      });
+      const arrival = ref !== undefined ? this.#arrivalFor?.(ref) : undefined;
+      const { opened, lane } = await receiveByKind(
+        arrival ? { decoded, senderId, arrival } : { decoded, senderId },
+        this.#gate,
+        {
+          roster: this.#roster,
+          keys: this.#keys,
+          cache: this.#cache,
+          replay: this.#replay,
+        },
+      );
 
       // The count is safe to expose where a per-frame SIZE would not be
       // (ADR-0036 §11's voice-activity trace) ONLY because the encoder runs with
@@ -312,6 +345,12 @@ export class IngressPipeline {
       this.#accounting.accepted(opened.wrapOutcome, observedSlot, senderId);
       this.#onAccepted?.({ senderId: Number(opened.senderId), plaintext: opened.plaintext });
       lane.decode({ data: opened.plaintext, timestampUs: 0 });
+      // Slot-continuity evidence (story 4 C2): this declared slot presented a
+      // frame from this verified sender via `ref`. A plain call; the listener
+      // acts only while that slot has an open episode.
+      if (ref !== undefined && typeof observedSlot === 'number') {
+        this.#onPresented?.(observedSlot, ref, senderId);
+      }
     } catch (err) {
       if (err instanceof FrameRejectedError) {
         // The token, verbatim. No mapping table, no bucket, no `other`: the

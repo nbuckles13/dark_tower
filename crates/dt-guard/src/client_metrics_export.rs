@@ -277,6 +277,11 @@ pub const NOT_KEY_DELIVERY: &[(&str, &str)] = &[
         "stream reset mid-frame; transport/stream framing, not key delivery",
     ),
     (
+        "duplicate_cross_transport",
+        "duplicate of an already-accepted frame arriving via a second handler during a \
+         make-before-break overlap; transport topology, not key delivery",
+    ),
+    (
         "stream_slot_mismatch",
         "relay stream_id is not one of the receiver's declared slots, or differs between frames \
          on one stream; relay/stream structure, not key delivery",
@@ -327,9 +332,10 @@ pub const DECLARED_WRAPPERS: &[DeclaredWrapper] = &[
         injects: "this.#metricLabels",
     },
     // The SDK's kind-free SESSION-level media series (KEK lifecycle, roster key
-    // changes, capture source): `MediaSessionMetrics` emits only through these
-    // two wrappers, which inject its object-literal `this.#sessionLabels`
-    // (story 3 OBS-A). Per-kind series keep resolving through `this.#base`.
+    // changes, capture source, MH connection lifecycle): `MediaSessionMetrics`
+    // emits only through these three wrappers, which inject its object-literal
+    // `this.#sessionLabels` (story 3 OBS-A; `#sessionHistogram` story 4 C2).
+    // Per-kind series keep resolving through `this.#base`.
     DeclaredWrapper {
         file: MEDIA_METRICS_TS,
         method: "#sessionCounter",
@@ -338,6 +344,11 @@ pub const DECLARED_WRAPPERS: &[DeclaredWrapper] = &[
     DeclaredWrapper {
         file: MEDIA_METRICS_TS,
         method: "#sessionGauge",
+        injects: "this.#sessionLabels",
+    },
+    DeclaredWrapper {
+        file: MEDIA_METRICS_TS,
+        method: "#sessionHistogram",
         injects: "this.#sessionLabels",
     },
 ];
@@ -2357,12 +2368,13 @@ fn emission_keys(
 /// **Scope is `Exported: yes` names only**, and that is deliberate: a
 /// non-exported name is dropped WHOLE by the collector's metric-name filter, so
 /// its labels never reach storage. Applying `keep_keys` to them would demand
-/// `meeting_id_hash` in `keep_keys` (the join-flow metrics carry it) — which is
-/// exactly the ADR-0036 §11 breach. Do not "fix" a finding here by widening
-/// `keep_keys`. Known and harmless while unexported: the join-flow metrics emit
-/// bare `status` / `failure_stage` / `close_reason` / `mh_index_bucket`, while
-/// GC's `ALLOWLIST` only has the `dt.`-dotted spellings; this rule fires the day
-/// one of them is exported.
+/// `meeting_id_hash` in `keep_keys` (the grandfathered join-flow metrics carry
+/// it) — which is exactly the ADR-0036 §11 breach. Do not "fix" a finding here
+/// by widening `keep_keys`. Known and harmless while unexported: the remaining
+/// grandfathered join-flow metrics emit bare `status` / `failure_stage` /
+/// `close_reason`, while GC's `ALLOWLIST` only has the `dt.`-dotted spellings;
+/// this rule fires the day one of them is exported. (`mh_index_bucket` left with
+/// `dt_client_mh_connection_total`'s move to the exported session bag, story 4.)
 ///
 /// **Fail-closed paths (`unresolved_label_bag`):** an interpolated backtick
 /// literal starting `dt_client_` in first-argument position (any name). For

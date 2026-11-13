@@ -290,6 +290,7 @@ export {
   VIDEO_STREAM_CAP_HEADROOM,
   videoReceiveConfigLogLine,
   HANDLER_SET_CONFIG_RANGES,
+  REPLACEMENT_AFTER_DETECTION_BUDGET_MS,
   MH_KEEPALIVE_FLOOR_MS,
   handlerSetConfigLogLine,
 } from './config/clientConfig.js';
@@ -375,6 +376,16 @@ export {
   MEDIA_RECOVERY_SOURCES,
   SLOT_UNFULFILLED_BUCKETS_MS,
   FIRST_RENDER_BUCKETS_MS,
+  MH_DIAL_PHASES,
+  MH_DIAL_OUTCOMES,
+  MH_DIAL_DURATION_OUTCOMES,
+  MH_DISCONNECT_CAUSES,
+  MH_RECONNECT_OUTCOMES,
+  MEDIA_RESUME_OUTCOMES,
+  MH_NON_MEMBER_SOURCES,
+  MH_DIAL_DURATION_BUCKETS_MS,
+  MH_TIME_TO_FIRST_CONNECTED_BUCKETS_MS,
+  MH_DISRUPTION_BUCKETS_MS,
   MediaKindMetrics,
   MediaMetrics,
   MediaSessionMetrics,
@@ -520,3 +531,4 @@ export type {
   StreamAssignmentEvent,
   StreamAssignmentsEvent,
 } from './signaling/events.js';
+export type { SlotReconnectingChangedEvent } from './session/slotContinuity.js';

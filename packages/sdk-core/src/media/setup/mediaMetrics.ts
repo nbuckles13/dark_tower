@@ -37,10 +37,12 @@
 // session series per kind (or a per-kind series kind-free) is a compile error,
 // not a review catch. Catalog: `docs/observability/metrics/client.md`.
 //
-// `MediaTransport`'s `#emitMetric` DOES spread the join set. That is legal for
-// exactly one grandfathered metric and is annotated at that site; see
-// `../MediaTransport.ts`. Nothing here shares code with it, deliberately — what
-// is reused is `MetricsSink` (the interface), never the label set.
+// NOTHING under `media/**` spreads the join set any more. Until story 4 C2,
+// `MediaTransport` spread it into `dt_client_mh_connection_total` (an ADR-0028
+// join-flow metric grandfathered with `meeting_id_hash`); that series and
+// `dt_client_time_to_first_mh_connected_ms` LEFT the grandfathered roster and
+// are emitted below through `MediaSessionMetrics`' session bag, like every
+// other kind-free media series (`../transportTelemetry.ts` is their tracker).
 //
 // ---------------------------------------------------------------------------
 // HANDLES ARE RESOLVED ONCE, HERE, AT SETUP
@@ -531,6 +533,123 @@ export const MEDIA_MH_CONTROL_CHANNEL_ENDINGS = {
 /** One of {@link MEDIA_MH_CONTROL_CHANNEL_ENDINGS}. */
 export type MediaMhControlChannelEnding =
   (typeof MEDIA_MH_CONTROL_CHANNEL_ENDINGS)[keyof typeof MEDIA_MH_CONTROL_CHANNEL_ENDINGS];
+
+/**
+ * ---------------------------------------------------------------------------
+ * MH CONNECTION AND DISRUPTION VOCABULARIES (story 4 C2, R-42)
+ * ---------------------------------------------------------------------------
+ *
+ * Frozen by `docs/debates/2026-10-28-mh-replacement-and-migration/
+ * telemetry-contract.md` §Client. Each is the ONE home of its label values:
+ * zero-initialisation, tests and the transport tracker iterate these arrays
+ * (never a restated list). Close-code tokens are produced by the ONE
+ * projection in `../closeCode.ts` and are members of these arrays by test.
+ */
+
+/** `phase` of `dt_client_mh_connection_total` / `dt_client_mh_dial_duration_ms`. */
+export const MH_DIAL_PHASES = ['join', 'added', 'redial'] as const;
+/** One of {@link MH_DIAL_PHASES}. */
+export type MhDialPhase = (typeof MH_DIAL_PHASES)[number];
+
+/**
+ * The close-code tokens (proto `MhCloseCode` name, prefix stripped, lowercased)
+ * plus `contract_fault` for a 0 or unknown code. Shared by the dial outcome
+ * and the disconnect cause.
+ */
+export const MH_CLOSE_CODE_TOKENS = [
+  'wrong_handler',
+  'binding_conflict',
+  'mc_unavailable',
+  'handler_released',
+  'declined',
+  'contract_fault',
+] as const;
+/** One of {@link MH_CLOSE_CODE_TOKENS}. */
+export type MhCloseCodeToken = (typeof MH_CLOSE_CODE_TOKENS)[number];
+
+/** `outcome` of `dt_client_mh_connection_total`: one per dial, every dial. */
+export const MH_DIAL_OUTCOMES = [
+  'connected',
+  ...MH_CLOSE_CODE_TOKENS,
+  'transport_failure',
+  'timeout',
+  'aborted_by_removal',
+] as const;
+/** One of {@link MH_DIAL_OUTCOMES}. */
+export type MhDialOutcome = (typeof MH_DIAL_OUTCOMES)[number];
+
+/** `outcome` of `dt_client_mh_dial_duration_ms`: {@link MH_DIAL_OUTCOMES} projected to two. */
+export const MH_DIAL_DURATION_OUTCOMES = ['connected', 'failed'] as const;
+/** One of {@link MH_DIAL_DURATION_OUTCOMES}. */
+export type MhDialDurationOutcome = (typeof MH_DIAL_DURATION_OUTCOMES)[number];
+
+/** THE projection of a dial outcome onto the duration histogram's binary outcome. */
+export function dialDurationOutcome(outcome: MhDialOutcome): MhDialDurationOutcome {
+  return outcome === 'connected' ? 'connected' : 'failed';
+}
+
+/** `cause` of `dt_client_mh_disconnects_total`: one per end of an ESTABLISHED session. */
+export const MH_DISCONNECT_CAUSES = [
+  'transport_loss',
+  'directed_removal',
+  ...MH_CLOSE_CODE_TOKENS,
+] as const;
+/** One of {@link MH_DISCONNECT_CAUSES}. */
+export type MhDisconnectCause = (typeof MH_DISCONNECT_CAUSES)[number];
+
+/**
+ * THE lost-handler predicate (telemetry contract: lost =
+ * `cause=~"transport_loss|handler_released"`). Starts a per-ref reconnect
+ * episode and a per-slot continuity episode — the one definition both use.
+ */
+export function isHandlerLoss(cause: MhDisconnectCause): boolean {
+  return cause === 'transport_loss' || cause === 'handler_released';
+}
+
+/** `outcome` of `dt_client_mh_reconnect_duration_ms`. */
+export const MH_RECONNECT_OUTCOMES = ['reconnected', 'removed', 'abandoned'] as const;
+/** One of {@link MH_RECONNECT_OUTCOMES}. */
+export type MhReconnectOutcome = (typeof MH_RECONNECT_OUTCOMES)[number];
+
+/** `outcome` of `dt_client_media_resume_ms`. */
+export const MEDIA_RESUME_OUTCOMES = ['resumed', 'reassigned_away', 'abandoned'] as const;
+/** One of {@link MEDIA_RESUME_OUTCOMES}. */
+export type MediaResumeOutcome = (typeof MEDIA_RESUME_OUTCOMES)[number];
+
+/** `source` of `dt_client_mh_non_member_refs_total`: which message named the non-member. */
+export const MH_NON_MEMBER_SOURCES = ['send_directive', 'stream_assignment'] as const;
+/** One of {@link MH_NON_MEMBER_SOURCES}. */
+export type MhNonMemberSource = (typeof MH_NON_MEMBER_SOURCES)[number];
+
+/**
+ * Bucket upper bounds (ms) for `dt_client_mh_dial_duration_ms` — THE SSoT.
+ * The top finite bucket reaches past the default per-MH connect deadline
+ * (`../events.ts:DEFAULT_MH_CONNECT_TIMEOUT_MS`) PLUS the admission window's
+ * range max (a provisional dial closed late in the window is `failed`,
+ * measured to the close) — pinned by a test that reads both — so no dial
+ * folds into `+Inf`.
+ */
+export const MH_DIAL_DURATION_BUCKETS_MS: readonly number[] = [
+  50, 100, 250, 500, 1_000, 2_000, 3_000, 5_000, 7_500, 10_000, 15_000, 20_000, 30_000,
+];
+
+/** Bucket upper bounds (ms) for `dt_client_time_to_first_mh_connected_ms` — THE SSoT. */
+export const MH_TIME_TO_FIRST_CONNECTED_BUCKETS_MS: readonly number[] = [
+  100, 250, 500, 1_000, 2_000, 3_000, 5_000, 7_500, 10_000, 15_000, 20_000, 30_000,
+];
+
+/**
+ * Bucket upper bounds (ms) for the two disruption timers,
+ * `dt_client_mh_reconnect_duration_ms` and `dt_client_media_resume_ms` — THE
+ * SSoT. The top finite bucket is at least the MAXIMUM of both abandonment caps'
+ * config ranges (`clientConfig.ts:HANDLER_SET_CONFIG_RANGES`
+ * `reconnectAbandonMs` / `resumeAbandonMs`; pinned by a test that reads the
+ * ranges), so an `abandoned` observation never folds into `+Inf`.
+ */
+export const MH_DISRUPTION_BUCKETS_MS: readonly number[] = [
+  250, 500, 1_000, 2_000, 3_000, 5_000, 7_500, 10_000, 15_000, 20_000, 30_000, 45_000, 60_000,
+  90_000, 120_000, 180_000, 300_000, 600_000,
+];
 
 /**
  * The wrap outcomes that are REPORTED.
@@ -1142,6 +1261,23 @@ export class MediaKindMetrics {
   timeToFirstMediaFrameMs(ms: number): void {
     this.#sink?.histogram('dt_client_time_to_first_media_frame_ms', this.#base, ms);
   }
+
+  /**
+   * One per-slot continuity episode ended (story 4 C2, the media-dark window):
+   * from this client observing the loss or removal of the handler carrying an
+   * ACTIVE slot, to the slot's first presented frame via another handler
+   * (`resumed`), a reassignment (`reassigned_away`), or session end / the
+   * `media.handlers.resumeAbandonMs` cap (`abandoned`). Buckets:
+   * {@link MH_DISRUPTION_BUCKETS_MS}. Owned by `session/slotContinuity.ts`.
+   */
+  resumeMs(outcome: MediaResumeOutcome, ms: number): void {
+    this.#sink?.histogram(
+      'dt_client_media_resume_ms',
+      { ...this.#base, outcome },
+      ms,
+      MH_DISRUPTION_BUCKETS_MS,
+    );
+  }
 }
 
 /**
@@ -1183,6 +1319,16 @@ export class MediaSessionMetrics {
   /** The ONE counter path for session series (a `dt-guard` declared wrapper). */
   #sessionCounter(name: string, labels: MetricLabels = {}, value?: number): void {
     this.#sink?.counter(name, { ...this.#sessionLabels, ...labels }, value);
+  }
+
+  /** The ONE histogram path for session series (a `dt-guard` declared wrapper). */
+  #sessionHistogram(
+    name: string,
+    labels: MetricLabels,
+    value: number,
+    boundaries: readonly number[],
+  ): void {
+    this.#sink?.histogram(name, { ...this.#sessionLabels, ...labels }, value, boundaries);
   }
 
   /** The ONE gauge path for session series (a `dt-guard` declared wrapper). */
@@ -1292,6 +1438,87 @@ export class MediaSessionMetrics {
    */
   captureSource(mode: MediaCaptureSourceMode): void {
     this.#sessionGauge('dt_client_media_capture_source', { mode }, 1);
+  }
+
+  // ------------------------------------------------ MH connections (R-42) ---
+  //
+  // Kind-free: a handler carries every kind, so per-kind labels would count one
+  // dial twice. Emitted only by `../transportTelemetry.ts` (and the session's
+  // non-member count). These two series LEFT the ADR-0036 §11 grandfathered
+  // join-flow roster (story 4 C2): no `meeting_id_hash`, `status` or
+  // `mh_index_bucket` — the bag is `#sessionLabels` like every other series here.
+
+  /**
+   * One dial reached its outcome. `connected` means the handshake SURVIVED the
+   * admission window (`media.handlers.admissionWindowMs`); a close inside it is
+   * the close-code outcome. `0` is the join-time zero-initialisation. Local
+   * session teardown records nothing.
+   */
+  mhConnection(phase: MhDialPhase, outcome: MhDialOutcome, count: 0 | 1 = 1): void {
+    this.#sessionCounter('dt_client_mh_connection_total', { phase, outcome }, count);
+  }
+
+  /**
+   * Dial start to handshake (`connected`) or to the failure / provisional close
+   * (`failed`). Buckets: {@link MH_DIAL_DURATION_BUCKETS_MS}.
+   */
+  mhDialDurationMs(phase: MhDialPhase, outcome: MhDialDurationOutcome, ms: number): void {
+    this.#sessionHistogram(
+      'dt_client_mh_dial_duration_ms',
+      { phase, outcome },
+      ms,
+      MH_DIAL_DURATION_BUCKETS_MS,
+    );
+  }
+
+  /**
+   * Join start to the handshake of the first dial that FINALISES connected.
+   * Once per session. Buckets: {@link MH_TIME_TO_FIRST_CONNECTED_BUCKETS_MS}.
+   */
+  timeToFirstMhConnectedMs(ms: number): void {
+    this.#sessionHistogram(
+      'dt_client_time_to_first_mh_connected_ms',
+      {},
+      ms,
+      MH_TIME_TO_FIRST_CONNECTED_BUCKETS_MS,
+    );
+  }
+
+  /** One ESTABLISHED session ended. `0` is the zero-initialisation. Teardown records nothing. */
+  mhDisconnect(cause: MhDisconnectCause, count: 0 | 1 = 1): void {
+    this.#sessionCounter('dt_client_mh_disconnects_total', { cause }, count);
+  }
+
+  /**
+   * One per-ref disruption ended: loss of an in-set handler to its redial
+   * finalising connected, its removal, or abandonment (session end or
+   * `media.handlers.reconnectAbandonMs`). Buckets: {@link MH_DISRUPTION_BUCKETS_MS}.
+   */
+  mhReconnectDurationMs(outcome: MhReconnectOutcome, ms: number): void {
+    this.#sessionHistogram(
+      'dt_client_mh_reconnect_duration_ms',
+      { outcome },
+      ms,
+      MH_DISRUPTION_BUCKETS_MS,
+    );
+  }
+
+  /**
+   * A FRESHLY received message named a handler_ref outside the current set
+   * (counted and ignored, ADR-0039 §4). One per occurrence. `0` is the
+   * zero-initialisation.
+   */
+  mhNonMemberRef(source: MhNonMemberSource, count: 0 | 1 = 1): void {
+    this.#sessionCounter('dt_client_mh_non_member_refs_total', { source }, count);
+  }
+
+  /** Zero-initialise every kind-free counter series of the MH connection family. */
+  zeroInitMhConnections(): void {
+    for (const phase of MH_DIAL_PHASES) {
+      for (const outcome of MH_DIAL_OUTCOMES) this.mhConnection(phase, outcome, 0);
+    }
+    for (const cause of MH_DISCONNECT_CAUSES) this.mhDisconnect(cause, 0);
+    for (const source of MH_NON_MEMBER_SOURCES) this.mhNonMemberRef(source, 0);
   }
 }
 

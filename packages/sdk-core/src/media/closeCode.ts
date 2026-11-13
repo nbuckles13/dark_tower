@@ -12,6 +12,7 @@
 // different channel and a different concept.
 
 import { MhCloseCode } from '../proto/dark_tower/signaling/v1/signaling_pb.js';
+import type { MhCloseCodeToken, MhDialOutcome, MhDisconnectCause } from './setup/mediaMetrics.js';
 
 /**
  * What the transport layer does about a session end.
@@ -59,4 +60,59 @@ function dispositionOf(code: MhCloseCode): CloseDisposition {
       return unhandled;
     }
   }
+}
+
+/**
+ * THE ONE projection of a CLEAN close's code onto its bounded telemetry token
+ * (story 4 C2, R-42) — used for BOTH `dt_client_mh_connection_total{outcome}`
+ * (a close inside the admission window) and `dt_client_mh_disconnects_total
+ * {cause}` (a close of an established session). Tokens are the proto value name
+ * with the `MH_CLOSE_CODE_` prefix stripped, lowercased — the same tokens MH's
+ * `CloseCode::as_label()` uses — written out here (never computed from the
+ * name, so the test's name-derivation is an independent check). A 0 or unknown
+ * code is `contract_fault`.
+ *
+ * Takes a PRESENT code only: "no code" (a session lost without a clean close)
+ * is not a close code, and each call site names its own token for it
+ * (`transport_failure` for a dial, `transport_loss` for a disconnect).
+ */
+export function closeCodeToken(closeCode: number): MhCloseCodeToken {
+  if (!isMhCloseCode(closeCode)) return 'contract_fault';
+  switch (closeCode) {
+    case MhCloseCode.WRONG_HANDLER:
+      return 'wrong_handler';
+    case MhCloseCode.BINDING_CONFLICT:
+      return 'binding_conflict';
+    case MhCloseCode.MC_UNAVAILABLE:
+      return 'mc_unavailable';
+    case MhCloseCode.HANDLER_RELEASED:
+      return 'handler_released';
+    case MhCloseCode.DECLINED:
+      return 'declined';
+    case MhCloseCode.UNSPECIFIED:
+      return 'contract_fault';
+    default: {
+      const unhandled: never = closeCode;
+      return unhandled;
+    }
+  }
+}
+
+/**
+ * A DIAL's outcome when its provisional session closes inside the admission
+ * window: the close-code token, or `transport_failure` when there was no clean
+ * close (`undefined`).
+ */
+export function dialCloseOutcomeOf(closeCode: number | undefined): MhDialOutcome {
+  return closeCode === undefined ? 'transport_failure' : closeCodeToken(closeCode);
+}
+
+/**
+ * An ESTABLISHED session's disconnect cause: the close-code token, or
+ * `transport_loss` when there was no clean close (`undefined`). The ONE input
+ * of `isHandlerLoss` everywhere (the transport's `handlerLost` and the per-ref
+ * reconnect episode).
+ */
+export function disconnectCauseOf(closeCode: number | undefined): MhDisconnectCause {
+  return closeCode === undefined ? 'transport_loss' : closeCodeToken(closeCode);
 }

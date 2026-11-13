@@ -50,6 +50,12 @@ interface DarktowerTestBus {
   // the projection in `lib/e2eBus.ts`.
   // eslint-disable-next-line @typescript-eslint/consistent-type-imports
   readonly handlerSets: ReadonlyArray<import('./lib/e2eBus.js').BusHandlerSet>;
+  /** Story 4 C2: every per-slot reconnecting-overlay set/clear, in order (`{slotId, reconnecting}`). */
+  // eslint-disable-next-line @typescript-eslint/consistent-type-imports
+  readonly reconnectingOverlays: ReadonlyArray<import('./lib/e2eBus.js').BusReconnectingOverlay>;
+  /** Story 4 C2: every media transport fault, in order (`{stage}` only). */
+  // eslint-disable-next-line @typescript-eslint/consistent-type-imports
+  readonly transportFaults: ReadonlyArray<import('./lib/e2eBus.js').BusTransportFault>;
   /** Subscribe to a bounded event type; returns an unsubscribe closure. */
   on(type: string, listener: (event: Readonly<Record<string, unknown>>) => void): () => void;
   /**

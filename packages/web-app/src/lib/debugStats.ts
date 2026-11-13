@@ -16,6 +16,7 @@
 // the snapshot later never reaches the screen by accident.
 
 import type {
+  HandlerSetView,
   LocalMediaStats,
   LocalReceiveSlotStats,
   LocalSendStreamStats,
@@ -155,4 +156,31 @@ export function statsView(prev: StatsSample | undefined, next: StatsSample): Sta
 export function formatRate(value: number | undefined, unit: 'pkt/s' | 'kbit/s'): string {
   if (value === undefined || !Number.isFinite(value)) return '—';
   return unit === 'kbit/s' ? `${(value / 1_000).toFixed(1)} kbit/s` : `${value.toFixed(1)} pkt/s`;
+}
+
+/** One handler row of the R-20 handler-set view: its ref and address, NEVER a credential. */
+export interface HandlerRow {
+  readonly ref: number;
+  readonly url: string;
+}
+
+/** The R-20 handler-set view (story 4 C2): the set version and each member's ref + url. */
+export interface HandlerSetRows {
+  readonly version: string;
+  readonly handlers: readonly HandlerRow[];
+}
+
+/**
+ * EXPLICIT ALLOW-LIST PROJECTION of the token-free handler set (the SDK's
+ * `mediaHandlerSet` view, held in `store.media.handlerSet`): the version, and
+ * per handler its ref and url — named field by field, never spread or
+ * iterated generically, so a field added to the SDK view later (or a token, if
+ * one ever leaked onto it) never reaches the panel.
+ */
+export function handlerSetRows(view: HandlerSetView | undefined): HandlerSetRows | undefined {
+  if (view === undefined) return undefined;
+  return {
+    version: view.version,
+    handlers: view.handlers.map((h) => ({ ref: h.ref, url: h.url })),
+  };
 }
