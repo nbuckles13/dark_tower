@@ -2845,7 +2845,7 @@ tasks:
   tier: light
   tier_reason: 'Documentation only: runbooks and docs/TODO.md entries, no code, wire, auth or GSA'
 - id: 29
-  status: pending
+  status: completed
   specialist: observability
   deps:
   - 7
@@ -2946,6 +2946,7 @@ tasks:
 
     Requirements: R-35 (all), R-33 (presentation), R-34 (cross-service panels), R-38 (SLO line and the TODO closure above).
     Tier: full (three services' rule files and the paging posture).
+  slug: 2026-11-13-obs-alerts-mh-replacement
   tag: story-2026-10-31-survive-handler-loss-task-OBS-ALERTS
 - id: 30
   status: pending
