@@ -1198,16 +1198,16 @@ ac_db_connections_active / ac_db_connections_max * 100
 
 ```bash
 # Errors in last hour
-kubectl logs -n dark-tower -l app=ac-service --since=1h | grep -i "error"
+kubectl logs -n dark-tower -l app=ac-service --since=1h --tail=-1 | grep -i "error"
 
 # Failed token issuance attempts
-kubectl logs -n dark-tower -l app=ac-service --since=1h | grep "token issuance failed"
+kubectl logs -n dark-tower -l app=ac-service --since=1h --tail=-1 | grep "token issuance failed"
 
 # Database connection issues
-kubectl logs -n dark-tower -l app=ac-service --since=1h | grep -i "database.*error"
+kubectl logs -n dark-tower -l app=ac-service --since=1h --tail=-1 | grep -i "database.*error"
 
 # Slow queries (if logged)
-kubectl logs -n dark-tower -l app=ac-service --since=1h | grep "slow query"
+kubectl logs -n dark-tower -l app=ac-service --since=1h --tail=-1 | grep "slow query"
 ```
 
 **Log aggregation queries (Loki/CloudWatch/Splunk):**

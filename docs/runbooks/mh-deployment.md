@@ -18,13 +18,13 @@ For active-incident triage (e.g. "an alert is firing right now"), see the compan
 
 ## Table of Contents
 
-1. [Deployment Procedure](#deployment-procedure)
+1. [Deployment Procedure](#deployment-procedure) (including [Operating the MH pool](#operating-the-mh-pool-procedures-and-refusals-adr-0039-7-10): node maintenance, pool exhausted, `mh.sh` refusals, force-delete ban, attempt budget)
 2. [Story 3 cutover (see each other): order, skew detection, rollback](#story-3-cutover-see-each-other-order-skew-detection-rollback)
 3. [Post-Deploy Monitoring Checklist: MH WebTransport + MC↔MH Coordination](#post-deploy-monitoring-checklist-mh-webtransport--mcmh-coordination)
 4. [Required environment keys](#required-environment-keys)
 5. [Config-failure triage](#config-failure-triage-three-signals-and-kubectl-logs-is-wrong-for-all-three)
 6. [Both pods CrashLoop immediately after apply](#both-pods-crashloop-immediately-after-apply)
-7. [Rollout With Media Flowing](#rollout-with-media-flowing) (including [Mixed-Transport Rollback Hazard](#mixed-transport-rollback-hazard) and [Operator levers](#operator-levers-for-media-video-off-and-nothing-else))
+7. [Rollout With Media Flowing](#rollout-with-media-flowing) (drain, [meetings shed at the deadline](#meetings-shed-at-the-drain-deadline), [upgrade stuck](#upgrade-stuck-the-new-mh-never-goes-available--check-gc), [Mixed-Transport Rollback Hazard](#mixed-transport-rollback-hazard), [Operator levers](#operator-levers-for-media-video-off-and-nothing-else))
 8. [Rollback](#rollback)
 9. [References](#references)
 
@@ -32,7 +32,7 @@ For active-incident triage (e.g. "an alert is firing right now"), see the compan
 
 ## Deployment Procedure
 
-> **Status**: Stub. The full step-by-step deployment procedure (manifest layout, rolling-update sequencing, smoke tests, GC registration verification) is not yet documented for mh-service. Until it is, follow the structure of `docs/runbooks/mc-deployment.md` §Deployment Steps, substituting `mh-service` for `mc-service`.
+> **MH is a slot pool, not a Deployment you roll.** The procedure is the one converge below, the pool operations in [Operating the MH pool](#operating-the-mh-pool-procedures-and-refusals-adr-0039-7-10), and the drain model in [Rollout With Media Flowing](#rollout-with-media-flowing). Do NOT adapt `mc-deployment.md` §Deployment Steps to MH: its `rollout restart` / `set image` / `rollout undo` steps have no MH equivalent.
 
 The MH service is deployed by the ONE converge (never `kubectl apply -k` of the MH base or its Kind
 overlay: that would create the never-applied template Deployment `mh-template` directly):
@@ -65,9 +65,9 @@ overlay: that would create the never-applied template Deployment `mh-template` d
   | `DEPLOY_FAILED REASON=` | Meaning | Oncall next step |
   |---|---|---|
   | `mh-no-free-slot` | No free slot for an upgrade or top-up (or deploy's own K ≥ B+1 check, `MH_TOKEN=-`). Old MHs keep serving. | `mh.sh list`: drain non-baseline owners you own (`mh.sh drain <k> --owner <id>`), or lower B (`mh-fleet.env`), then re-run `deploy.sh`. |
-  | `mh-rollout-failed` | A new MH never went Available (`MH_TOKEN=mh-rollout-failed` from upgrade, `not-available-timeout` from top-up). **The old MH is untouched and still serving, and `mh.sh list` shows it `stale`.** | `kubectl logs -n dark-tower -l dark-tower.io/mh-slot=<SLOT> --prefix` (and `describe pod`) on the NEW pod; fix, then re-run `deploy.sh`, or check out the previous revision and deploy. The failed new MH (top-up's `not-available-timeout`, or upgrade's replacement) is left in place for diagnosis; mh.sh's `MH_RESULT … DETAIL=` line prints the exact drain command that reclaims it (it carries `--owner`; a top-up pod is owner `baseline`). |
+  | `mh-rollout-failed` | A new MH never went Available (`MH_TOKEN=mh-rollout-failed` from upgrade, `not-available-timeout` from top-up). **The old MH is untouched and still serving, and `mh.sh list` shows it `stale`.** | `kubectl logs -n dark-tower -l dark-tower.io/mh-slot=<SLOT> --tail=-1 --prefix` (and `describe pod`) on the NEW pod; fix, then re-run `deploy.sh`, or check out the previous revision and deploy. The failed new MH (top-up's `not-available-timeout`, or upgrade's replacement) is left in place for diagnosis; mh.sh's `MH_RESULT … DETAIL=` line prints the exact drain command that reclaims it (it carries `--owner`; a top-up pod is owner `baseline`). |
   | `apiserver-unreachable` / `runtime-unreachable` / `prerequisite-missing` | The MH step failed because the ENVIRONMENT is down (classified like every other step: a dead apiserver makes mh.sh report `kubectl-failed`, which is then probed). `MH_TOKEN` keeps mh.sh's own result. | Operator lane: fix the cluster/host, re-run `deploy.sh`. |
-  | `mh-pool-failed` | Any other mh.sh outcome — branch on `MH_TOKEN`: `mh-pool-busy` (another mh.sh holds the `mh-pool` Lease: wait, re-run), `kubectl-failed`/`no-kubeconfig` (apiserver), `no-template` (the template or slot ConfigMaps are malformed — re-run `deploy.sh`), `stuck-terminating` (a pod past its grace: investigate, never force), `drain-timeout`. Also `MH_TOKEN=-` when `mh.sh upgrade` returned OK without its contract `replaced` array. | Per `MH_TOKEN`, as listed; `mh.sh list` first. |
+  | `mh-pool-failed` | Any other mh.sh outcome — branch on `MH_TOKEN`: `mh-pool-busy` (another mh.sh holds the `mh-pool` Lease: wait, re-run), `kubectl-failed`/`no-kubeconfig` (apiserver), `no-template` (the template or slot ConfigMaps are malformed — re-run `deploy.sh`), `stuck-terminating` (a pod past its grace: investigate, never force), `drain-timeout`. Also `MH_TOKEN=-` in three deploy-side cases, each with an `ERROR` line above it: `mh.sh upgrade` returned OK without its contract `replaced` array; `mh.sh list` returned an invalid baseline/K (B must be ≥ 1); or the final check found the serving current-revision baseline MHs ≠ B ("MH pool did not converge", e.g. a top-up MH that later went unready, or a leftover stale one). | Per `MH_TOKEN`, as listed; `mh.sh list` first. For `MH_TOKEN=-`: read the `ERROR` line, `mh.sh list`, re-run `deploy.sh`. |
   | `mh-removed-still-selectable` | Deploy's own check (`MH_TOKEN=-`, `WORKLOADS=deployment/gc-service`): the converge REMOVED an MH (upgrade's old MH, or a baseline-shrink drain), and past B (the largest `gc_mh_staleness_threshold_seconds` the live GC pods publish) + two GC health-checker ticks, a live GC pod was still over the limit. Per pod, never summed: `gc_mh_available{state=~"pending|healthy|degraded"}` (fresh rows that are or can become selectable) must be at most the `serving` MHs in `mh.sh list`, AND the pod's `gc_db_queries_total{operation="count_available_mh",status="success"}` must have advanced by 2 since the wait's first read (a restarted GC container is re-baselined at 0). The `ERROR` line lists each over-limit pod in one of three shapes — see the next column. It also fails AT ONCE, before any wait, with the same REASON when there is no Ready GC pod, no `http` port, `/metrics` is unreadable, or the staleness gauge is absent — the `ERROR` line above the `DEPLOY_FAILED` names which. If the apiserver itself is down, the line says `apiserver-unreachable`/`runtime-unreachable` instead (operator lane). Since story 4 MH-3 a draining MH reports DRAINING to GC immediately on SIGTERM (and on every later report), so GC stops selecting it at once; a row still counted selectable past B is a GC-side fault. The pool itself converged. | By shape: **`<pod>=<count>(error=E)`** — rows are still counted selectable past B: GC's stale sweep is not marking them (`kubectl logs -n dark-tower deploy/gc-service`, health-checker lines); compare `mh.sh list` with GC's registry. **`<pod>=unrecomputed(success=N,baseline=M,error=E)`** — GC's `count_available_mh` recompute has not succeeded twice since the removal, so the count is FROZEN, not stale: `error=` > 0 = a DB / health-checker failure (`MH registry tick step failed` lines, `gc_db_queries_total{operation="count_available_mh",status="error"}`). **`<pod>=ABSENT(error=E)`** — the pod publishes no `gc_mh_available` series (startup or registration problem). A GC pod replaced during the wait (new name) is not in the wait's pod set and its old name stays `unrecomputed` until the deadline: re-run `deploy.sh`. Re-run `deploy.sh` once GC is healthy (the converge is then a no-op and does not wait). |
 
 - **Image prune (R-30).** Per-slot Deployments have no rollout history, so for MH `deploy.sh` keeps
@@ -82,6 +82,102 @@ overlay: that would create the never-applied template Deployment `mh-template` d
 > `deploy.sh` fails `DEPLOY_FAILED REASON=blueprint-changed` (kind-config changed), or, with an old
 > helper binary, provision refuses first with `PROVISION_FAILED REASON=kind-config-unrendered` (nothing deleted; deploy's `mh_slot_table` has the same check); a
 > mismatched gateway fails `mh_slot_table: … listenAddress … != DT_HOST_GATEWAY_IP`.
+
+### Operating the MH pool: procedures and refusals (ADR-0039 §7, §10)
+
+Every procedure below uses `infra/kind/scripts/mh.sh` with your kubeconfig. Branch on its final
+stderr line, `MH_RESULT STATUS=OK|FAIL REASON=<token> [SLOT=<k>] [DETAIL=…]`, and its exit code
+(0 OK, 1 FAIL, 2 PRECONDITION, 3 CAPACITY, 4 REFUSED, 5 BUSY; the token list's one home is
+`MH_TOKENS` in `mh.sh`). `mh.sh` defaults `--owner` to `manual`; a `deploy.sh` MH is owner
+`baseline`, so pass `--owner baseline` to drain one.
+
+#### Node maintenance
+
+0. **Cordon the node:** `kubectl cordon <node>`. `mh.sh up` has no node placement, so without it
+   the "capacity elsewhere" MH can land on the node you are about to drain.
+1. **Capacity elsewhere first:** `mh.sh up --owner <owner>` for each MH on the node (returns once
+   the new MH is Available = GC-selectable). Check `mh.sh list --json` has a free slot first.
+2. **Drain the MHs on the node:** `mh.sh drain <k> --owner <owner>` for each. MC moves their meetings
+   ([MH drains on SIGTERM](#mh-drains-on-sigterm)); `drain` returns when the pod is gone.
+3. **Drain the node:** plain `kubectl drain <node> --ignore-daemonsets` is safe for any MH still on
+   it. MHs are Deployment-managed, and the replacement pod is held Pending by the hostPort until the
+   old pod has exited, so two live MHs never share an address. **The MH PDB (`minAvailable: 1`,
+   `infra/services/mh-service/pdb.yaml`) stays and gates evictions.** Never pass `--grace-period`
+   (0, or anything below the pod's own 35 s: it truncates the drain and frees the hostPort early),
+   and never `--disable-eviction` (it bypasses the PDB). (`kubectl drain --force` only covers pods
+   with no controller, which MH pods are not.)
+
+On Kind the cluster is one node: there is no "elsewhere", so node maintenance there is a cluster
+recreate.
+
+#### Address pool exhausted (`mh-no-free-slot`)
+
+`mh.sh up` and `mh.sh upgrade` exit **3** with `REASON=mh-no-free-slot` **before touching any
+running MH** — the old MHs keep serving. (`deploy.sh` reports `DEPLOY_FAILED REASON=mh-no-free-slot`,
+also for its own K ≥ B+1 check.) **K = 6 slots, fixed at cluster creation** (the helper port table,
+`crates/devloop-helper/src/ports.rs`), so changing K means a helper rebuild and a **cluster
+recreate**. Diagnose:
+
+```bash
+./infra/kind/scripts/mh.sh list --json | jq -c '.slots[] | {slot, state, owner, stale, terminating_past_grace}'
+```
+
+Free a slot you own (`mh.sh drain <k> --owner <id>`: a leftover `manual` MH or a Layer-7 run's
+leak), wait out a `draining` slot, or lower B (`mh-fleet.env`). A `terminating_past_grace` slot is
+[stuck-terminating](#mhsh-refusals-what-to-check-what-to-do), not capacity.
+
+#### `mh.sh` refusals: what to check, what to do
+
+| `REASON=` (exit) | Means | Check | Do |
+|---|---|---|---|
+| `last-serving-mh` (4) | `drain` (or an upgrade drain step) would remove the only serving MH. | `mh.sh list`: is a second MH `starting` rather than `serving`? | `mh.sh up` first, then drain. `--force` overrides it and leaves every meeting [awaiting a handler](mc-incident-response.md#scenario-25-meetings-awaiting-a-media-handler) — only for a deliberate full stop. |
+| `stuck-terminating` (4) | An MH pod is Terminating past its grace (`terminating_past_grace: true`). `drain` (on a non-free slot) and `upgrade` (each step) refuse while it lasts; `up` does not (the stuck pod keeps its slot and `up` takes another). **`--force` never overrides it**. | `kubectl describe pod <pod>` (the DETAIL names it): finalizers, a kubelet/node problem, a wedged volume. | **Investigate, never force** ([force-delete ban](#never-force-delete-an-mh-pod)). Escalate to infrastructure if the kubelet is unhealthy. |
+| `foreign-owner` (4) | The slot belongs to another owner (`baseline`, `manual`, or a Layer-7 run token). | `mh.sh list`: the slot's `owner`. | Re-run with `--owner <that owner>`. Draining a running Layer-7 run's MH breaks that run; wait for it. |
+| `mh-pool-busy` (5) | Another `mh.sh` holds the `mh-pool` Lease (DETAIL `holder=<owner>@<host>:<pid>`). The Lease covers only seconds of decide-and-create/delete. | Who the holder is. | Wait a few seconds and re-run. A Lease is reclaimed only after it expires. |
+| `drain-timeout` (1) | The pod was not gone within its own `terminationGracePeriodSeconds` + `MH_DRAIN_MARGIN_S` (30). No escalation. | `mh.sh list` (`terminating_past_grace`), `kubectl describe pod`. | As `stuck-terminating`. Re-running `drain` joins the wait (no second delete). |
+| `not-available-timeout` (1, `up`) / `mh-rollout-failed` (1, `upgrade`) | The new MH never went Available. The new pod is **left in place**. For `upgrade`, the old MH is untouched and serving; `up` has no old MH. | [Upgrade stuck = check GC](#upgrade-stuck-the-new-mh-never-goes-available--check-gc). | **`up`**: fix the cause, then run the DETAIL's `mh.sh drain <k> --owner <owner>` (or re-run `deploy.sh` for a baseline top-up). **`upgrade`**: either that, or re-run `upgrade`, which resumes the pending pair. |
+
+#### Never force-delete an MH pod
+
+**Never `kubectl delete pod --force --grace-period=0` on an MH pod** (ADR-0039 §7, R-28). It removes
+the API object while the process may still be running, so the scheduler lets a second MH take the
+same hostPort slot: two live MHs on one address, the one way around the one-process-per-address
+invariant. (Signal: [`gc-incident-response.md` Scenario 14](gc-incident-response.md#scenario-14-two-live-media-handlers-on-one-address).)
+A pod stuck terminating is **investigated, not forced**: `mh.sh drain` refuses
+(`stuck-terminating`) and `mh.sh list` flags it (`terminating_past_grace`). `mh.sh` itself never
+deletes a pod and never passes `--force`/`--grace-period`.
+
+- **Planned removal** of one MH = `mh.sh drain <k> --owner <owner>` (after `mh.sh up` if it is the
+  last one).
+- **The crash drill is a process kill**, not a delete: the container restarts in place (same slot,
+  same pod IP, new `handler_id`; GC supersedes the dead row, `gc_mh_registrations_total{outcome="superseded", match="both"}`),
+  and MC declares the old incarnation dead within N and replaces it. **Run the drill on an MH you
+  provisioned for it**, never on a `baseline` MH: `mh.sh signal` is owner-gated with no `--force`.
+
+  ```bash
+  ./infra/kind/scripts/mh.sh up --owner drill-<you> --json           # note .slot, .pod_uid, .restart_count
+  ./infra/kind/scripts/mh.sh signal <k> KILL --owner drill-<you>     # SIGKILL the mh-service process (Kind only: needs shareProcessNamespace)
+  ./infra/kind/scripts/mh.sh list --json | jq '.slots[] | select(.slot==<k>) | {state, pod_uid, restart_count}'   # same pod_uid, restart_count +1, back to serving
+  ./infra/kind/scripts/mh.sh drain <k> --owner drill-<you>           # clean up
+  ```
+
+#### Replacement attempt budget per meeting
+
+Each meeting's replacement attempts are bounded by GC's exclusion cap,
+`GC_MH_MAX_EXCLUDE_HANDLER_IDS` (default 16, `gc-deployment.md` §Configuration). A meeting's exclude
+list is its current ∪ removed ∪ refused handlers, and a removed handler is never re-added, so at the
+default (16, minus the 2 initial handlers) **a meeting survives about 14 handler replacements in its
+lifetime**. After that its owed replacements count `mc_media_handler_migrations_total{outcome="rate_limited"}`
+and it **stops acquiring** — loud and counted, never silent.
+
+- **When you would see it:** a very long meeting through repeated upgrades (every planned transfer
+  consumes one), or a flapping detector / forged heartbeat loop declaring the same meeting's
+  handlers again and again.
+- **What it means:** the meeting keeps its surviving handlers and keeps working on them; it just
+  gets no new one. If it has none left it is [awaiting a handler](mc-incident-response.md#scenario-25-meetings-awaiting-a-media-handler).
+  **Rejoining resets it** once the meeting has ended: MC ends a meeting when its last participant
+  leaves, and the next join starts a new meeting actor with an empty exclude list. A single
+  participant rejoining a still-running meeting does not reset it.
 
 Pre-deployment checks: GC reachable, MC reachable, JWKS endpoint reachable, MH WebTransport TLS secret provisioned. Post-rollout, run the post-deploy monitoring checklist below.
 
@@ -163,8 +259,8 @@ A story-2 MH hard-rejects a registration whose egress streams do not all share o
 (`PolicyRejection::HeterogeneousTransportModes` in the story-2 image; removed by MH-A1, counted
 `mh_media_policy_applies_total{outcome="rejected_invalid"}`). It rejects the **whole**
 registration, so the meeting's **audio** goes dark, not just its video. Nothing re-pushes a
-rejected registration until the meeting's next structural change (there is no re-assert cadence
-before story 4). See [Mixed-Transport Rollback Hazard](#mixed-transport-rollback-hazard).
+rejected registration until the meeting's next structural change (there is no periodic re-assert;
+ADR-0039 dropped it). See [Mixed-Transport Rollback Hazard](#mixed-transport-rollback-hazard).
 
 **The window between steps is a media outage in any order. Announce it.** A v2 component and a
 v3 component cannot exchange audio, so no order keeps audio up between (b) and (d). The order
@@ -176,7 +272,8 @@ decides **whether the window's failures clear by themselves when the next compon
   a per-frame or per-join refusal that clears when the last component lands.
 - **With MC first:** a story-2 MH rejects whole registrations, and **those do not clear on their
   own**. Nothing re-pushes until each meeting's next structural change, because there is no
-  re-assert cadence before story 4.
+  periodic re-assert (ADR-0039 dropped it; since story 4 a lagging apply is instead detected per
+  heartbeat and migrated, which a story-2 MH cannot take part in).
 - MH-A1's transitional path, which accepts a registration with no `source_streams`, exists **only
   at intermediate branch commits** before MC-B. It is never in a shipped build, so do not expect it
   during a release cutover.
@@ -213,10 +310,14 @@ re-scoped in [Rollback for the media path](#rollback-for-the-media-path).
    this tree prunes generations (`deploy.sh` `prune_superseded_images()` touches images only). The
    retiring keys' `optional: true` refs cover a partial revert. **MC**: `kubectl rollout undo` lands
    each pod template on the previous hash-suffixed generation; undo exactly the MC Deployments the
-   change rolled. **MH has no rollout history** (each MH is a per-slot `mh-s<k>` Deployment created
-   by `infra/kind/scripts/mh.sh`): its rollback is a tree revert plus `deploy.sh`, which re-renders
-   the `mh-template` ConfigMap and runs `mh.sh upgrade` (start-new-then-drain-old), then
-   `infra/kind/scripts/mh.sh list --json` shows no slot `stale`. A `media-codec-profile` change
+   change rolled. **MH has no rollout history and no undo** (each MH is a per-slot `mh-s<k>`
+   Deployment created by `infra/kind/scripts/mh.sh`): its rollback is a tree revert plus
+   `deploy.sh`, which re-renders the `mh-template` ConfigMap and runs `mh.sh upgrade`
+   (start-new-then-drain-old; meetings migrate as in a normal upgrade), then
+   `infra/kind/scripts/mh.sh list --json` shows no slot `stale`. Its safety does not rest on
+   content-addressed undo: the rollback renders the previous tree's ConfigMaps afresh, and
+   ConfigMap generations referenced by a live MH pod are never pruned, so a mid-upgrade
+   old-revision MH can still crash-restart in place. A `media-codec-profile` change
    touched MC and MH, so roll both back (the tree revert does). Otherwise MC directs one profile
    while MH costs against another. **On Kind an MC undo is transient**: the next `deploy.sh`
    converges back to the tree. The durable rollback is a tree revert plus `deploy.sh`.
@@ -300,9 +401,9 @@ sum(increase(mh_media_session_starts_total{outcome="declined_pending_cap"}[30m])
 # Scenario 27.
 #
 # Cumulative-zero, same shape and justification as the admission reasons above:
-# no rate threshold is invented here (a useful rate depends on MC's re-assert
-# cadence, which lands at story task 13, and alerting is task 21's scope), and
-# zero is unambiguously correct for all three values in either era.
+# no rate threshold is invented here (alerting is the alert rules' scope; since
+# story 4 a handler whose apply lags is detected per heartbeat as APPLY_LAG and
+# migrated, MC Scenario 24), and zero is unambiguously correct for all three values.
 #
 # `no_generation` is DELIBERATELY EXCLUDED: it is the expected steady state for
 # the whole task-11 -> task-13 window, so including it would fail every deploy
@@ -517,6 +618,53 @@ histogram_quantile(0.95,
 - [ ] *Additional (beyond R-36)*: WebTransport handshake P95 trailing-1h trend is flat (slow-leak detection — admission key-lookup lag or connection-pool drift)
 - [ ] *Additional (beyond R-36)*: `mc_register_meeting_duration_seconds` P95 trailing-1h trend is flat (leading indicator for `no_meeting_key` and slow first joins; see `crates/mc-service/src/observability/metrics.rs::record_register_meeting`)
 
+#### Story 4 MH replacement: the 24-hour watch (ADR-0039)
+
+Run after any MH, MC or GC deploy of story 4 or later, and after any roll that drained MHs. Every
+line is pod- or fleet-level; none carries a meeting or handler identity.
+
+```promql
+# 1. No migration timed out (the drain-shed reading) or found no capacity. Expected UNOBSERVED (0).
+#    Non-zero: mc-incident-response.md Scenario 26 (timed_out) / Scenario 25 (no_capacity).
+sum by (trigger, outcome) (increase(mc_media_handler_migrations_total{outcome=~"timed_out|no_capacity"}[24h]))
+
+# 2. Planned transfers completed ~= the meetings that were on the rolled MHs (read the old MHs'
+#    meeting counts before the roll; each rolled MH's final "Drain finished" log line should read
+#    exit_reason=empty; exit_reason=deadline with shed_completed=false is an MH defect, see
+#    §Meetings shed at the drain deadline). Meetings may move twice when every MH rolls.
+sum(increase(mc_media_handler_migrations_total{trigger="planned_transfer", outcome="completed"}[24h]))
+
+# 3. No meeting is awaiting a handler. Expected 0 on every MC pod (paged by
+#    MCMediaMeetingsAwaitingHandler, lands with OBS-ALERTS).
+max(mc_media_meetings_without_handlers)
+
+# 4. GC registrations: address_conflict FLAT; superseded only at crash restarts (match="both").
+#    Superseded with no crash, or any unknown_handler: gc-incident-response.md Scenario 14.
+sum by (outcome, match) (increase(gc_mh_registrations_total{outcome=~"address_conflict|superseded"}[24h]))
+sum(increase(gc_mh_load_reports_total{outcome="unknown_handler"}[24h]))
+
+# 5. Client dials declined / wrong_handler near zero (a share of all dials).
+#    declined sustained: mh-incident-response.md Scenario 24.
+sum by (outcome) (increase(dt_client_mh_connection_total{outcome=~"declined|wrong_handler"}[24h]))
+  / scalar(sum(increase(dt_client_mh_connection_total[24h])))
+
+# 6. Owner-silence releases appear ONLY ~15 min (MH_MEETING_OWNER_SILENCE_TIMEOUT_SECONDS) after an
+#    MC exit that did not release its meetings (crash/OOM/SIGKILL, or a rollout whose teardowns were
+#    cut off), clients="none"; a graceful MC rollout releases via EndMeeting and leaves ~0 here.
+#    clients="present", or releases with no such MC exit before them: mh-incident-response.md Scenario 26.
+sum by (clients) (increase(mh_media_handler_releases_total{trigger="owner_silence"}[24h]))
+```
+
+```bash
+# 7. The pool: at least B serving, at least one free slot (the next upgrade needs it).
+./infra/kind/scripts/mh.sh list --json | jq '{baseline,
+  serving: [.slots[] | select(.state=="serving")] | length,
+  free:    [.slots[] | select(.state=="free")]    | length,
+  stale:   [.slots[] | select(.stale)]            | length,
+  stuck:   [.slots[] | select(.terminating_past_grace)] | length}'
+# Expect serving >= baseline, free >= 1, stale == 0, stuck == 0.
+```
+
 #### Story 3 video: the 24-hour watch list, in the order things rise first
 
 This list is the single home for the watch-list queries. `mc-deployment.md` points here and lists
@@ -696,11 +844,10 @@ git checkout <previous-good-commit> && ./infra/kind/scripts/deploy.sh   # re-ren
 # `mh.sh upgrade` replaces EVERY stale MH (serially, start-new-then-drain-old), so
 # there is no split-version pair once it returns OK.
 
-# Active WebTransport sessions on rolled-back pods will be severed during pod
-# replacement. Per assumption 4 of the MH QUIC story, MH state is in-memory
-# only — clients reconnect with fresh JWTs to the rolled-back pods naturally.
-# No data migration or auth-state cleanup is required to roll back; this is a
-# pure binary replacement.
+# Meetings MIGRATE as in a normal upgrade: each old MH drains on SIGTERM and MC
+# moves its meetings make-before-break (a small blip, no rejoin; see "Rollout With
+# Media Flowing"). MH state is in-memory only, so no data migration or auth-state
+# cleanup is required: a pure binary replacement. No database schema change.
 ```
 
 #### Cross-service ordering: MC and MH are coupled by the sender_id binding contract
@@ -841,7 +988,8 @@ and the manifests orderable rather than independent:
 > `spec.template.spec.terminationGracePeriodSeconds`. The literal checked into
 > `deployment.yaml` (the MH template) is a `"0"` sentinel. `kubectl apply -f` bypasses the
 > replacement and applies the sentinel verbatim — and because `0` is not a valid
-> grace, **both pods refuse to start**. Always `kubectl apply -k`.
+> grace, **the MH refuses to start**. Deploy MH only through `deploy.sh` (the root render stores
+> the template; `mh.sh` instantiates it), never `kubectl apply` of the MH base.
 >
 > That refusal is deliberate: a sentinel that reached a running pod silently
 > would give MH a drain window nobody chose, which is the failure the derivation
@@ -850,7 +998,8 @@ and the manifests orderable rather than independent:
 If the deploy bundled MC changes alongside MH (e.g. an MC-side `RegisterMeeting` client revision), also roll back MC:
 
 ```bash
-# Same shape as MH: MC is two per-instance Deployments, `mc-0` and `mc-1`.
+# NOT the same shape as MH: MC is two per-instance Deployments, `mc-0` and `mc-1`,
+# which DO have rollout history (MH's per-slot pool does not; its rollback is the converge above).
 # There is no Deployment named `mc-service` — that string is a Service, a PDB,
 # a NetworkPolicy, a ServiceMonitor and a *container* name, which is the trap.
 kubectl rollout undo deployment/mc-0 -n dark-tower
@@ -906,7 +1055,7 @@ what this story's configuration task found false.)
 | `MH_POD_MEMORY_LIMIT_BYTES` *(story 3)* | **Not a ConfigMap key**: a downward-API `resourceFieldRef` to this container's `resources.limits.memory` (`divisor: "1"`) in `deployment.yaml` (the MH template) | the container's memory limit (never restated) | The input to MH's boot-time memory check, from **MH-A2**: the formula has ONE executable home, `check_pod_memory` / `per_connection_memory_bound_bytes` in `crates/mh-service/src/config.rs` (see there for the terms; the passing boot's INFO line logs each one), so that exhaustion is a counted reset and never an OOM kill. Absent, empty, unparseable or 0 refuses to boot (no default, no cgroup fallback). A refusal is one ERROR line on stderr, target `mh.config`, message "Pod memory check failed: refusing to start", naming every term, its key and the levers (the pod shows CrashLoopBackOff); a passing boot logs the figures and headroom at INFO on target `mh.config.memory`. With the send window, `MH_MAX_CONNECTIONS` has roughly 1.3x headroom at 1 GiB — the binding constraint on raising it. **The limit must stay declared.** If it were absent, Kubernetes would resolve the variable to the node's allocatable memory and the check would pass vacuously. `dt-guard kustomize` (`crates/dt-guard/src/kustomize_resource_field_refs.rs`) fails any `resourceFieldRef` whose container does not declare the resource, over the base and the rendered Kind root. |
 | `MH_MEDIA_DIAL_CLOCK_SKEW_SECONDS` *(story 4 MH-1)* | ConfigMap `mh-service-config` (REQUIRED ref) | `config.env` (`30`) | Clock skew MH allows on a client `media_dial` token's `exp` and `iat` at admission (ADR-0039 §5). **Enforced by mh-service** (`crates/mh-service/src/auth/mod.rs`); bounds `0..=60` inclusive; unset or above 60 refuses to start (REQUIRED: there is no code default). Published as `mh_media_dial_clock_skew_seconds`; a too-small value shows as `mh_jwt_validations_total{token_type="media_dial",failure_reason="expired"}`. **Do NOT raise skew to mask clock drift; fix NTP.** |
 | `MH_MAX_PENDING_CONNECTIONS_PER_PARTICIPANT` *(story 4 MH-1)* | ConfigMap `mh-service-config` (REQUIRED ref) | `config.env` (`2`) | Connections still awaiting MC's bind answer (`NotifyParticipantConnected` in flight) allowed per (meeting, participant); the excess is closed `DECLINED` without asking MC (ADR-0039 §5). **Enforced by mh-service's session actor**; bounds `1..=16` (`0` would decline every dial and refuses to start; the 16 ceiling is our own choice, ADR-0039 says only "small"; unset refuses to start — REQUIRED, no code default). Counted `mh_media_session_starts_total{outcome="declined_pending_cap"}`: near zero is healthy, sustained means a client redial storm — raising the cap does not fix a redial storm. |
-| `MH_MEETING_OWNER_SILENCE_TIMEOUT_SECONDS` *(story 4 MH-3)* | ConfigMap `mh-service-config` (REQUIRED ref) | `config.env` (`900`) | Owner-silence release (ADR-0039 §6): MH ends a meeting whose **owning MC** has not communicated (a registration, teardown or heartbeat verdict; errors and owner-mismatch answers do not count) for this long, closing its sessions `HANDLER_RELEASED`. Reclaims capacity after an MC restart (a restarted MC has a new id and answers its predecessor's meetings with owner-mismatch). **Not an MC-failover mechanism.** **Enforced by mh-service's session actor**; bounds `300..=3600` (out of range or unset refuses to start; REQUIRED). **Relationship to MC's N:** N ≤ 30 s, so MC's heartbeat interval (N/3) ≤ 10 s, and 300 s spans ≥ 30 intervals — checked at compile time, never per registration. Published as `mh_media_meeting_owner_silence_timeout_seconds`; releases count `mh_media_handler_releases_total{trigger="owner_silence"}` (`clients="none"` is routine ~15 min after an MC rollout; `clients="present"` means people stayed attached to an ownerless meeting for the whole window). |
+| `MH_MEETING_OWNER_SILENCE_TIMEOUT_SECONDS` *(story 4 MH-3)* | ConfigMap `mh-service-config` (REQUIRED ref) | `config.env` (`900`) | Owner-silence release (ADR-0039 §6): MH ends a meeting whose **owning MC** has not communicated (a registration, teardown or heartbeat verdict; errors and owner-mismatch answers do not count) for this long, closing its sessions `HANDLER_RELEASED`. Reclaims capacity after an MC exit that did not release its meetings (a restarted MC has a new id and answers its predecessor's meetings with owner-mismatch). **Not an MC-failover mechanism.** **Enforced by mh-service's session actor**; bounds `300..=3600` (out of range or unset refuses to start; REQUIRED). **Relationship to MC's N** (`MC_MH_HEARTBEAT_TIMEOUT_MS`, range `(0, 30000]` ms, default 6000): N ≤ 30 s, so the 300 s floor is ≥ 10× the largest N (≥ 30 of MC's largest heartbeat intervals, N/3 ≤ 10 s) — checked at compile time, never per registration. That gap is what makes the release safe: a live MC always declares a silent MH dead and moves off long before MH releases on owner silence. **Never shorten owner silence toward N.** Published as `mh_media_meeting_owner_silence_timeout_seconds`; releases count `mh_media_handler_releases_total{trigger="owner_silence"}` (`clients="none"` is routine ~15 min after an MC crash, or a rollout whose shutdown teardowns were cut off; a graceful rollout releases via `EndMeeting` and leaves ~0; `clients="present"` means people stayed attached to an ownerless meeting for the whole window). |
 | `MEDIA_VIDEO_MAX_BITRATE_BPS`, `MEDIA_VIDEO_FRAME_RATE_HZ`, `MEDIA_AUDIO_MAX_BITRATE_BPS`, `MEDIA_AUDIO_FRAME_RATE_HZ` *(story 3)* | ConfigMap **`media-codec-profile`** (`infra/services/media-codec-profile/profile.env`), shared with MC | `profile.env` | MH derives **both** per-stream egress costs from these (required reads): bitrate plus code-derived per-frame overhead × frame rate, with no headroom knob. Raising either video value **lowers every MH's stream ceiling**. MH also refuses to boot on an audio bitrate outside its supported band or an audio frame rate other than the one its frame duration implies (constants in `crates/mh-service/src/config.rs`). Read the result on `mh_media_egress_stream_ceiling`. **Editing the profile rolls MC and MH together** ([Operator levers](#operator-levers-for-media-video-off-and-nothing-else)). |
 
 The ConfigMap comments in `infra/services/mh-service/config.env` carry each key's value, derivation
@@ -953,7 +1102,7 @@ MH's ordering consequences. (Until story 2 task 18, MH borrowed the MC section o
 | Cause | Signal | Where the answer is |
 |---|---|---|
 | A Deployment holds a `configMapKeyRef` that its ConfigMap generation lacks: a key deleted while a hard ref to it remains, or a template pointing at a ConfigMap generation that no longer exists | `CreateContainerConfigError`: **no container ever ran** | `kubectl describe pod -n dark-tower -l app=mh-service`. It names the missing key, or the missing `mh-service-config-<hash>`. `logs` is **empty** and `exec` is impossible |
-| A new image started with a pod template that lacks a required `env` entry (`kubectl set image`, a partial apply, the manifests reverted under a newer image) | `CrashLoopBackOff` | `kubectl logs -n dark-tower -l app=mh-service --previous --prefix`: `ConfigError::MissingEnvVar` names the variable. Then [Both pods CrashLoop immediately after apply](#both-pods-crashloop-immediately-after-apply) |
+| A new image started with a pod template that lacks a required `env` entry (`kubectl set image`, a partial apply, the manifests reverted under a newer image) | `CrashLoopBackOff` | `kubectl logs -n dark-tower -l app=mh-service --tail=-1 --previous --prefix`: `ConfigError::MissingEnvVar` names the variable. Then [Both pods CrashLoop immediately after apply](#both-pods-crashloop-immediately-after-apply) |
 | The `mh-service-tls` Secret is absent (fresh namespace; it is created imperatively by `infra/kind/scripts/provision.sh:create_tls_secret()` and is not in the kustomization) | `FailedMount`; pod Pending in `ContainerCreating` | `kubectl describe pod`. The `mh-tls` volume is not `optional:`, so kubelet blocks the mount and the process **never starts**. There is no config load, no `MH_TLS_CERT_PATH` error and no log at all. A Secret that exists but is malformed is a different failure (`Identity::load_pemfiles`, a CrashLoop with a log) |
 
 **Pod phase alone tells them apart before you read anything**: Pending/`ContainerCreating` is the
@@ -964,9 +1113,9 @@ names it for the second, and plain `logs` is empty for both of those.
 **ConfigMap names are content-hash-suffixed** (`mh-service-config-<hash>`, and the per-slot
 `mh-slot-<k>-config-<hash>` rendered by `infra/kind/scripts/deploy.sh:render_env_overlay`;
 `configMapGenerator` in `infra/services/mh-service/kustomization.yaml`, ADR-0038 §2). A config change changes the pod template and rolls exactly the pods that consume it, so a wrong
-value fails at deploy time. **An MH roll drains the pod and sheds, at the drain deadline, every
-meeting MC has not moved off** ([Rollout With Media Flowing](#rollout-with-media-flowing)), so a
-config-only change is a media-shedding event too until planned transfer (MC-F) lands. Do not
+value fails at deploy time. **An MH config change replaces every MH** (`mh.sh upgrade`): each
+drains and MC moves its meetings, a small blip per meeting
+([Rollout With Media Flowing](#rollout-with-media-flowing)), so schedule it like an image roll. Do not
 `kubectl edit` the live ConfigMap: nothing references that name after the next apply, and the next
 apply of the environment root overwrites it anyway. `kubectl get configmap -n dark-tower -l app=mh-service`
 lists every generation. The pod template's `configMapKeyRef` names the live one.
@@ -982,51 +1131,37 @@ release branch that takes the MH code change but not the `config.env` / `deploym
 change, or a `kubectl set image` ahead of the manifests. That is the CrashLoop row above.
 
 **Removing a key: the INVERSE order. Code read first, key later. A ConfigMap key is never removed in
-the same deploy that removes its code read.** The rule is re-derived here against ADR-0038 §2 because
-its old premise, "`rollout undo` restores the Deployment's refs but never the ConfigMap", is no longer
-true as stated.
+the same deploy that removes its code read.**
 
-- **What undo does now.** It returns each pod template to its previous revision, which references the
-  **previous hash-suffixed ConfigMap generation**. The image and the configuration it shipped with roll
-  back together. The mechanism, and the obligation it creates, are stated once in
-  `mc-deployment.md` §Config-failure triage ("Fast rollback lever"), and they apply to MH unchanged.
-- **Whether that generation still exists when the undo runs decides everything, and key ordering
-  does not change it.** A generator-named generation is immutable, and the revision you undo to
-  started against it, so it contains every key its template references. If it still exists, the undo
-  starts. If it has been pruned, the undo fails `CreateContainerConfigError` naming the ConfigMap,
-  whatever order the keys were removed in. An `optional: true` ref does not save it either, because
-  the same template holds hard refs to other keys in that ConfigMap. **For MH's generator-named
-  ConfigMaps, undo safety rests entirely on retention.** In this tree the generation exists: ADR-0038's
-  step-3 notes record that ConfigMap generations are not pruned, and `deploy.sh`'s
-  `prune_superseded_images()` never touches them. There are two limits:
-  - **On Kind, undo reaches back ONE generation.** The image prune keeps only the current image and
-    the one the workload's rollout history names as previous, so `--to-revision` further back finds
-    its ConfigMap but not its image (`ErrImageNeverPull`: the Deployments set `imagePullPolicy: Never`).
-  - **A pruning pipeline removes it.** A pipeline that prunes superseded generations (`kubectl apply
-    --prune`, or a GitOps controller with pruning on) can delete the previous generation in the same
-    sync that rolls the new revision. No pruning policy is defined for a production overlay yet.
-    **Any future pruning of old ConfigMap generations must spare the ones referenced by retained
-    ReplicaSets or ControllerRevisions**, as the MC runbook states. That obligation, not key
-    ordering, is the defence.
-- **Where the key-ordering rule still bites:**
-  - **A tree revert or partial apply in which the ConfigMap and the Deployments do not move
+- **MH has no `rollout undo`** (ADR-0039 §7). Each MH is a per-slot `mh-s<k>` Deployment with no
+  rollout history, and the rollback is the converge from the previous checkout: `deploy.sh`
+  re-renders the previous tree's ConfigMaps and template and runs `mh.sh upgrade`
+  ([Rollback](#rollback)). So MH's rollback safety does **not** rest on an undo landing on a retained
+  ConfigMap generation. (MC still has `rollout undo`; its content-addressed undo reasoning is in
+  `mc-deployment.md` §Config-failure triage and does not apply to MH.)
+- **Retention still matters for live pods.** ConfigMap generations referenced by a live MH pod are
+  never pruned (nothing in `deploy.sh` prunes ConfigMaps; `prune_superseded_images()` touches images
+  only, and keeps every live MH pod's image plus the previous revision's), so an old-revision MH
+  still serving mid-upgrade can crash-restart in place. **Any future pruning pipeline** (`kubectl
+  apply --prune`, a GitOps controller with pruning on) **must spare the generations and images a
+  live MH pod references**, or that in-place restart fails `CreateContainerConfigError` /
+  `ErrImageNeverPull`.
+- **Where the key-ordering rule bites:**
+  - **A tree revert or partial apply in which the ConfigMap and the template do not move
     together.** Remove a key in the same commit as its read, then revert only the code, or apply
     only the manifests, and a running image demands a key its generation lacks. Removing the read one
     deploy before the key keeps every such intermediate state startable.
   - **ADR-0038 §2's stable-name-plus-checksum-annotation variant.** If MH's config ever moved to a
-    stable name, the pre-ADR-0038 premise returns exactly: undo restores the Deployment's refs
-    without restoring the ConfigMap.
+    stable name, a revert of the template would no longer bring its ConfigMap with it.
 - **So the `MH_MAX_STREAMS` two-deploy retirement below stays**, because it is cheap and correct for
-  both cases above. **It is not a defence against pruning.**
+  both cases above.
 
-**Undo is transient.** The next `dev-cluster deploy` or environment-root apply re-converges to the tree
-and rolls forward over it (ADR-0038: out-of-band `kubectl` changes are overwritten). **The durable
-rollback is a tree revert of the image and its manifests together.** Never revert the ConfigMap alone
-under a newer image. A `git revert` of `config.env` followed by an apply produces a new generation
-that lacks keys the Deployments still hold hard refs to. The apply rolls the pods at once, and they
-come up `CreateContainerConfigError`. If the Deployment env is reverted as well while the newer image
-stays, the pods `CrashLoopBackOff` instead. Either way MH accepts nothing
-([Rollback ordering](#rollback-ordering-the-image-may-roll-back-alone-the-manifests-may-not)).
+**The durable rollback is a tree revert of the image and its manifests together**, applied by
+`deploy.sh`. Never revert the ConfigMap alone under a newer image. A `git revert` of `config.env`
+followed by a deploy produces a new generation that lacks keys the template still holds hard refs to:
+every replacement MH comes up `CreateContainerConfigError` (or `CrashLoopBackOff` if the env is
+reverted too) and never goes Available, so `mh.sh upgrade` stops at `mh-rollout-failed` with the old
+MHs still serving ([Rollback ordering](#rollback-ordering-the-image-may-roll-back-alone-the-manifests-may-not)).
 
 ### `MH_MAX_STREAMS`: the rule applied, over two deploys
 
@@ -1052,7 +1187,7 @@ Entry point — the container is already dead, so read the previous container's
 logs, not the current one's:
 
 ```bash
-kubectl logs -n dark-tower -l app=mh-service --previous --prefix
+kubectl logs -n dark-tower -l app=mh-service --tail=-1 --previous --prefix
 ```
 
 ### First, partition on how much output there is
@@ -1143,55 +1278,106 @@ would blind that guard on **every one of them** while it kept reporting clean.
 ## Rollout With Media Flowing
 
 **Read this before rolling MH while meetings are in progress.** ADR-0039 §7 reverses ADR-0036 §11
-("MH sheds media sessions on restart"): **MH drains on SIGTERM.** One mechanism serves `mh.sh drain`,
-`mh.sh upgrade`, scale-down and node maintenance.
+("MH sheds media sessions on restart"): **MH drains on SIGTERM, and MC moves each meeting off it.**
+One mechanism serves `mh.sh drain`, `mh.sh upgrade` (and so `deploy.sh`), baseline shrink and
+[node maintenance](#node-maintenance).
 
 ### MH drains on SIGTERM
 
-1. **Not ready** at once (`/ready` 503, latched — a GC re-registration mid-drain cannot flip it back).
-   `/health` stays 200 for the whole drain, so the kubelet never kills it early.
-2. **DRAINING to GC** immediately (an out-of-cycle load report with `HEALTH_STATUS_DRAINING`), and on
-   every later report until exit, so GC stops selecting it now, not at the staleness bound.
-3. **DRAINING to every MC** holding a meeting on it: each meeting's next heartbeat is sent at once,
-   carrying `ServingState DRAINING` and `drain_remaining_ms` (relative; MH's grace is the only copy).
-4. **Keeps forwarding** — servers, media and heartbeats all stay up — while MC moves each meeting
-   away (planned transfer, make-before-break).
-5. **Exits** the moment it holds no meetings (an empty MH is gone in about a second), or at the
-   deadline `terminationGracePeriodSeconds − 5 s` (30 s at the deployed 35).
-6. At the deadline, every meeting still held is **shed**: its sessions close `HANDLER_RELEASED`
-   (never code-less), then the process exits inside the 5 s margin. The count is on MH's **final log
-   line** (target `mh.drain`, "Drain finished": `exit_reason=empty|deadline`, `meetings_shed`,
-   `drain_duration_seconds`) — exit-time counters (`mh_drain_meetings_shed_total`) may never be
-   scraped, so the log line and MC's
-   `mc_media_handler_migrations_total{trigger="planned_transfer", outcome="timed_out"}` are the evidence.
+The sequence for one replaced MH (`mh.sh upgrade` repeats it per stale MH, serially):
+
+1. **`mh.sh up` (or upgrade's create step) returns only when the new MH is Available**, which means
+   GC-selectable: MH sets `/ready` only after GC accepted its `RegisterMH`, and it sends GC a load
+   report immediately after that registration, so GC can select it within one RPC.
+2. **The old MH is drained** (`mh.sh` deletes its `mh-s<k>` Deployment; the pod gets SIGTERM). At
+   once it goes **not ready** (`/ready` 503, latched — a GC re-registration mid-drain cannot flip it
+   back; `/health` stays 200 so the kubelet never kills it early), reports
+   **`HEALTH_STATUS_DRAINING` to GC** (an out-of-cycle load report, then on every later report until
+   exit, so GC stops selecting it now, not at the staleness bound), and flags **DRAINING in each
+   meeting's heartbeat** to that meeting's MC, sent at once and carrying `drain_remaining_ms`
+   (relative; MH's grace is the only copy).
+3. **MC moves each meeting make-before-break** (planned transfer, story 4 MC-F): it asks GC for a
+   replacement, registers it, waits until every routable participant is connected to it, then
+   removes the old handler. With **no grant** (GC unavailable or out of capacity) the meeting's
+   **surviving handlers** are the target instead.
+4. **The old MH keeps forwarding** — servers, media and heartbeats all stay up — and stays reachable
+   on its own hostPort address until it exits (hostPort DNAT, no Service in the path).
+5. **It exits at zero meetings** (an empty MH is gone in about a second), **or at the drain
+   deadline** `terminationGracePeriodSeconds − 5 s` (30 s at the deployed 35). At the deadline every
+   meeting still held is **shed**: its sessions close `HANDLER_RELEASED`. The count is on MH's
+   **final log line** (target `mh.drain`, "Drain finished": `exit_reason=empty|deadline`,
+   `meetings_shed`, `shed_completed`, `drain_duration_seconds`). The healthy reading is
+   `exit_reason=empty`. If the shed itself cannot finish (session actor gone, or its 2 s budget
+   exceeded) the line reads `shed_completed=false` (always with `meetings_shed=0`), a WARN on
+   `mh.drain` precedes it, and the remaining sessions end **code-less**.
+6. **The slot frees only when the pod is gone.** A terminating pod holds its hostPort, so no second
+   MH can take that address while the old process lives ([force-delete ban](#never-force-delete-an-mh-pod)).
 
 Draining never self-fences on MC silence, and it relaxes no admission check: a draining MH still
 accepts a `RegisterMeeting` (it counts as held and hears DRAINING at once) and still verifies every
 dial. A second SIGTERM during the drain is ignored; SIGKILL at the grace period is the backstop.
 
-### The client-visible consequence, stated plainly — and the gap until MC-F
+### The client-visible consequence, stated plainly
 
-**Until planned transfer (story 4 MC-F) lands, MC does not move meetings off a draining MH.** So a
-roll still **sheds every meeting held on the pod** — now at the drain deadline, about 30 s after
-SIGTERM, instead of at about 2 s. Clients see a `HANDLER_RELEASED` close for that handler, not a
-transport fault. An MH holding nothing exits at once.
+**A small blip per meeting**: one handler-set push, a directive change and a keyframe, because edges
+move only at the old handler's removal (multi-handler send, ADR-0036 §9 story 6, is the path to
+hitless). **No "reconnecting", no rejoin**: the client dials the new handler from the set MC pushes,
+and closes the old one as a directed removal. Shown on `dt_client_media_resume_ms` (the planned blip
+starts an episode too; read it against `mc_media_handler_migrations_total{trigger}`).
 
-- **Multi-party blast radius:** MC co-locates, so an all-connected meeting lands every edge on ONE
-  handler (`crates/mc-service/src/media_routing/edges.rs`, `colocate`). Shedding that pod's meetings
-  silences every participant of each of them at once, while signalling, the roster and the slot grid
-  still read healthy. Size the announcement to the meetings on the pod.
-- **Drain-shed triage:** MC's `mc_media_handler_migrations_total{trigger="planned_transfer",
-  outcome="timed_out"}` plus MH's final `mh.drain` log line. The remedy for a drain that is too short
-  for MC to finish is **one value**: raise `terminationGracePeriodSeconds` in the MH template (it is
-  the drain budget; see the `MH_TERMINATION_GRACE_SECONDS` row).
+- **Rolling every MH at once may move some meetings twice** (a meeting can land on another MH that
+  is itself about to drain). That is expected, and it shows as extra
+  `mc_media_handler_migrations_total{trigger="planned_transfer"}`. A serial `mh.sh upgrade` does it
+  too: a meeting moved onto a still-stale MH moves again when that MH's turn comes.
+- **The drain deadline is ONE value.** It is derived from the MH template's
+  `terminationGracePeriodSeconds` (the `MH_TERMINATION_GRACE_SECONDS` row); there is no second
+  drain key. Raising it lengthens every drain, upgrade and node maintenance, and how long a
+  terminating pod holds its slot.
 
-> **Diagnostic tell**, so you can distinguish a shed from a real fault: after a shed, the client's
-> session to the old pod closes with `HANDLER_RELEASED`, and
-> `dt_client_media_frames_received_total` goes flat while
-> `dt_client_media_frames_sent_total` may keep rising briefly. That is the same reading as
-> [`mh-incident-response.md` Scenario 17](mh-incident-response.md#scenario-17-media-datagram-drop),
-> which is why Scenario 17's rung 1 asks about the connection first — a shed shows as a connection
-> close, a stale-policy fault leaves a healthy connection.
+### Meetings shed at the drain deadline
+
+**Signal:** MC's `mc_media_handler_migrations_total{trigger="planned_transfer", outcome="timed_out"}`
+— never MH's exit-time counter (`mh_drain_meetings_shed_total` is best-effort: the pod is gone within
+one scrape interval). **Evidence:** the old MH's final `mh.drain` "Drain finished" line with
+`exit_reason=deadline` and `meetings_shed` > 0. **`exit_reason=deadline` with `shed_completed=false`**
+(the `meetings_shed` value is then not a count of what was dropped) means an unknown number of
+meetings ended code-less, not `HANDLER_RELEASED`: an MH defect, escalate to `media-handler` with the
+preceding `mh.drain` WARN ("Drain-deadline shed did not complete within its budget…" or "Session
+actor unavailable at the drain deadline…"). Triage: [`mc-incident-response.md` Scenario 26](mc-incident-response.md#scenario-26-media-handler-migration-timed-out).
+
+```promql
+sum(increase(mc_media_handler_migrations_total{trigger="planned_transfer", outcome="timed_out"}[1h]))
+```
+
+**Causes** (there is no per-MC limiter — user ruling 2026-10-31 — so never name one):
+- the drain deadline is too short for the number of meetings on the pod → raise
+  `terminationGracePeriodSeconds` in the MH template (the one value), redeploy;
+- GC was unavailable (or out of capacity) **and** the meeting had no surviving handler → fix GC
+  (`gc-incident-response.md`), check free slots (`mh.sh list --json`) before the next roll.
+
+### Upgrade stuck: the new MH never goes Available = check GC
+
+MH is Ready only once GC has accepted its registration. With GC down or refusing (allowlist,
+`address_conflict`), the new MH never goes Available and **the old MH keeps serving — the safe
+direction**. `mh.sh up` exits 1 `REASON=not-available-timeout`; `mh.sh upgrade` exits 1
+`REASON=mh-rollout-failed` (deploy: `DEPLOY_FAILED REASON=mh-rollout-failed`). Either way the new
+pod is **left in place for diagnosis**, and the `MH_RESULT … DETAIL=` line prints the exact
+`mh.sh drain <k> --owner <owner>` that reclaims it.
+
+```bash
+kubectl logs -n dark-tower -l dark-tower.io/mh-slot=<new-slot> --prefix --tail=-1 \
+  | grep -E "Registration failed, will retry|GC rejected registration|registration failed or was rejected|Failed to connect to GC"   # targets mh.grpc.gc_client / mh.grpc.gc_task
+kubectl get pods -n dark-tower -l app=gc-service                                         # GC up?
+```
+
+A gRPC-status refusal from GC (e.g. `FAILED_PRECONDITION` `address_conflict`) logs "Registration
+failed, will retry" and "GC task: registration failed or was rejected; retrying while not ready";
+"GC rejected registration" appears only for an `accepted=false` answer. "Failed to connect to GC"
+at startup makes the process exit, so that case shows as `CrashLoopBackOff` (read it with
+`--previous`), not as a running not-ready pod.
+
+Then `gc-incident-response.md` (registration outcomes: `gc_mh_registrations_total{outcome}`), fix,
+re-run `deploy.sh` (or `mh.sh upgrade`, which resumes).
 
 ### Mixed-Transport Rollback Hazard
 
@@ -1270,12 +1456,18 @@ If you need to stop media, **draining every MH to zero (`mh.sh drain --force`, o
 `mh-s<k>` to zero) is the wrong lever, and it is worse than the problem it is reaching for.** (`mh.sh
 drain` refuses the last serving MH without `--force` — `last-serving-mh` — precisely because of this.)
 
+**Draining ONE MH is not a kill switch either**: it moves that MH's meetings onto the others
+(planned transfer, [above](#mh-drains-on-sigterm)), so media keeps flowing everywhere.
+
 **MH placement is part of starting a meeting.** With no MH available, GC cannot place a new
 meeting, so **every new meeting fails to start, fleet-wide**. Meetings that already have an MC
 assignment keep admitting participants (a sticky join never re-checks the MH pool, R-6) — **but
 those joins succeed into silence**: GC returns 200, the participant's handler is gone, and no media
-flows. That is worse for the operator than a clean failure, because nothing at the join tells anyone
-it went wrong. So scaling to zero converts a media-path problem into a **new-meeting outage plus
+flows. That is worse for the operator than a clean failure, because nothing at the join tells the participant
+it went wrong. Every existing meeting loses its last handler and sits **awaiting a handler**, visible as
+`mc_media_meetings_without_handlers` > 0 and paged by `MCMediaMeetingsAwaitingHandler` (lands with
+OBS-ALERTS; [`mc-incident-response.md` Scenario 25](mc-incident-response.md#scenario-25-meetings-awaiting-a-media-handler)).
+So scaling to zero converts a media-path problem into a **new-meeting outage plus
 silent media in every existing meeting**, whose blast radius is strictly wider than the problem it
 was aimed at, including meetings that were not affected by whatever prompted the action.
 
@@ -1340,7 +1532,7 @@ touches MH ([Operator levers](#operator-levers-for-media-video-off-and-nothing-e
     It is deliberately not an env-test, because it needs MC restarted mid-suite.
 - **Beside it, the cost of a `media-codec-profile` change.** It is a coordinated MC+MH roll: the
   profile is referenced by mc-0, mc-1 and the MH template, so any edit rolls both MC pods and
-  replaces every MH (`mh.sh upgrade`), and **each replaced MH drains, shedding at its deadline what MC has not moved off**. It is a capacity change too, because MH derives its stream costs
+  replaces every MH (`mh.sh upgrade`), and **each replaced MH drains** (MC moves its meetings; only what is not moved by the deadline is shed). It is a capacity change too, because MH derives its stream costs
   from the profile. See the header of `infra/services/media-codec-profile/profile.env`, which is
   where the membership rule lives (only values both services must agree on, a header rule and not
   a guard). It is not a lever.
@@ -1348,8 +1540,8 @@ touches MH ([Operator levers](#operator-levers-for-media-video-off-and-nothing-e
   new-meeting outage plus silent media in existing meetings, by the same mechanism as
   [scaling MH to zero](#scaling-mh-to-zero-is-not-a-media-kill-switch). Two facts that section does
   not carry:
-  - The change is itself a ConfigMap change, so it **replaces every MH, each draining and shedding
-    at its deadline every meeting MC has not moved off** (the drain described above).
+  - The change is itself a ConfigMap change, so it **replaces every MH**, each draining (MC moves its
+    meetings; only what is not moved by the deadline is shed; the drain described above).
   - The ceiling gates only generation-advancing applies. So it is the roll that silences existing
     meetings, not the lower budget: their rejoins re-register against the lowered ceiling and are
     refused.
@@ -1362,8 +1554,8 @@ touches MH ([Operator levers](#operator-levers-for-media-video-off-and-nothing-e
   ([`mh-incident-response.md` Scenario 19](mh-incident-response.md#scenario-19-server-mute-not-taking-effect-at-ingress)).
 
 Beyond the video-off lever, the only supported remedy for bad media-path behaviour is a **rollback**
-(below). It is a remedy, not a media stop control: it drains and sheds sessions, and meetings resume on the
-rolled-back build.
+(below). It is a remedy, not a media stop control: it drains each MH, MC moves the meetings, and
+they continue on the rolled-back build.
 
 ### Rollback for the media path
 
@@ -1391,9 +1583,11 @@ git checkout <previous-good-commit> && ./infra/kind/scripts/deploy.sh   # mh.sh 
 ./infra/kind/scripts/mh.sh list   # every slot serving on the rolled-back revision, none stale
 ```
 
-**The rollback itself sheds media sessions** (at each MH's drain deadline, until MC-F moves meetings off a draining MH), by the same mechanism as the rollout that prompted it.
-That is the cost of the redeploy-only lever and it is unavoidable here: participants on the affected
-pods rejoin. Say so when you announce the rollback, rather than discovering it in the user reports.
+**The rollback is an upgrade, so meetings migrate as in a normal upgrade** (within the v3 era):
+each rolled-back MH comes up Available first, then the old one drains and MC moves its meetings
+make-before-break — a small blip per meeting, no rejoin ([MH drains on SIGTERM](#mh-drains-on-sigterm)).
+Only what MC cannot move by the drain deadline is shed. Across the story-3 cutover the all-together
+rollback is still an outage window (above).
 
 **The version-skew detector that survives a rollback.** If a rolled-back component speaks a frame
 version its peers do not, the receiving side counts it individually, never collapsed into a
@@ -1431,15 +1625,16 @@ sum by(outcome) (increase(mh_media_policy_applies_total[15m]))
 # 4. MC agrees about what MH applied. Anything but `match` means read MC
 #    Scenario 15. (A reply from a restarted MH incarnation is not a push
 #    outcome: it is mc_register_meeting_total{status="handler_replaced"},
-#    expected on every MH rollout; story 4 MC-B1.)
+#    expected after an in-place MH restart at a reused address; story 4 MC-B1.)
 #    OUT OF THIS GATE'S SCOPE: an MC-restart floor adoption appears under NO
 #    outcome label (it is recorded on mc_media_policy_generation_adoptions_total);
 #    it is an MC-rollout event, covered by mc-deployment.md's checklist.
 sum by(outcome) (increase(mc_media_policy_pushes_total[15m]))
 ```
 
-**Expect `mc_register_meeting_total{status="handler_replaced"}` on every MH rollout.** It is a
-later incarnation answering at a reused address, not a fault; `MCRegisterMeetingFailureRate` reads
+**`mc_register_meeting_total{status="handler_replaced"}` is expected after an in-place MH restart**
+(a crash, or a rollout that reuses a slot address). It is a later incarnation answering at a reused
+address, not a fault; `MCRegisterMeetingFailureRate` reads
 `status="error"` only, and `MCMediaGenerationDivergence` never sees it.
 
 **Related**:
@@ -1450,7 +1645,22 @@ later incarnation answering at a reused address, not a fault; `MCRegisterMeeting
 
 ## Rollback
 
-For the MH-WebTransport / MC↔MH-coordination deploy path, see [Rollback criteria](#rollback-criteria) above. For other rollback scenarios (general service restore, configuration regression), MH has no rollout history to undo: check out the previous revision and run `deploy.sh` (it re-renders `mh-template` and runs `mh.sh upgrade`; [The MH pool](#the-mh-pool-hostport-slots-mhsh-and-what-deploy-does-adr-0039-7-10)); deeper operational steps will be filled in alongside the deployment-procedure stub.
+For the MH-WebTransport / MC↔MH-coordination deploy path, see [Rollback criteria](#rollback-criteria) above. For every MH rollback (ADR-0039 §7, §10; story 4 R-30):
+
+- **MH rollback = run the upgrade from the previous checkout**: `git checkout <previous-good-commit>
+  && ./infra/kind/scripts/deploy.sh` (it re-renders `mh-template` and runs `mh.sh upgrade`, then the
+  baseline top-up; [The MH pool](#the-mh-pool-hostport-slots-mhsh-and-what-deploy-does-adr-0039-7-10)).
+  `mh.sh upgrade` alone does the same against an already-rendered template. **Meetings migrate as in
+  a normal upgrade** ([Rollout With Media Flowing](#rollout-with-media-flowing)). There is no
+  `kubectl rollout undo` for MH: per-slot Deployments have no rollout history.
+- **What survives pruning, so the rollback and an in-flight upgrade can both start**: the images of
+  every live MH pod plus the previous revision's (`mh-template` `previous_images`), and every
+  ConfigMap generation a live MH pod references (ConfigMaps are never pruned). A mid-upgrade
+  old-revision MH can therefore still crash-restart in place.
+- **The first deploy of story 4 changes Kind's host port mappings to hostPort slots, so that
+  deploy, and any rollback across it, requires a cluster recreate** (helper rebuild on the host
+  first; see the "ROLLING ACROSS THE SLOT-POOL CHANGE" banner in §Deployment Procedure).
+- **No database schema change** in story 4: code, config and Kind topology only.
 
 **`EndMeeting` rollout order (story 2 R-20, R-24; holds within an era, never across the story-3 cutover, where everything rolls back together — corrected 2026-10-21).** MH gains the `EndMeeting` RPC before any MC calls it; **roll MH first, and roll back in reverse — MC first**. Rolling MH back alone is safe: the tree revert + `deploy.sh` (`mh.sh upgrade`) starts each MH on the previous hash-suffixed ConfigMap generation, which still exists because nothing prunes generations ([Config-failure triage](#config-failure-triage-three-signals-and-kubectl-logs-is-wrong-for-all-three)), and an MC talking to a one-version-older MH gets `UNIMPLEMENTED` for `EndMeeting`, which MC counts and does not retry — that older MH simply keeps the meeting's state and edges until it restarts, today's pre-teardown behaviour. After an MH deploy, `mh_grpc_requests_total{method="end_meeting"}` and every `mh_media_meeting_teardowns_total{outcome}` series are present at 0; an ABSENT series means the new image is not running.
 
@@ -1501,7 +1711,8 @@ Images: the patch changes `Cargo.lock`, so ALL FOUR service images rebuild.
 - **MC-side post-deploy checklist (companion)**: `docs/runbooks/mc-deployment.md` §"Post-Deploy Monitoring Checklist: MC↔MH Coordination (RegisterMeeting + Notifications)"
 - **Metrics catalog**: `docs/observability/metrics/mh-service.md`, `docs/observability/metrics/mc-service.md`
 - **Alert rules**: `infra/docker/prometheus/rules/mh-alerts.yaml`, `infra/docker/prometheus/rules/mc-alerts.yaml`
-- **ADR-0036**: Media Flow Between Participants — §1 (transport, the application egress queue bound), §8 (MC→MH control plane, the applied-generation echo and its four re-fire triggers), §11 (shed-on-restart recorded as the decision; media telemetry constraints)
+- **ADR-0036**: Media Flow Between Participants — §1 (transport, the application egress queue bound), §8 (MC→MH control plane, the applied-generation echo and its four re-fire triggers), §11 (shed-on-restart, reversed by ADR-0039 §7; media telemetry constraints)
+- **ADR-0039**: Media Handler Replacement and Migration — §7 (hostPort slots, `mh.sh`, drain on SIGTERM), §10 (operations), §3 (attempt budget); runbook change list `docs/debates/2026-10-28-mh-replacement-and-migration/runbook-alert-changes.md`
 - **ADR-0011**: Observability Framework
 - **ADR-0029**: Dashboard / counter conventions (counters vs rates; Category A vs B PromQL)
 
