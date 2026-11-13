@@ -10,8 +10,15 @@
 //!
 //! When a connection drops:
 //! 1. Participant marked as "disconnected" (still visible to others)
-//! 2. 30-second grace period for reconnection
+//! 2. Grace period for reconnection (`MC_DISCONNECT_GRACE_PERIOD_SECONDS`)
 //! 3. If not reconnected: participant removed, slots released
+//!
+//! # Meeting Lifetime
+//!
+//! A meeting exists only while it has participants: the last removal ends it
+//! (`EmptyReason::LastParticipantLeft`), and a meeting no participant is
+//! admitted to within its join window ends through the SAME path
+//! (`EmptyReason::JoinWindowExpired`). See `meeting_timers`.
 
 use crate::errors::McError;
 use crate::media_admission::rotation::{
@@ -27,11 +34,12 @@ use super::join_park::{JoinPark, ParkedJoin, ReleaseReason};
 use super::meeting_media::{
     Affected, HandlerlessCensus, JoinMedia, MeetingMedia, MutedSourceCensus, RosterEntry,
 };
+use super::meeting_timers::{MeetingTimers, LIFETIME_TICK};
 use super::messages::{
-    DisconnectCause, JoinResult, KekPush, LeaveReason, MeetingEndCause, MeetingLifecycleEvent,
-    MeetingLifecycleSink, MeetingMessage, MeetingState, ParticipantInfo, ParticipantStateUpdate,
-    ParticipantStatus, ReconnectResult, SenderLookup, ServerMuteRefusal, SignalingPayload,
-    UnmuteRelay,
+    DisconnectCause, EmptyReason, JoinResult, KekPush, LeaveReason, MeetingEndCause,
+    MeetingLifecycleEvent, MeetingLifecycleSink, MeetingMessage, MeetingState, ParticipantInfo,
+    ParticipantStateUpdate, ParticipantStatus, ReconnectResult, SenderLookup, ServerMuteRefusal,
+    SignalingPayload, UnmuteRelay,
 };
 use super::metrics::{ActorMetrics, ActorType, ControllerMetrics, MailboxMonitor};
 use super::participant::{ParticipantActor, ParticipantActorHandle};
@@ -64,9 +72,6 @@ mod replacement;
 
 /// Default channel buffer size for the meeting mailbox.
 const MEETING_CHANNEL_BUFFER: usize = 500;
-
-/// Grace period for participant reconnection (ADR-0023: 30 seconds).
-const DISCONNECT_GRACE_PERIOD: Duration = Duration::from_secs(30);
 
 /// Why a heartbeat got no verdict from the meeting actor. Every arm is an
 /// error status to MH — NEVER a RELEASED (security S-2).
@@ -141,10 +146,16 @@ impl MeetingActorHandle {
                 respond_to: tx,
             })
             .await
-            .map_err(|e| McError::Internal(format!("channel send failed: {e}")))?;
+            .map_err(|_| McError::MeetingTeardownInProgress)?;
 
-        rx.await
-            .map_err(|e| McError::Internal(format!("response receive failed: {e}")))?
+        // A closed mailbox or a dropped reply means the actor has left its
+        // loop: it ENDED (emptied, join window, closed) or MC is shutting
+        // down. In both cases the right client action is a fresh join through
+        // GC, so this is `MeetingTeardownInProgress` (CONFLICT, retried by the
+        // SDK), never `Internal`. An actor PANIC also lands here; it is
+        // reported by the controller's `check_meeting_health` (ERROR +
+        // `record_panic`), not by this code, so nothing is masked.
+        rx.await.map_err(|_| McError::MeetingTeardownInProgress)?
     }
 
     /// Notify of a connection disconnect.
@@ -819,6 +830,12 @@ pub struct MeetingActor {
     /// Set when the meeting has ended and the actor should leave its loop
     /// through the clean exit path (which releases the handlers).
     end_cause: Option<MeetingEndCause>,
+    /// The lifetime timers this actor enforces (join window, disconnect
+    /// grace); the controller's config value, or the derived defaults.
+    timers: MeetingTimers,
+    /// Monotonic creation instant: the join window's anchor, set once at
+    /// spawn and never re-armed.
+    created: Instant,
     /// Where this actor reports its lifecycle; `None` for an actor spawned
     /// outside a controller (tests), which still tears down, unobserved.
     wiring: Option<MeetingWiring>,
@@ -836,6 +853,8 @@ pub struct MeetingWiring {
     /// The process's in-flight teardown count, which a graceful shutdown
     /// waits on so a handed-off release is not dropped with the runtime.
     pub teardowns: Arc<crate::media_routing::teardown::TeardownTracker>,
+    /// The configured lifetime timers (`Config::meeting_timers`).
+    pub timers: MeetingTimers,
 }
 
 /// Reports `TeardownComplete` when dropped — so it is sent on EVERY exit of the
@@ -935,7 +954,10 @@ impl MeetingActor {
             kek_lifecycle,
             handlers,
             AdmissionEpoch::generate,
-            move |actor| actor.wiring = Some(wiring),
+            move |actor| {
+                actor.timers = wiring.timers;
+                actor.wiring = Some(wiring);
+            },
         )
     }
 
@@ -1044,6 +1066,8 @@ impl MeetingActor {
             join_park,
             replacement,
             end_cause: None,
+            timers: MeetingTimers::default(),
+            created: Instant::now(),
             wiring: None,
         };
         configure(&mut actor);
@@ -1141,6 +1165,9 @@ impl MeetingActor {
             |actor| {
                 actor.media.apply_seams(seams);
                 actor.kek_debounce_manual = manual;
+                if let Some(wiring) = &wiring {
+                    actor.timers = wiring.timers;
+                }
                 actor.wiring = wiring;
                 if dial_refresh_seed.is_some() {
                     actor.dial_refresh =
@@ -1168,14 +1195,16 @@ impl MeetingActor {
             "MeetingActor started"
         );
 
-        // Create interval for checking disconnect grace periods
-        let mut grace_check = tokio::time::interval(Duration::from_secs(5));
+        // The lifetime check (disconnect-grace expiry), every LIFETIME_TICK.
+        let mut grace_check = tokio::time::interval(LIFETIME_TICK);
 
         loop {
             // The meeting ended during the previous turn (emptied, or closed):
             // leave through the clean exit path below, which releases the
             // handlers. Checked BEFORE any other work, so nothing is admitted
-            // after the ending turn — a join already queued sees `Draining`.
+            // after the ending turn: a join already queued in the mailbox is
+            // dropped with the actor, and its handle maps the dropped reply to
+            // `MeetingTeardownInProgress`.
             if self.end_cause.is_some() {
                 break;
             }
@@ -1189,6 +1218,7 @@ impl MeetingActor {
             let dial_wake = self.dial_refresh.next_wake();
             let health_wake = self.media.next_health_wake();
             let replacement_wake = self.replacement.next_wake();
+            let join_window_wake = self.join_window_wake();
 
             tokio::select! {
                 // Handle cancellation
@@ -1206,6 +1236,18 @@ impl MeetingActor {
                 // Check disconnect grace periods
                 _ = grace_check.tick() => {
                     self.check_disconnect_timeouts().await;
+                }
+
+                // Nobody was admitted within the join window: the meeting
+                // ends through the same path as an emptied one. An exact
+                // deadline (not the tick), so the bound is the window itself.
+                () = async {
+                    match join_window_wake {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.on_join_window_deadline();
                 }
 
                 // An establishing participant's settle window is due
@@ -1346,8 +1388,10 @@ impl MeetingActor {
         }
 
         // No reply sender outlives the actor: every parked join is answered
-        // `Draining` (counted by the connection as a join failure, the same
-        // outcome as a join that reaches a draining meeting).
+        // with the not-admitting refusal — `MeetingTeardownInProgress` for an
+        // ended meeting, `Draining` at MC shutdown (counted by the connection
+        // as a join failure, the same outcome as a join that reaches the actor
+        // in that state).
         self.answer_parked_joins_draining();
 
         // Every open replacement attempt (in flight, or a grant still
@@ -1663,7 +1707,7 @@ impl MeetingActor {
         media: JoinMedia,
     ) -> Result<JoinResult, McError> {
         if self.is_shutting_down {
-            return Err(McError::Draining);
+            return Err(self.not_admitting());
         }
 
         // Check if participant already exists (don't include participant_id in error - MINOR-002)
@@ -2142,7 +2186,8 @@ impl MeetingActor {
         // close, a grace expiry. A participant still in its grace window is on
         // the roster, so a reconnect inside the window never reaches here.
         //
-        // No new admission from this turn on (`Draining`), and the loop leaves
+        // No new admission from this turn on (`MeetingTeardownInProgress`,
+        // via `not_admitting`), and the loop leaves
         // through the clean exit path, which drains the push workers and
         // releases every handler (`media_routing::teardown`). The pending KEK
         // rotation just recorded is dropped with the actor, which is sound: the
@@ -2151,10 +2196,76 @@ impl MeetingActor {
             info!(
                 target: "mc.actor.meeting",
                 meeting_id = %self.meeting_id,
+                reason = EmptyReason::LastParticipantLeft.label(),
                 "Last participant left; ending the meeting"
             );
-            self.is_shutting_down = true;
-            self.end_cause = Some(MeetingEndCause::Empty);
+            self.end_meeting(MeetingEndCause::Empty(EmptyReason::LastParticipantLeft));
+        }
+    }
+
+    /// THE meeting-end step, shared by the last-leave choke point and the
+    /// join-window deadline: from this turn on nothing is admitted, and the
+    /// loop's next turn leaves through the clean exit path (handler release,
+    /// KEK lifecycle removal, controller reap, GC notified after release).
+    ///
+    /// The FIRST cause wins (`get_or_insert`): every counted end — last leave,
+    /// join window, close — goes through here, so `end_cause` has one setter.
+    fn end_meeting(&mut self, cause: MeetingEndCause) {
+        self.is_shutting_down = true;
+        self.end_cause.get_or_insert(cause);
+    }
+
+    /// THE join-window arming predicate: the roster is empty and the meeting
+    /// has not ended. Shared by the arm and the deadline's re-check so the two
+    /// cannot drift.
+    fn is_join_window_armed(&self) -> bool {
+        self.participants.is_empty() && self.end_cause.is_none()
+    }
+
+    /// When the join window fires: armed only while
+    /// [`Self::is_join_window_armed`]. Anchored at creation and never re-armed
+    /// — once anyone is admitted, only the last-leave choke point ends it.
+    fn join_window_wake(&self) -> Option<Instant> {
+        self.is_join_window_armed()
+            .then(|| self.created + self.timers.join_window)
+    }
+
+    /// The join window elapsed. Re-checks the arming predicate (same turn,
+    /// same actor), so an admission that won the race keeps the meeting.
+    fn on_join_window_deadline(&mut self) {
+        if !self.is_join_window_armed() {
+            return;
+        }
+        info!(
+            target: "mc.actor.meeting",
+            meeting_id = %self.meeting_id,
+            reason = EmptyReason::JoinWindowExpired.label(),
+            window_seconds = self.timers.join_window.as_secs(),
+            // The meeting's age NOW on the monotonic clock the deadline uses
+            // (same `created` Instant), and the lifetime tick that bounds
+            // "window + one tick": what an observer checks the end against,
+            // independent of wall-clock log timestamps.
+            age_ms = u64::try_from(self.created.elapsed().as_millis()).unwrap_or(u64::MAX),
+            lifetime_tick_ms = u64::try_from(LIFETIME_TICK.as_millis()).unwrap_or(u64::MAX),
+            "No participant joined within the join window; ending the meeting"
+        );
+        self.end_meeting(MeetingEndCause::Empty(EmptyReason::JoinWindowExpired));
+    }
+
+    /// The refusal for a join that reaches a meeting which is no longer
+    /// admitting: an ENDING meeting answers `MeetingTeardownInProgress`
+    /// (CONFLICT — the client re-joins through GC and gets a fresh meeting);
+    /// only MC-wide shutdown answers `Draining`.
+    fn not_admitting(&self) -> McError {
+        Self::not_admitting_for(self.end_cause)
+    }
+
+    fn not_admitting_for(end_cause: Option<MeetingEndCause>) -> McError {
+        match end_cause {
+            Some(MeetingEndCause::Empty(_) | MeetingEndCause::Closed) => {
+                McError::MeetingTeardownInProgress
+            }
+            Some(MeetingEndCause::Shutdown) | None => McError::Draining,
         }
     }
 
@@ -3358,10 +3469,16 @@ impl MeetingActor {
         }
     }
 
-    /// The actor is exiting: answer every parked join `Draining`.
+    /// The actor is exiting: answer every parked join with the not-admitting
+    /// refusal (`MeetingTeardownInProgress` for an ended meeting, `Draining`
+    /// at MC shutdown). Keyless either way.
     fn answer_parked_joins_draining(&mut self) {
+        let end_cause = self.end_cause;
         for ParkedJoin { respond_to, .. } in self.join_park.take_parked() {
-            if respond_to.send(Err(McError::Draining)).is_err() {
+            if respond_to
+                .send(Err(Self::not_admitting_for(end_cause)))
+                .is_err()
+            {
                 debug!(
                     target: "mc.actor.meeting",
                     meeting_id = %self.meeting_id,
@@ -3616,7 +3733,9 @@ impl MeetingActor {
             "Closing meeting"
         );
 
-        self.is_shutting_down = true;
+        // Stop admitting from this turn on, through THE end step (the loop
+        // leaves through the clean exit path; see the end of this fn).
+        self.end_meeting(MeetingEndCause::Closed);
 
         // Notify all participants. The meeting is being torn down, so the roster
         // maps are dropped wholesale rather than removed one-by-one; emit the
@@ -3641,9 +3760,9 @@ impl MeetingActor {
             managed.handle.cancel();
         }
 
-        // Leave through the CLEAN exit path — deliberately NOT by cancelling
-        // this actor's token, which is the process-shutdown path.
-        self.end_cause.get_or_insert(MeetingEndCause::Closed);
+        // The cause was recorded by `end_meeting` above; the loop leaves
+        // through the CLEAN exit path — deliberately NOT by cancelling this
+        // actor's token, which is the process-shutdown path.
 
         Ok(())
     }
@@ -3732,6 +3851,7 @@ impl MeetingActor {
             let _ = wiring.lifecycle.send(MeetingLifecycleEvent::Ended {
                 meeting_id: self.meeting_id.clone(),
                 cause,
+                age: self.created.elapsed(),
             });
         }
         let done = TeardownDone {
@@ -3740,7 +3860,10 @@ impl MeetingActor {
             cause,
         };
         let reason = match cause {
-            MeetingEndCause::Empty | MeetingEndCause::Closed => {
+            MeetingEndCause::Empty(
+                EmptyReason::LastParticipantLeft | EmptyReason::JoinWindowExpired,
+            )
+            | MeetingEndCause::Closed => {
                 crate::media_routing::teardown::TeardownReason::MeetingEnded
             }
             MeetingEndCause::Shutdown => crate::media_routing::teardown::TeardownReason::Shutdown,
@@ -3771,7 +3894,7 @@ impl MeetingActor {
         for (participant_id, participant) in &self.participants {
             if participant.status == ParticipantStatus::Disconnected {
                 if let Some(disconnected_at) = participant.disconnected_at {
-                    if now.duration_since(disconnected_at) >= DISCONNECT_GRACE_PERIOD {
+                    if now.duration_since(disconnected_at) >= self.timers.disconnect_grace {
                         timed_out.push(participant_id.clone());
                     }
                 }
@@ -6098,6 +6221,229 @@ mod tests {
                 "a clean close of the last participant ends the meeting WITHOUT waiting out grace",
             )
             .expect("the meeting actor exits cleanly, not by panic");
+    }
+
+    // =====================================================================
+    // Join window + configured grace (join-window devloop)
+    // =====================================================================
+
+    /// A controller-wired actor with explicit lifetime timers, returning the
+    /// lifecycle receiver so the END CAUSE is observed, not inferred.
+    fn spawn_wired(
+        meeting_id: &str,
+        timers: MeetingTimers,
+    ) -> (
+        MeetingActorHandle,
+        JoinHandle<()>,
+        tokio::sync::mpsc::UnboundedReceiver<MeetingLifecycleEvent>,
+    ) {
+        let (lifecycle, rx) = tokio::sync::mpsc::unbounded_channel();
+        let wiring = MeetingWiring {
+            lifecycle,
+            muted_census: Arc::new(MutedSourceCensus::default()),
+            handlerless_census: Arc::new(HandlerlessCensus::default()),
+            teardowns: Arc::default(),
+            timers,
+        };
+        let (handle, task) = MeetingActor::spawn_managed(
+            meeting_id.to_string(),
+            CancellationToken::new(),
+            ActorMetrics::new(),
+            ControllerMetrics::new(),
+            test_secret(),
+            crate::media_admission::fixtures::kek_lifecycle(),
+            crate::actors::meeting_media::test_handlers(),
+            wiring,
+        )
+        .expect("system CSPRNG must be available in tests");
+        (handle, task, rx)
+    }
+
+    fn timers(join_window_secs: u64, grace_secs: u64) -> MeetingTimers {
+        MeetingTimers {
+            join_window: Duration::from_secs(join_window_secs),
+            disconnect_grace: Duration::from_secs(grace_secs),
+        }
+    }
+
+    /// The `Ended` cause, if the actor has reported one.
+    fn ended_cause(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<MeetingLifecycleEvent>,
+    ) -> Option<MeetingEndCause> {
+        while let Ok(event) = rx.try_recv() {
+            if let MeetingLifecycleEvent::Ended { cause, .. } = event {
+                return Some(cause);
+            }
+        }
+        None
+    }
+
+    /// Let the actor run its ready turns without advancing paused time.
+    async fn settle() {
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    async fn join(handle: &MeetingActorHandle, n: u32) -> Result<JoinResult, McError> {
+        handle
+            .connection_join(
+                format!("conn-{n}"),
+                format!("user-{n}"),
+                format!("part-{n}"),
+                String::new(),
+                false,
+                test_identity_key(),
+                None,
+                test_media(),
+            )
+            .await
+    }
+
+    /// Boundary pair: alive at window − 1 ms, ended AT the window (an exact
+    /// deadline, no tick term) with `Empty(JoinWindowExpired)`.
+    #[tokio::test(start_paused = true)]
+    async fn a_never_joined_meeting_ends_exactly_at_the_join_window() {
+        let (handle, task, mut rx) = spawn_wired("jw-boundary", timers(40, 30));
+        settle().await;
+
+        tokio::time::advance(Duration::from_secs(40) - Duration::from_millis(1)).await;
+        settle().await;
+        assert_eq!(
+            ended_cause(&mut rx),
+            None,
+            "must still be alive at window - 1 ms"
+        );
+        assert!(!task.is_finished());
+        assert!(handle.get_state().await.is_ok());
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        settle().await;
+        assert_eq!(
+            ended_cause(&mut rx),
+            Some(MeetingEndCause::Empty(EmptyReason::JoinWindowExpired)),
+            "ended at the window, through the Empty path, distinguishable by reason"
+        );
+        tokio::time::timeout(Duration::from_millis(1), task)
+            .await
+            .expect("the actor leaves through its clean exit path")
+            .expect("no panic");
+
+        // A join reaching the dead actor is a GC re-join case, not Internal.
+        assert!(matches!(
+            join(&handle, 9).await,
+            Err(McError::MeetingTeardownInProgress)
+        ));
+    }
+
+    /// Disarm + cause attribution + the CONFIGURED grace: a participant
+    /// admitted before the window keeps the meeting alive past it, even while
+    /// in grace; when its (non-default, 12 s) grace expires the cause is a
+    /// LEAVE.
+    #[tokio::test(start_paused = true)]
+    async fn an_admitted_participant_disarms_the_window_and_grace_expiry_is_a_leave() {
+        let (handle, task, mut rx) = spawn_wired("jw-disarm", timers(5, 12));
+        join(&handle, 1).await.expect("admitted");
+        handle
+            .connection_disconnected(
+                "conn-1".to_string(),
+                "part-1".to_string(),
+                DisconnectCause::ConnectionLost,
+            )
+            .await
+            .unwrap();
+        let lost_at = Instant::now();
+
+        // Past the (5 s) window, still inside the configured grace.
+        tokio::time::sleep_until(lost_at + Duration::from_secs(11)).await;
+        settle().await;
+        assert_eq!(ended_cause(&mut rx), None, "grace member keeps it alive");
+        assert_eq!(handle.get_state().await.unwrap().participants.len(), 1);
+
+        // The configured grace (12 s, not the 30 s default) plus at most one
+        // LIFETIME_TICK.
+        tokio::time::sleep_until(lost_at + Duration::from_secs(12) + LIFETIME_TICK).await;
+        settle().await;
+        assert_eq!(
+            ended_cause(&mut rx),
+            Some(MeetingEndCause::Empty(EmptyReason::LastParticipantLeft)),
+            "grace expiry is a leave, never a join-window end"
+        );
+        let _ = task.await;
+    }
+
+    /// A failed session attempt (a reconnect with a bogus binding token) never
+    /// touches the roster, so it cannot disarm or postpone the window.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_attempt_does_not_disarm_the_window() {
+        let (handle, _task, mut rx) = spawn_wired("jw-refused", timers(40, 30));
+        tokio::time::advance(Duration::from_secs(20)).await;
+        let refused = handle
+            .connection_reconnect(
+                "conn-x".to_string(),
+                "no-such-correlation".to_string(),
+                "bogus".to_string(),
+                ClientMediaStates::live(av()),
+                None,
+            )
+            .await;
+        assert!(refused.is_err());
+        tokio::time::advance(Duration::from_secs(20)).await;
+        settle().await;
+        assert_eq!(
+            ended_cause(&mut rx),
+            Some(MeetingEndCause::Empty(EmptyReason::JoinWindowExpired)),
+            "the window stays anchored at creation"
+        );
+    }
+
+    /// Security A1: a join delivered at the deadline instant has exactly one
+    /// of two outcomes — admitted and the meeting lives, or refused
+    /// `MeetingTeardownInProgress` and the meeting ends. Never an admitted
+    /// participant inside an ended meeting.
+    #[tokio::test(start_paused = true)]
+    async fn a_join_at_the_deadline_instant_is_either_admitted_or_refused_consistently() {
+        let (handle, _task, mut rx) = spawn_wired("jw-race", timers(40, 30));
+        tokio::time::advance(Duration::from_secs(40)).await;
+        let outcome = join(&handle, 1).await;
+        settle().await;
+        let ended = ended_cause(&mut rx);
+        match outcome {
+            Ok(_) => {
+                assert_eq!(ended, None, "an admitted joiner's meeting must not end");
+                assert_eq!(handle.get_state().await.unwrap().participants.len(), 1);
+            }
+            Err(McError::MeetingTeardownInProgress) => assert_eq!(
+                ended,
+                Some(MeetingEndCause::Empty(EmptyReason::JoinWindowExpired))
+            ),
+            Err(other) => unreachable!("unexpected refusal at the deadline: {other:?}"),
+        }
+    }
+
+    /// The last clean close still ends the meeting at once, with the LEAVE
+    /// reason (regression for the shared `end_meeting` step).
+    #[tokio::test(start_paused = true)]
+    async fn a_clean_last_close_ends_immediately_with_the_leave_reason() {
+        let (handle, task, mut rx) = spawn_wired("jw-clean-close", timers(40, 30));
+        join(&handle, 1).await.expect("admitted");
+        let _ = handle
+            .connection_disconnected(
+                "conn-1".to_string(),
+                "part-1".to_string(),
+                DisconnectCause::ClientClosed,
+            )
+            .await;
+        // One virtual second: far inside both the grace (30 s) and the window
+        // (40 s), so an end here can only be the immediate last-leave end.
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("a clean last close ends the meeting immediately")
+            .expect("no panic");
+        assert_eq!(
+            ended_cause(&mut rx),
+            Some(MeetingEndCause::Empty(EmptyReason::LastParticipantLeft))
+        );
     }
 
     /// Task #64: an ABRUPT loss (`DisconnectCause::ConnectionLost`) must PRESERVE

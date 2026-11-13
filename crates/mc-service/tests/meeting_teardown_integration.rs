@@ -20,6 +20,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::observability::testing::MetricAssertion;
+use mc_service::actors::MeetingTimers;
+use mc_service::errors::McError;
 use mc_service::grpc::{MhClient, MhRegistrationClient};
 use mc_service::redis::MhEndpointInfo;
 use mc_test_utils::mock_mh::{MediaHandlerStub, MediaHandlerStubHandle, StubEvent};
@@ -27,14 +29,23 @@ use proto_gen::dark_tower::internal::v1::ReleaseCause;
 use test_common::accept_loop_rig::AcceptLoopRig;
 use test_common::media_session::{audio_slots, capability_frame, join_as};
 use test_common::{
-    build_test_stack_with_notifier, client_media_config, seed_meeting_with_handlers,
+    build_test_stack_with_timers, client_media_config, seed_meeting_with_handlers,
     RecordingMeetingEnded, TestStackHandles,
 };
 
 /// The rig and stack, with a real `MhClient` and a recording GC notifier.
 async fn stack(label: &str) -> (TestStackHandles, AcceptLoopRig, Arc<RecordingMeetingEnded>) {
+    stack_with_timers(label, MeetingTimers::default()).await
+}
+
+/// [`stack`] with explicit meeting lifetime timers (the join window), handed
+/// to the controller exactly as `main.rs` hands it `Config::meeting_timers()`.
+async fn stack_with_timers(
+    label: &str,
+    timers: MeetingTimers,
+) -> (TestStackHandles, AcceptLoopRig, Arc<RecordingMeetingEnded>) {
     let notifier = Arc::new(RecordingMeetingEnded::default());
-    let stack = build_test_stack_with_notifier(label, Arc::clone(&notifier) as _).await;
+    let stack = build_test_stack_with_timers(label, Arc::clone(&notifier) as _, timers).await;
     let rig = AcceptLoopRig::start_with_media_config(
         Arc::clone(&stack.controller_handle),
         Arc::clone(&stack.jwt_validator),
@@ -486,4 +497,193 @@ async fn a_create_during_teardown_waits_for_the_release_then_succeeds() {
             .any(|e| matches!(e, StubEvent::EndMeeting { .. })),
         "the create was answered only AFTER the previous incarnation's release"
     );
+}
+
+// ===========================================================================
+// Join window (RULING 2026-11-12: a meeting exists only while it has
+// participants). Real time with a short window: MeetingTimers carries any
+// Duration; the 23 s floor is a CONFIG bound, enforced and tested in config.rs.
+// ===========================================================================
+
+/// Real headroom over a joined control meeting's WebTransport handshake +
+/// join under a loaded parallel `cargo test` (a join must land inside it).
+const TEST_JOIN_WINDOW: Duration = Duration::from_secs(3);
+
+fn join_window_timers() -> MeetingTimers {
+    MeetingTimers {
+        join_window: TEST_JOIN_WINDOW,
+        ..MeetingTimers::default()
+    }
+}
+
+/// A meeting GC assigned but nobody connected to ends through the SAME end
+/// path as an emptied one: GC told exactly once (after the teardown, which
+/// for a never-programmed meeting has no MH release to make), counted as a
+/// join-window end, the actor gone — and not before its window.
+#[tokio::test]
+async fn a_never_connected_meeting_ends_within_its_join_window_through_the_empty_path() {
+    let stub = MediaHandlerStub::builder()
+        .programs_successfully("mh-jw")
+        .spawn()
+        .await;
+    let timers = join_window_timers();
+    let (stack, rig, notifier) = stack_with_timers("join-window-end", timers).await;
+    // The config echo the main.rs wiring publishes from the SAME value this
+    // stack's controller hands every meeting actor (what the actor then
+    // enforces is asserted below: never before its window).
+    let snap = MetricAssertion::snapshot();
+    mc_service::observability::metrics::set_meeting_timers(timers);
+    snap.gauge("mc_meeting_join_window_seconds")
+        .assert_value(TEST_JOIN_WINDOW.as_secs_f64());
+    snap.gauge("mc_meeting_disconnect_grace_seconds")
+        .assert_value(timers.disconnect_grace.as_secs_f64());
+
+    let assigned_at = tokio::time::Instant::now();
+    seed_meeting_with_handlers(&stack, "jw-never", vec![endpoint("mh-jw", &stub)]).await;
+    // Counted from ASSIGNMENT: MC never holds a meeting its gauge does not show.
+    snap.gauge("mc_meetings_active").assert_value(1.0);
+
+    assert_eq!(
+        notifier.wait_for(1, Duration::from_secs(10)).await,
+        vec!["jw-never".to_string()],
+        "GC told exactly once, for this meeting"
+    );
+    // Both sides of the task's bound, in real time on THIS host: the deadline
+    // arm fires at the window, never seconds late (the Gate-2 attempt-2 3.3 s
+    // investigation: in-process lateness is bounded here, so a larger
+    // wall-clock delta on the cluster is clock skew, not the actor loop).
+    let lived = assigned_at.elapsed();
+    assert!(
+        lived >= TEST_JOIN_WINDOW,
+        "never before its window: {lived:?}"
+    );
+    assert!(
+        lived <= TEST_JOIN_WINDOW + mc_service::actors::meeting_timers::LIFETIME_TICK,
+        "ended within window + one LIFETIME_TICK (incl. teardown + notify): {lived:?}"
+    );
+    // MC programs its handlers at the FIRST JOIN (the join carries the media
+    // routing deps, `MeetingMedia::install`), so a never-joined meeting was
+    // never registered on any MH: MH holds nothing for it, and the teardown
+    // has nothing to release. Asserted, not assumed — a future change that
+    // registers at assignment must then also show a release here.
+    let events = stub.events();
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, StubEvent::RegisterArrived { .. })),
+        "a never-joined meeting is never registered on MH: {events:?}"
+    );
+    assert!(
+        stub.end_meeting_requests().is_empty(),
+        "nothing registered, so nothing to release"
+    );
+
+    snap.counter("mc_meetings_ended_total")
+        .with_labels(&[("cause", "empty"), ("reason", "join_window_expired")])
+        .assert_delta(1);
+    snap.counter("mc_meetings_ended_total")
+        .with_labels(&[("cause", "empty"), ("reason", "last_participant_left")])
+        .assert_delta(0);
+    // And it leaves the gauge at the end (this stack's controller holds no
+    // other meeting).
+    snap.gauge("mc_meetings_active").assert_value(0.0);
+    assert!(
+        matches!(
+            stack
+                .controller_handle
+                .get_meeting_handle("jw-never".to_string())
+                .await,
+            Err(McError::MeetingNotFound(_))
+        ),
+        "the actor is gone and the fence lifted: MC holds nothing for this id"
+    );
+
+    // POSITIVE CONTROL on the SAME stub and controller: a meeting that IS
+    // joined is registered on this stub and released after its last leave. So
+    // the absences above mean "nothing was programmed", never "the stub sees
+    // nothing".
+    seed_meeting_with_handlers(&stack, "jw-control", vec![endpoint("mh-jw", &stub)]).await;
+    let mut a = join_as(&rig, &stack, "jw-control", "user-ctl").await;
+    a.write(capability_frame(audio_slots(1))).await;
+    let _ = a.settle().await;
+    a.close();
+    let events = wait_for_end(&stub, 1).await;
+    assert_released_after_pushes_stopped(&events, "jw-control", "mh-jw");
+}
+
+/// After a join-window end, GC's re-assignment creates a NEW incarnation that
+/// a participant can join (requirement 2). The freshness evidence is
+/// `MeetingNotFound` BEFORE the re-seed: the old actor is gone, so whatever
+/// admits the join is a new one. (Its first push at generation 1 does not
+/// discriminate on its own — the old incarnation was never registered either.)
+#[tokio::test]
+async fn a_join_after_a_join_window_end_gets_a_fresh_meeting() {
+    let stub = MediaHandlerStub::builder()
+        .programs_successfully("mh-jw-re")
+        .spawn()
+        .await;
+    let (stack, rig, notifier) =
+        stack_with_timers("join-window-rejoin", join_window_timers()).await;
+    seed_meeting_with_handlers(&stack, "jw-again", vec![endpoint("mh-jw-re", &stub)]).await;
+    notifier.wait_for(1, Duration::from_secs(10)).await;
+    assert!(matches!(
+        stack
+            .controller_handle
+            .get_meeting_handle("jw-again".to_string())
+            .await,
+        Err(McError::MeetingNotFound(_))
+    ));
+    let before = stub.received_generations().len();
+
+    // GC re-assigns (a fresh hand-off), and the join is admitted.
+    seed_meeting_with_handlers(&stack, "jw-again", vec![endpoint("mh-jw-re", &stub)]).await;
+    let mut a = join_as(&rig, &stack, "jw-again", "user-a").await;
+    a.write(capability_frame(audio_slots(1))).await;
+    let _ = a.settle().await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while stub.received_generations().len() == before {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no push for the new incarnation"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        stub.received_generations()[before],
+        1,
+        "the joined incarnation programs its handler from generation 1"
+    );
+    // The joined meeting outlives the (short) window: an admitted participant
+    // disarms it.
+    tokio::time::sleep(TEST_JOIN_WINDOW * 2).await;
+    assert!(stack
+        .controller_handle
+        .get_meeting_handle("jw-again".to_string())
+        .await
+        .is_ok());
+    a.close();
+}
+
+/// A clean last leave still ends the meeting IMMEDIATELY, as a leave — far
+/// inside the default join window (975 s) and the 30 s grace.
+#[tokio::test]
+async fn a_clean_last_leave_still_ends_immediately_as_a_leave() {
+    let stub = MediaHandlerStub::builder()
+        .programs_successfully("mh-leave")
+        .spawn()
+        .await;
+    let (stack, rig, notifier) = stack("join-window-leave").await;
+    seed_meeting_with_handlers(&stack, "jw-leave", vec![endpoint("mh-leave", &stub)]).await;
+    let snap = MetricAssertion::snapshot();
+    join_as(&rig, &stack, "jw-leave", "user-a").await.close();
+    assert_eq!(
+        notifier.wait_for(1, Duration::from_secs(5)).await,
+        vec!["jw-leave".to_string()]
+    );
+    snap.counter("mc_meetings_ended_total")
+        .with_labels(&[("cause", "empty"), ("reason", "last_participant_left")])
+        .assert_delta(1);
+    snap.counter("mc_meetings_ended_total")
+        .with_labels(&[("cause", "empty"), ("reason", "join_window_expired")])
+        .assert_delta(0);
 }

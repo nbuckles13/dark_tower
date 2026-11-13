@@ -26,10 +26,23 @@ export interface RedialBackoff {
   readonly random: () => number;
 }
 
+/**
+ * THE capped exponential backoff window `min(capMs, baseMs * 2^n)` — shared by
+ * the MH redial (full jitter, below) and the join retry (equal jitter,
+ * `session/joinRetry.ts`). The jitter policies differ on purpose; the window is
+ * one rule.
+ */
+export function backoffWindowMs(
+  attempt: number,
+  backoff: { readonly baseMs: number; readonly capMs: number },
+): number {
+  // 2^n overflows to Infinity long before it matters; min() then takes the cap.
+  return Math.min(backoff.capMs, backoff.baseMs * 2 ** Math.max(0, attempt));
+}
+
 /** The delay before redial attempt `attempt` (0-based). Never negative. */
 export function redialDelayMs(attempt: number, backoff: RedialBackoff): number {
-  // 2^n overflows to Infinity long before it matters; min() then takes the cap.
-  const window = Math.min(backoff.capMs, backoff.baseMs * 2 ** Math.max(0, attempt));
+  const window = backoffWindowMs(attempt, backoff);
   const jitter = Math.floor(backoff.random() * window);
   return (attempt === 0 ? backoff.floorMs : 0) + jitter;
 }

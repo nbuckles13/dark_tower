@@ -216,9 +216,76 @@ fn select_mc(candidates: &[McCandidate]) -> &McCandidate {
 
 Assignments are marked ended (soft delete) when:
 
-1. **Meeting ends normally**: Last participant leaves, MC notifies GC
-2. **Meeting timeout**: No participants for 1 hour (background job)
-3. **MC failure**: MC marked unhealthy, assignments migrated or ended
+1. **Meeting ends on MC, MC notifies GC** (`NotifyMeetingEnded`). *Amended
+   2026-11-12 (user ruling): an MC meeting exists only while it has
+   participants.* MC ends it through ONE end path (handler release, KEK and
+   policy cleanup, `mc_meetings_active` decrement, then the notify — sent only
+   AFTER the release) when:
+   - the last participant leaves or closes cleanly — immediately; an abrupt
+     loss first waits out the bounded reconnect grace
+     (`MC_DISCONNECT_GRACE_PERIOD_SECONDS`). Cause `empty`, reason
+     `last_participant_left`.
+   - no participant has joined within the **join window**, measured from the
+     moment GC's assignment created the meeting — `MC_MEETING_JOIN_WINDOW_SECONDS`,
+     a short configured window (production 30 s; fail-loud on an invalid
+     value, floor one MC lifetime tick). Unset, it falls back to a derived
+     value that is also its CEILING: the longest lifetime AC gives any
+     meeting/guest token, plus JWT expiry leeway, plus the SDK's join
+     deadline — past that, no credential issued at assignment can still
+     produce a participant, so no configuration can re-open the leak. MC ends
+     the meeting AT the window — an exact deadline, not a polled check. An
+     observer (test, operator) should allow up to one lifetime tick past it
+     as tolerance (`window ≤ age ≤ window + one lifetime tick`); that term is
+     not part of MC's rule. MC logs the meeting's monotonic age on its end
+     lines. Cause `empty`, reason
+     `join_window_expired`. A join that loses the race against the window is
+     refused and recovered by the late-joiner path below; the shorter the
+     window, the more often that path runs, with no extra mechanism.
+
+   The notify carries no cause; GC treats both alike. A join after the end
+   finds the row ended and is a NEW incarnation: GC re-selects MC and MHs and
+   sends a fresh `AssignMeetingWithMh` (`atomic_assign` revives the row).
+
+   **Late joiners.** GC's sticky-join reuse path does not contact MC, so a GC
+   join never extends the window, and the row stays live from the window's end
+   until MC's teardown completes and GC processes the notify. A joiner who
+   reaches MC in that span — anyone who GC-joined the never-connected meeting
+   during the window, the creator (GC assigns before it mints the token), or a
+   join that reached GC before the notify — is refused with `NOT_FOUND` or
+   `CONFLICT` (`teardown_in_progress`). The SDK's initial `join()` retries
+   those two codes a bounded number of times with jittered backoff, each retry
+   re-running GC's join, which re-assigns once the row has ended. No GC->MC
+   "touch" is added.
+
+   **Residual — slow or unreachable MH.** The refusal span is teardown + one
+   notify. Teardown is sub-second with a healthy MH, which the SDK retry
+   covers; with a slow or unreachable MH it can run up to MC's teardown
+   bound (`TEARDOWN_MAX`, logged at MC startup as
+   `teardown_fence_hold_max_seconds`), the retries exhaust on `CONFLICT`, and
+   the user re-joins. Accepted: the retry is not stretched to a worst-case MH
+   outage (a genuine `NOT_FOUND` would then take that long to surface), and
+   the notify is not moved ahead of the release, which security relies on.
+2. ~~**Meeting timeout**: No participants for 1 hour (background job)~~
+   *Superseded 2026-11-12 by item 1.* GC holds no participant data and never
+   ends a meeting for inactivity; the job this item named was never that.
+3. **MC failure (backstop)**: GC's assignment cleanup job
+   (`crates/gc-service/src/tasks/assignment_cleanup.rs`) ends active rows
+   whose MC is no longer healthy (heartbeat stale) and that are older than
+   `GC_INACTIVITY_HOURS` — rows MC never reported because it died first. Its
+   safety property is MC liveness, not row age: a row whose MC still
+   heartbeats is never ended by the job, so it cannot hand a live meeting to a
+   second MC. Joins fail such rows over sooner anyway (`atomic_assign`'s
+   unhealthy/stale-MC arm). The same job hard-deletes ended rows after
+   `GC_RETENTION_DAYS` (below). Invalid values for its settings refuse startup.
+
+   **Residuals the backstop does NOT cover**, alongside item 1's slow-MH
+   residual (docs/TODO.md, "`NotifyMeetingEnded` is not incarnation-safe"): (1) a notify that fails
+   ambiguously, uncommitted, while MC stays healthy leaves a live row for a
+   meeting MC no longer holds — joins get `meeting_not_found` until MC
+   restarts or is marked unhealthy; item 1's join-window ends raise notify
+   volume, and with it exposure to this residual, in proportion. (2) a join's
+   failover re-pointing a row to another MC can race the old MC's in-flight
+   notify and end the new MC's live row.
 
 ```sql
 -- Soft delete: mark ended_at instead of DELETE

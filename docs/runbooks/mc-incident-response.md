@@ -86,6 +86,8 @@ container name, so `kubectl ... deployment/mc-service` fails with
    - [Scenario 21: Server Mute Not Enforced](#scenario-21-server-mute-not-enforced)
    - [Scenario 22: Client Video Decode Failures](#scenario-22-client-video-decode-failures)
    - [Scenario 23: Client Video Slot Unfulfilled](#scenario-23-client-video-slot-unfulfilled)
+   - [Scenario 30: Joins Not Reaching MC](#scenario-30-joins-not-reaching-mc)
+   - [Scenario 31: Meeting Not Found After a GC Join / Join-Window Ends](#scenario-31-meeting-not-found-after-a-gc-join--join-window-ends)
 4. [Diagnostic Commands](#diagnostic-commands)
 5. [Recovery Procedures](#recovery-procedures)
 6. [Postmortem Template](#postmortem-template)
@@ -430,7 +432,15 @@ kubectl exec -it deployment/gc-service -n dark-tower -- \
 
 1. **Client Disconnect Without Cleanup**: Clients disconnected abruptly
    - Check: Connection close events in logs
-   - Fix: Implement meeting timeout/cleanup logic
+   - Expected behaviour: an abruptly disconnected participant is removed after
+     `MC_DISCONNECT_GRACE_PERIOD_SECONDS` (+ one `LIFETIME_TICK`), and the meeting ends when the
+     last one goes. A meeting nobody ever joined ends at its join window
+     (`mc_meeting_join_window_seconds`). **Since the join-window devloop (2026-11-12) MC holds no
+     meeting with zero connections past the join window**, so `MCLowConnectionCount` (`for: 17m`,
+     longer than any legal window) firing is a meeting-lifecycle DEFECT. Check
+     `mc_meetings_ended_total{reason="join_window_expired"}` is moving, and grep the MC logs for
+     "No participant joined within the join window" for a meeting id that stayed. If clients are
+     not reaching MC at all, that is `MCJoinsNotReachingMC` (Scenario 30), not this scenario.
 
 2. **Meeting Actor Stuck**: Meeting actor not processing messages
    - Check: Mailbox depth for MeetingActor
@@ -1048,8 +1058,14 @@ Triage by the `error_type` label on `mc_session_join_failures_total`:
 8. **`draining` / `migrating`**: MC is draining or migrating meetings away
    - Check: MC status in GC database
    - Fix: Expected during maintenance; joins will succeed on another MC
+   - Since the join-window devloop, `draining` means **MC-wide shutdown only**. A join that reaches
+     a single meeting which is ENDING (last leave, join window, close) is `teardown_in_progress`,
+     and the SDK re-joins through GC on it.
 
 9. **`internal`**: Unexpected internal error (stream failures, decode errors)
+   - **Not an ended meeting.** A join that hits a meeting actor that has exited (closed mailbox or
+     dropped reply) is `teardown_in_progress` since the join-window devloop, not `internal`. An
+     actor panic lands there too, and is reported on `mc_actor_panics_total`.
    - Check: MC logs for stack traces or error details
    - Fix: Investigate logs, may require code fix or rollback
 
@@ -3930,6 +3946,111 @@ decode, capture-state and recovery-request faults; Scenario 16 routing for key r
 
 **Related**: [MH Scenario 22](mh-incident-response.md#scenario-22-video-slot-stuck-pending);
 [Scenario 22](#scenario-22-client-video-decode-failures); `client-dev-local.md` F26.
+
+---
+
+### Scenario 30: Joins Not Reaching MC
+
+**Alert**: `MCJoinsNotReachingMC` (warning: ≥ 3 successful GC joins and zero MC joins in 5m, for 2m)
+**Severity**: Warning
+**Runbook Section**: `#scenario-30-joins-not-reaching-mc`
+
+**What it means**: GC assigned meetings and issued join tokens, but no join attempt arrived at any
+MC. The break is between the browser and MC's WebTransport listener. GC and the MC actors are not
+at fault. All new joins fail. Meetings already running are unaffected until their participants
+reconnect.
+
+**Triage in order (stop at the first hit)**:
+
+1. **Is MC accepting QUIC at all?** Check `mc_webtransport_connections_total` by status over 10m.
+   - Zero across all statuses: connections are not arriving at all. Go to step 2.
+   - Rejections climbing: this is a handshake or TLS problem, not reachability. Go to
+     [Scenario 9: WebTransport Rejections](#scenario-9-webtransport-rejections).
+   - Accepted but no joins: the client connects and then fails before its JoinRequest. Check JWT
+     ([Scenario 10](#scenario-10-jwt-validation-failures)) and client errors.
+2. **Pods and listener.** Run `kubectl get pods -n dark-tower -l app=mc-service`. Check readiness
+   and the MC startup line for the WebTransport bind address. If no MC is ready, go to
+   [Scenario 4: Complete Service Outage](#scenario-4-complete-service-outage).
+3. **Advertised address.** GC hands clients `MC_WEBTRANSPORT_ADVERTISE_ADDRESS` from the
+   per-instance ConfigMap (`infra/services/mc-service/mc-{0,1}-config.env`). A recent ConfigMap or
+   deploy change that left an unreachable address produces exactly this alert. Compare it against
+   the externally reachable host:port.
+4. **Service / NodePort.** Run `kubectl get svc -n dark-tower mc-service-0 mc-service-1 -o wide`.
+   Each must expose UDP webtransport (4433 → nodePort 30433 / 30435), and the endpoints must be
+   non-empty: `kubectl get endpoints -n dark-tower mc-service-0 mc-service-1`. Empty endpoints
+   mean a selector or readiness break.
+5. **NetworkPolicy.** `infra/services/mc-service/network-policy.yaml` must keep the
+   external-client ingress rule (UDP 4433, `from: []`). Run
+   `kubectl get networkpolicy -n dark-tower -o yaml` and diff it against the repo. A NetworkPolicy
+   change that dropped the rule, or made it TCP, causes this alert.
+6. **Upstream of the cluster.** Check the LB, firewall or security group for UDP to the node
+   ports. UDP is often blocked where TCP passes.
+
+**Not the lever**: do NOT raise `MC_MEETING_JOIN_WINDOW_SECONDS`. It only changes how long the
+unreachable meetings linger. It restores nothing.
+
+**Rollback**: if this started with a deploy, roll back the MC ConfigMap, Service or NetworkPolicy
+change first (`kubectl rollout undo` for the deployment; re-apply the previous kustomize render for
+Service/NetworkPolicy). The application binary is the least likely cause when zero joins arrive.
+
+**Blind spot (accepted)**: a fleet with fewer than 3 successful GC joins per 5 minutes cannot fire
+this alert.
+
+**Related**: `MCLowConnectionCount` (17m) is the leak detector, not the reachability detector. If
+both fire, this alert is the root cause.
+
+---
+
+### Scenario 31: Meeting Not Found After a GC Join / Join-Window Ends
+
+**Alert**: none (a user report, or a dashboard read of MC Overview → Meetings Ended by Cause).
+**Severity**: Investigate
+
+**Background**: an MC meeting exists only while it has participants. GC's assignment creates the
+meeting actor. A meeting nobody joins within `mc_meeting_join_window_seconds` (the live value; set per environment
+in the base `config.env` and the Kind overlay, the derived value only if the key is unset) ends with `cause="empty"`, `reason="join_window_expired"`, and MC
+notifies GC. GC's reuse path does not tell MC about a later GC join, so a user who GC-joins such a
+meeting and reaches MC after its window is refused with `meeting_not_found` or
+`teardown_in_progress`. **The SDK re-joins through GC automatically** (bounded, `JOIN_RETRY`:
+4 attempts, equal jitter), and GC re-assigns once it has processed `NotifyMeetingEnded`.
+
+**(a) A user reports "meeting not found" (or "Meeting is restarting, please try again")**:
+
+1. Confirm in Loki that this meeting id ended by its window:
+   `{app="mc-service"} |= "<meeting_id>" |= "Meeting ended; releasing it on its media handlers"`
+   carrying `reason="join_window_expired"`. Its "Meeting actor created" line shows when GC
+   assigned it.
+2. If the SDK's retries ran out with `teardown_in_progress`, the teardown outlasted the retry
+   span. **This is a NAMED RESIDUAL, not a defect**: with a slow or unreachable MH, teardown can
+   take up to `teardown_fence_hold_max_seconds` (MC's startup line), and GC keeps handing out the
+   ending assignment until MC's notify. Check that bound and the health of that meeting's MHs
+   (MH incident runbook). The remedy is a manual rejoin after that bound.
+3. If refusals persist past that bound with a HEALTHY MC, suspect a lost `NotifyMeetingEnded`
+   (`MCNotifyMeetingEndedFailing`, `MCMeetingEndedNotificationsDropped`; `docs/TODO.md`
+   residual): from GC's view the row was never ended, so GC keeps reusing the LIVE assignment
+   for a meeting MC has already ended, until MC restarts or is marked unhealthy (then the next
+   join fails the row over in `atomic_assign`, and the backstop eventually ends it).
+
+**(b) A sustained rise in `join_window_expired` relative to `last_participant_left`**:
+
+GC joins are succeeding but clients aren't reaching MC, or are reaching it and failing before
+admission.
+- If `MCJoinsNotReachingMC` is firing, follow [Scenario 30](#scenario-30-joins-not-reaching-mc),
+  which is the one source for the ingress, NodePort and NetworkPolicy steps.
+- Otherwise read `mc_session_join_failures_total` by `error_type` (clients arrive and fail), then
+  `client.md` join metrics for a client defect.
+- **The window key is not the fix** when clients never reach MC: raising
+  `MC_MEETING_JOIN_WINDOW_SECONDS` only keeps unreached meetings longer (it is capped at the derived
+  default anyway).
+- **The one case where raising it IS the lever**: clients DO reach MC but consistently slower than
+  the window — `join_window_expired` rising TOGETHER WITH
+  `mc_session_join_failures_total{error_type=meeting_not_found|teardown_in_progress}` (refused
+  joins, not absent ones). Each SDK retry gets a fresh meeting with the same window, so a slow
+  client (high-RTT mobile, lossy UDP) fails every attempt. Keep the window well above the p99
+  client GC-join → MC-admission latency; raise it.
+- **Checking WHEN a meeting ended**: use the `age_ms` field on the end lines (MC's monotonic
+  clock, from the deadline's own anchor), not the gap between wall-clock log timestamps — a host
+  wall-clock step (seen on WSL2) can make that gap seconds longer than the window.
 
 ---
 

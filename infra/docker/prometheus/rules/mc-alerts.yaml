@@ -399,18 +399,69 @@ groups:
           runbook_url: "docs/runbooks/mc-incident-response.md#scenario-7-resource-pressure"
 
       - alert: MCLowConnectionCount
+        # THE NEVER-JOINED-MEETING LEAK DETECTOR (join-window devloop,
+        # 2026-11-12). A meeting nobody has joined is LEGAL for up to its join
+        # window (MC_MEETING_JOIN_WINDOW_SECONDS, at most the derived default
+        # `MAX_JOIN_WINDOW`, actors/meeting_timers.rs), so zero connections
+        # with meetings held is normal for that long. `for:` is therefore at
+        # least MAX_JOIN_WINDOW + LIFETIME_TICK plus margin — pinned by
+        # `meeting_timers::tests::low_connection_alert_outlasts_every_legal_join_window`.
+        # DELIBERATELY CONSERVATIVE: pinned to the legal CEILING (~975 s), not
+        # the configured value (MC_MEETING_JOIN_WINDOW_SECONDS; live value on
+        # mc_meeting_join_window_seconds), so the window can be raised up to
+        # the ceiling without an alert change — at the cost that, at a
+        # production window far below the ceiling, a leak is detected after the
+        # full `for:` (17 min), not after about one configured window.
+        # Prometheus cannot read the configured window; the ceiling pin is the
+        # SSoT.
+        # It no longer detects "clients cannot reach MC" fast: that is
+        # MCJoinsNotReachingMC below.
         expr: |
           sum(mc_connections_active) < 1 and sum(mc_meetings_active) > 0
-        for: 5m
+        for: 17m
         labels:
           severity: warning
           service: mc-service
           component: webtransport
         annotations:
-          summary: "MC has active meetings but no connections"
-          description: "Meeting Controller has {{ $value }} active meetings but no WebTransport connections for 5 minutes."
-          impact: "Meetings may be orphaned. Investigate connection issues."
+          summary: "MC holds meetings with no connections past every legal join window"
+          description: "Meeting Controller has held {{ $value }} active meetings with no WebTransport connections for 17 minutes, longer than any legal join window. MC ends a never-joined meeting at its join window, so this is a meeting-lifecycle leak (a defect), not idle meetings."
+          impact: "Leaked meetings hold MC capacity, key material and GC assignments. For 'clients cannot reach MC', see MCJoinsNotReachingMC (faster)."
           runbook_url: "docs/runbooks/mc-incident-response.md#scenario-3-meeting-lifecycle-issues"
+
+      - alert: MCJoinsNotReachingMC
+        # GC is handing out joins but no join reaches any MC: the client -> MC
+        # path (ingress, UDP NodePort, NetworkPolicy, advertised address) is
+        # down. Replaces the 5-minute reachability detection MCLowConnectionCount
+        # gave up when it became the 17m leak detector.
+        # - `status="success"` = a token was returned to the client (GC records
+        #   it only after the AC token is minted, gc handlers/meetings.rs); GC's
+        #   own refusals are `status="error"` and cannot trip this. Keep the
+        #   matcher — do not widen to all statuses.
+        # - `mc_session_joins_total` counts every join that reaches MC's join
+        #   path, success or failure.
+        # - `>= 3`: a lone GC-only join or probe (env-tests and synthetic
+        #   checks do this) must not fire it. ACCEPTED BLIND SPOT: a fleet
+        #   with fewer than 3 successful GC joins per 5m cannot fire it.
+        # - 5m range + `for: 2m` (~7m from outage start): a real client reaches
+        #   MC within seconds of its GC join, so 3 successful GC joins with
+        #   none arriving for 5 minutes is already unambiguous.
+        # - Both series are zero-initialised at boot, so `== 0` evaluates
+        #   rather than going absent.
+        expr: |
+          sum(increase(gc_meeting_join_total{status="success"}[5m])) >= 3
+          and on()
+          sum(increase(mc_session_joins_total[5m])) == 0
+        for: 2m
+        labels:
+          severity: warning
+          service: mc-service
+          component: webtransport
+        annotations:
+          summary: "GC is handing out joins but no join reaches MC"
+          description: "GC returned {{ $value }} successful joins in 5 minutes while no join reached any Meeting Controller, for 2 minutes. The browser -> MC WebTransport path is broken."
+          impact: "All new joins fail. Meetings already running are unaffected until their participants reconnect."
+          runbook_url: "docs/runbooks/mc-incident-response.md#scenario-30-joins-not-reaching-mc"
 
       - alert: MCGCHeartbeatWarning
         expr: |

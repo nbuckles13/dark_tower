@@ -355,6 +355,21 @@ spec:
             configMapKeyRef:
               name: mc-service-config
               key: MC_MAX_PARTICIPANTS
+        # ---- Meeting lifetime (join-window devloop, 2026-11-12) ----
+        # The base sets the value (config.env); the Kind overlay re-values it
+        # (configmap-join-window-patch.yaml). `optional: true` so a
+        # ConfigMap without the key (e.g. a rollback to a generation from
+        # before it existed) starts the pod on MC's DERIVED default instead of
+        # failing CreateContainerConfigError. Without THIS ref the value
+        # reaches the ConfigMap and nothing reads it (the Gate-2 L7 defect).
+        # Keep in lockstep with the other mc-N-deployment.yaml (guarded:
+        # `dt-guard env-config` checks every workload consuming the map).
+        - name: MC_MEETING_JOIN_WINDOW_SECONDS
+          valueFrom:
+            configMapKeyRef:
+              name: mc-service-config
+              key: MC_MEETING_JOIN_WINDOW_SECONDS
+              optional: true
         # Pod IP for gRPC advertise address (downward API)
         - name: POD_IP
           valueFrom:

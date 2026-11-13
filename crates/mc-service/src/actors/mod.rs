@@ -33,6 +33,7 @@ pub mod controller;
 pub mod join_park;
 pub mod meeting;
 pub mod meeting_media;
+pub mod meeting_timers;
 pub mod messages;
 pub mod metrics;
 pub mod participant;
@@ -44,6 +45,7 @@ pub use meeting::{HeartbeatRouteError, MeetingActor, MeetingActorHandle};
 #[cfg(feature = "test-seams")]
 pub use meeting_media::MeetingSeams;
 pub use meeting_media::{JoinMedia, MediaRoutingDeps, SLOT_VIEW_FLUSH_BATCH};
+pub use meeting_timers::MeetingTimers;
 pub use messages::*;
 pub use metrics::{ActorMetrics, ControllerMetrics, ControllerMetricsSnapshot, MailboxMonitor};
 pub use participant::{ParticipantActor, ParticipantActorHandle};

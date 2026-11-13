@@ -21,6 +21,7 @@ use crate::media_routing::PolicyGenerations;
 
 use super::meeting::{MeetingActor, MeetingActorHandle, MeetingWiring};
 use super::meeting_media::{HandlerlessCensus, MutedSourceCensus};
+use super::meeting_timers::MeetingTimers;
 use super::messages::{
     ControllerMessage, ControllerStatus, JoinResult, MeetingEndCause, MeetingInfo,
     MeetingLifecycleEvent, MeetingLifecycleSink,
@@ -118,12 +119,17 @@ impl MeetingControllerActorHandle {
             policy_generations,
             kek_lifecycle,
             Arc::new(NoMeetingEndedNotifier),
+            MeetingTimers::default(),
         )
     }
 
     /// As [`Self::new`], telling `meeting_ended` when a meeting has ended and
     /// its handlers are released (production: the GC notification queue).
     #[must_use]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "new()'s tuple plus the two production-only inputs (GC notifier, configured meeting timers); one constructor keeps tests and main on the same path"
+    )]
     pub fn with_meeting_ended_notifier(
         mc_id: String,
         metrics: Arc<ActorMetrics>,
@@ -132,6 +138,7 @@ impl MeetingControllerActorHandle {
         policy_generations: Arc<PolicyGenerations>,
         kek_lifecycle: Arc<crate::media_admission::KekLifecycle>,
         meeting_ended: Arc<dyn MeetingEndedNotifier>,
+        timers: MeetingTimers,
     ) -> Self {
         let (sender, receiver) = mpsc::channel(CONTROLLER_CHANNEL_BUFFER);
         let cancel_token = CancellationToken::new();
@@ -147,6 +154,7 @@ impl MeetingControllerActorHandle {
             kek_lifecycle,
         );
         actor.meeting_ended = meeting_ended;
+        actor.timers = timers;
         let teardowns = Arc::clone(&actor.teardowns);
 
         tokio::spawn(actor.run());
@@ -418,6 +426,9 @@ pub struct MeetingControllerActor {
     handlerless_census: Arc<HandlerlessCensus>,
     /// Told when a meeting has ended and its handlers are released.
     meeting_ended: Arc<dyn MeetingEndedNotifier>,
+    /// The lifetime timers handed to every meeting actor's wiring
+    /// (`Config::meeting_timers`).
+    timers: MeetingTimers,
     /// In-flight teardowns, handed to every meeting actor's wiring.
     teardowns: Arc<crate::media_routing::teardown::TeardownTracker>,
     /// Answered once the drain completes (see
@@ -533,6 +544,7 @@ impl MeetingControllerActor {
             muted_census: Arc::new(MutedSourceCensus::default()),
             handlerless_census: Arc::new(HandlerlessCensus::default()),
             meeting_ended: Arc::new(NoMeetingEndedNotifier),
+            timers: MeetingTimers::default(),
             teardowns: Arc::default(),
             shutdown_waiter: None,
         }
@@ -804,6 +816,7 @@ impl MeetingControllerActor {
             muted_census: Arc::clone(&self.muted_census),
             handlerless_census: Arc::clone(&self.handlerless_census),
             teardowns: Arc::clone(&self.teardowns),
+            timers: self.timers,
         };
         #[cfg(feature = "test-seams")]
         let (handle, task_handle) = match seams {
@@ -1218,8 +1231,12 @@ impl MeetingControllerActor {
 
     async fn on_lifecycle(&mut self, event: MeetingLifecycleEvent) {
         match event {
-            MeetingLifecycleEvent::Ended { meeting_id, cause } => {
-                self.reap_ended(&meeting_id, cause).await;
+            MeetingLifecycleEvent::Ended {
+                meeting_id,
+                cause,
+                age,
+            } => {
+                self.reap_ended(&meeting_id, cause, age).await;
             }
             MeetingLifecycleEvent::TeardownComplete { meeting_id, cause } => {
                 self.teardown_complete(&meeting_id, cause, false).await;
@@ -1234,8 +1251,14 @@ impl MeetingControllerActor {
     /// drain, as `EndMeetingRequest` requires. (The panic path in
     /// `check_meeting_health` evicts immediately — no worker survives a
     /// dropped actor there.)
-    async fn reap_ended(&mut self, meeting_id: &str, cause: MeetingEndCause) {
-        if self.meetings.remove(meeting_id).is_some() {
+    async fn reap_ended(
+        &mut self,
+        meeting_id: &str,
+        cause: MeetingEndCause,
+        age: std::time::Duration,
+    ) {
+        let reaped = self.meetings.remove(meeting_id).is_some();
+        if reaped {
             self.metrics.meeting_removed();
         }
         self.kek_lifecycle.remove_meeting(meeting_id).await;
@@ -1248,11 +1271,20 @@ impl MeetingControllerActor {
                 waiting: Vec::new(),
                 cause,
             });
+        // ONE value feeds the log line and the counter, so they cannot
+        // disagree. Recorded here (the reap), never at teardown completion, so
+        // the fence-backstop path cannot count a meeting twice or skip it.
+        if reaped && cause.counted() {
+            crate::observability::metrics::record_meeting_ended(cause);
+        }
         info!(
             target: "mc.actor.controller",
             mc_id = %self.mc_id,
             meeting_id = %meeting_id,
             cause = cause.label(),
+            reason = cause.reason_label(),
+            // Monotonic age, from the actor's own creation Instant.
+            age_ms = u64::try_from(age.as_millis()).unwrap_or(u64::MAX),
             total_meetings = self.meetings.len(),
             "Meeting ended; releasing it on its media handlers"
         );
@@ -1279,6 +1311,7 @@ impl MeetingControllerActor {
                 mc_id = %self.mc_id,
                 meeting_id = %meeting_id,
                 cause = fence.cause.label(),
+                reason = fence.cause.reason_label(),
                 "Teardown fence lifted by its deadline, not by the teardown reporting completion \
                  (the teardown task hung or vanished). Creates for this id proceed, and GC is \
                  told the meeting ended if it did; if the teardown is still releasing, it may \
@@ -1330,6 +1363,7 @@ impl MeetingControllerActor {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::actors::EmptyReason;
 
     /// Test secret for session binding (32 bytes as required by ADR-0023).
     fn test_secret() -> SecretBox<Vec<u8>> {
@@ -1711,9 +1745,15 @@ mod tests {
     async fn a_backstop_lifted_fence_still_tells_gc_an_ended_meeting_ended() {
         let notifier = Arc::new(RecordingNotifier::default());
         let mut actor = backstop_actor(Arc::clone(&notifier));
-        actor.reap_ended("m-empty", MeetingEndCause::Empty).await;
         actor
-            .reap_ended("m-shutdown", MeetingEndCause::Shutdown)
+            .reap_ended(
+                "m-empty",
+                MeetingEndCause::Empty(EmptyReason::LastParticipantLeft),
+                Duration::ZERO,
+            )
+            .await;
+        actor
+            .reap_ended("m-shutdown", MeetingEndCause::Shutdown, Duration::ZERO)
             .await;
 
         // Before the deadline nothing lifts (positive control on the timer).
@@ -1738,8 +1778,73 @@ mod tests {
 
         // A late real completion finds no fence and does not notify twice.
         actor
-            .teardown_complete("m-empty", MeetingEndCause::Empty, false)
+            .teardown_complete(
+                "m-empty",
+                MeetingEndCause::Empty(EmptyReason::LastParticipantLeft),
+                false,
+            )
             .await;
         assert_eq!(notifier.0.lock().unwrap().len(), 1);
+    }
+    /// A join-window end on the BACKSTOP path: counted on
+    /// `mc_meetings_ended_total{empty,join_window_expired}` exactly once (at
+    /// the reap, never at completion), GC told exactly once, and the
+    /// meeting's KEK lifecycle entry removed at the reap.
+    #[tokio::test(start_paused = true)]
+    async fn a_join_window_end_is_counted_once_and_notified_once_on_the_backstop_path() {
+        use common::observability::testing::MetricAssertion;
+        let notifier = Arc::new(RecordingNotifier::default());
+        let mut actor = backstop_actor(Arc::clone(&notifier));
+        let cause = MeetingEndCause::Empty(EmptyReason::JoinWindowExpired);
+        // Positive control for the KEK-entry removal: the entry is visible.
+        actor
+            .kek_lifecycle
+            .set_sender_ids_issued("m-window", 7)
+            .await;
+        actor
+            .create_meeting(
+                "m-window".to_string(),
+                crate::actors::meeting_media::test_handlers(),
+            )
+            .await
+            .expect("created");
+        assert_eq!(
+            actor
+                .kek_lifecycle
+                .sample(tokio::time::Instant::now())
+                .await
+                .1,
+            7
+        );
+
+        let snap = MetricAssertion::snapshot();
+        actor.reap_ended("m-window", cause, Duration::ZERO).await;
+        assert_eq!(
+            actor
+                .kek_lifecycle
+                .sample(tokio::time::Instant::now())
+                .await
+                .1,
+            0,
+            "the KEK lifecycle entry is removed at the reap"
+        );
+
+        tokio::time::advance(
+            crate::media_routing::teardown::TEARDOWN_MAX
+                + FENCE_BACKSTOP_MARGIN
+                + Duration::from_millis(1),
+        )
+        .await;
+        actor.expire_fences().await;
+        // A late real completion must neither notify nor count again.
+        actor.teardown_complete("m-window", cause, false).await;
+
+        assert_eq!(*notifier.0.lock().unwrap(), vec!["m-window".to_string()]);
+        snap.counter("mc_meetings_ended_total")
+            .with_labels(&[("cause", "empty"), ("reason", "join_window_expired")])
+            .assert_delta(1);
+        snap.counter("mc_meetings_ended_total")
+            .with_labels(&[("cause", "empty"), ("reason", "last_participant_left")])
+            .assert_delta(0);
     }
 }

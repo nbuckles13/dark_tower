@@ -832,6 +832,49 @@ sum(rate(mc_jwt_validations_total[5m])) > 0
 
 ---
 
+### Warning Alerts (Meeting Lifecycle and Reachability)
+
+Added by the join-window devloop (2026-11-12): an MC meeting exists only while it has participants, so a never-joined meeting ends at its join window. `MCLowConnectionCount` became the leak detector, and `MCJoinsNotReachingMC` took over the fast reachability detection it used to give.
+
+#### MCJoinsNotReachingMC
+
+**Severity**: Warning
+**Condition**: GC returned at least 3 successful joins (a token handed to a client) in 5 minutes, while no join reached any MC's join path, held for 2 minutes (about 7 minutes from outage start)
+**Impact**: All new joins fail. Meetings already running are unaffected until their participants reconnect.
+**Runbook**: [Scenario 30: Joins Not Reaching MC](../runbooks/mc-incident-response.md#scenario-30-joins-not-reaching-mc)
+
+**PromQL**:
+```promql
+sum(increase(gc_meeting_join_total{status="success"}[5m])) >= 3
+and on()
+sum(increase(mc_session_joins_total[5m])) == 0
+```
+`for: 2m`
+
+**Why this shape**:
+- `status="success"` means a token was returned to the client: GC records it only after the AC token is minted. GC's own refusals are `status="error"` and cannot trip this rule, so keep the matcher.
+- `mc_session_joins_total` counts every join that reaches MC's join path, success or failure (a JWT failure included). Zero therefore means nothing arrived, not that everything failed.
+- `>= 3` keeps a lone GC-only join or probe from firing it. **Accepted blind spot**: a fleet with fewer than 3 successful GC joins per 5 minutes cannot fire it.
+- 5m range + `for: 2m`: a real client reaches MC within seconds of its GC join, so 3 successful GC joins with none arriving for 5 minutes is already unambiguous.
+- Both series are zero-initialised at boot, so `== 0` evaluates rather than going absent.
+
+**Response**: follow Scenario 30 in order: is MC accepting QUIC at all, then pods and listener, advertised address, Service/NodePort, NetworkPolicy, and upstream UDP. **Raising `MC_MEETING_JOIN_WINDOW_SECONDS` is not the lever**: it only changes how long the unreachable meetings linger.
+
+#### MCLowConnectionCount
+
+**Severity**: Warning
+**Condition**: MC holds meetings (`mc_meetings_active > 0`) with zero WebTransport connections for 17 minutes, longer than any legal join window
+**Impact**: A meeting-lifecycle LEAK, which is a defect. MC ends a never-joined meeting at its join window (at most the derived `MAX_JOIN_WINDOW`), so meetings with no connections past that are not idle meetings. They hold MC capacity, key material and GC assignments.
+**Runbook**: [Scenario 3: Meeting Lifecycle Issues](../runbooks/mc-incident-response.md#scenario-3-meeting-lifecycle-issues)
+
+**PromQL**:
+```promql
+sum(mc_connections_active) < 1 and sum(mc_meetings_active) > 0
+```
+`for: 17m`
+
+**Why `for: 17m`**: a meeting with zero connections is LEGAL for up to its join window. `for:` must outlast the largest legal window plus `LIFETIME_TICK`, and the unit test `meeting_timers::tests::low_connection_alert_outlasts_every_legal_join_window` pins that against the same ceiling `config.rs` enforces. **The `for:` is pinned to the legal CEILING (`MAX_JOIN_WINDOW`, the derived ~975 s), NOT the configured value** (`MC_MEETING_JOIN_WINDOW_SECONDS`, live value on `mc_meeting_join_window_seconds`): raising it anywhere up to that ceiling never needs an alert change. At a production window far below the ceiling it is therefore deliberately conservative — a leak is detected after the full `for:` (17 minutes), not after about one configured window. A deliberate trade-off, not an oversight: Prometheus cannot read the configured value, so deriving `for:` from it is not possible, and the ceiling pin is the single source of truth. **This rule is no longer the reachability detector.** A total MC-ingress outage is `MCJoinsNotReachingMC` (about 7 minutes, 5m window + 2m `for`, from outage start). If both fire, `MCJoinsNotReachingMC` is the root cause.
+
 ### Warning Alerts (Media Signalling)
 
 #### MCMediaSendDirectiveFailures

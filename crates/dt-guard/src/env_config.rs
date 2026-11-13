@@ -26,6 +26,30 @@
 //!    pair resolves, the key is referenced) and starts a healthy-looking pod
 //!    running the WRONG value. See [`CONFIGMAP_KEY_NAME_MISMATCH_RULE_ID`] for
 //!    why this is frozen repo-wide and why it is scoped to ConfigMaps only.
+//! 5. (Since the 2026-11-12 join-window devloop.) Every `data:` key an OVERLAY
+//!    ConfigMap patch (`infra/kubernetes/overlays/<o>/services/<base>/`, its
+//!    `patches:` `path:` files) sets is consumed. Within ONE service check 5
+//!    reports only "read by nothing" (one hit on the patch); the per-workload
+//!    duty — replicas reading the same keys — MOVED to check 6, so do not
+//!    re-add it here (one defect must be one finding). Across bases, for
+//!    shared-generator overlays (e.g. the codec profile), check 5 keeps a
+//!    per-workload arm for overlay-only keys (no replica relation there); a
+//!    base-declared key the overlay only re-values needs SOME reader. Check 2 accepts an
+//!    `optional: true` ref to an overlay-only key. Declaration semantics on
+//!    the patch document, no kustomize build; every form not parsed here is
+//!    `unsupported_configmap_patch_form`, never a skip.
+//! 6. (Since the 2026-11-12 join-window devloop.) Within ONE service, every
+//!    workload that reads a ConfigMap — a local one or a shared generator —
+//!    reads the SAME keys of it with the SAME `optional:` (replica lockstep,
+//!    per workload). Rule 1 covers only `MissingEnvVar` keys; an optional key
+//!    dropped from one replica, or one replica's ref flipped hard, would
+//!    otherwise pass every check. Never across bases (MC and MH legitimately
+//!    read different subsets of the shared codec profile). Keyed by ConfigMap
+//!    NAME, so per-instance maps (`mc-0-config` vs `mc-1-config`) are outside
+//!    it by construction: check 3 covers keys declared there, and a key
+//!    declared in neither per-instance map and read by neither is unguarded
+//!    by design. Within a service, check 5 reports only "read by nothing";
+//!    its per-workload half is this check.
 //!
 //! # Discovery
 //!
@@ -78,17 +102,16 @@
 //!
 //! # Scope boundary — read this before trusting the status line
 //!
-//! This guard covers `infra/services/<svc>/` for the canonical services, plus
-//! the generator-only bases they consume, **only**. It does NOT cover
-//! `infra/kubernetes/overlays/**`. Kind overlays carry live `data:` keys
-//! (`overlays/kind/services/{ac,gc,mc}-service/configmap-otel-patch.yaml`,
-//! `overlays/kind/services/mh-service/configmap-egress-budget-patch.yaml`) that
-//! are invisible here, and because a Kustomize strategic merge on a ConfigMap
-//! is *additive*, an overlay can introduce a key that no base ConfigMap
-//! declares and no workload references. Extending coverage to overlays needs a
-//! patch-semantics resolution model rather than this declaration-semantics one;
-//! it is tracked in `docs/TODO.md` § Infrastructure Validation in Devloops.
-//! `env-config-clean-<S>-services-<W>-workloads-<C>-configmaps` therefore means "the base
+//! This guard covers `infra/services/<svc>/` for the canonical services, the
+//! generator-only bases they consume, and — check 5 only — the ConfigMap
+//! PATCHES of their overlays (`infra/kubernetes/overlays/**`): the keys an
+//! overlay adds to or re-values on a base ConfigMap. It does NOT cover
+//! overlay patches to WORKLOADS (env added or removed in an overlay) or
+//! overlay-created resources; that needs a patch-semantics resolution model
+//! (and a kustomize build) and stays tracked in `docs/TODO.md`
+//! § Infrastructure Validation in Devloops.
+//! `env-config-clean-<S>-services-<W>-workloads-<C>-configmaps-<P>-overlay-configmap-patches`
+//! therefore means "the base
 //! service manifests are consistent", not "MH's ConfigMap surface is checked".
 //! Coverage that is stated can be audited; coverage that is assumed cannot.
 
@@ -101,7 +124,7 @@ use crate::common::pod_spec::{
     container_configmap_refs, containers, env_from_is_list, meta_str, parse_docs,
     pod_configmap_refs, pod_spec, ConfigMapRefKind,
 };
-use crate::common::services::{infra_service_bases, INFRA_SERVICES_DIR};
+use crate::common::services::{infra_service_bases, INFRA_OVERLAYS_DIR, INFRA_SERVICES_DIR};
 use crate::common::status::emit_ok;
 use anyhow::{Context, Result};
 use once_cell::sync::Lazy;
@@ -189,6 +212,31 @@ pub const CONFIGMAP_NAME_AMBIGUOUS_ACROSS_BASES_RULE_ID: &str =
 /// partial rollout). Do not delete either as a duplicate of the other.
 pub const CONFIGMAP_KEY_NAME_MISMATCH_RULE_ID: &str = "configmap_key_name_mismatch";
 
+/// Check 6: within ONE service, workloads that read the same ConfigMap read
+/// different key sets from it — per-instance replicas (mc-0 / mc-1) drifted
+/// apart. Rule 1 catches this only for `MissingEnvVar` keys; an OPTIONAL key
+/// (a Rust default applies when absent) dropped from one replica would start
+/// that pod on a different value with every other check green.
+pub const CONFIGMAP_REFS_NOT_IN_LOCKSTEP_RULE_ID: &str = "configmap_refs_not_in_lockstep";
+
+/// Check 5: an OVERLAY ConfigMap patch adds a `data:` key that no base
+/// workload consumes (no `configMapKeyRef` naming that ConfigMap and key). A
+/// strategic merge on a ConfigMap is additive, so such a key reaches the
+/// cluster's ConfigMap and is read by NOTHING — a silent no-op override (the
+/// 2026-11-12 join-window devloop shipped exactly this: a Kind window override
+/// MC never received, discovered only by a Layer-7 timeout).
+pub const OVERLAY_CONFIGMAP_KEY_UNCONSUMED_RULE_ID: &str = "overlay_configmap_key_unconsumed";
+
+/// An overlay shape that can add ConfigMap keys but that check 5 does not
+/// parse (inline patch, unreadable `path:`, kindless JSON6902 document,
+/// `configMapGenerator` / `patchesStrategicMerge` / `patchesJson6902`) —
+/// refuses to pass check 5 vacuously.
+pub const UNSUPPORTED_CONFIGMAP_PATCH_FORM_RULE_ID: &str = "unsupported_configmap_patch_form";
+
+/// An overlay ConfigMap patch names a ConfigMap that is neither the base's own
+/// nor a shared generator — its keys cannot be checked against any consumer.
+pub const OVERLAY_CONFIGMAP_NOT_IN_BASE_RULE_ID: &str = "overlay_configmap_not_in_base";
+
 /// Rule-id → FAIL-token, in precedence order. The first id with any hit names
 /// the run.
 ///
@@ -219,8 +267,16 @@ const RULE_PRECEDENCE: &[(&str, &str)] = &[
         "workload-missing-pod-spec",
     ),
     (UNSUPPORTED_ENV_SOURCE_RULE_ID, "unsupported-env-source"),
+    (
+        UNSUPPORTED_CONFIGMAP_PATCH_FORM_RULE_ID,
+        "unsupported-configmap-patch-form",
+    ),
     (MALFORMED_ENV_REFERENCE_RULE_ID, "malformed-env-reference"),
     (CONFIGMAP_NOT_FOUND_RULE_ID, "configmap-not-found"),
+    (
+        OVERLAY_CONFIGMAP_NOT_IN_BASE_RULE_ID,
+        "overlay-configmap-not-in-base",
+    ),
     (MISSING_IN_MANIFEST_RULE_ID, "missing-in-manifest"),
     (KEY_NOT_IN_CONFIGMAP_RULE_ID, "key-not-in-configmap"),
     // After the two runtime-fatal reference faults (they stop a pod starting,
@@ -229,6 +285,16 @@ const RULE_PRECEDENCE: &[(&str, &str)] = &[
     (
         CONFIGMAP_KEY_NAME_MISMATCH_RULE_ID,
         "configmap-key-name-mismatch",
+    ),
+    // An overlay override that reaches nothing: the deployed behaviour
+    // silently differs from what the overlay states.
+    (
+        OVERLAY_CONFIGMAP_KEY_UNCONSUMED_RULE_ID,
+        "overlay-configmap-key-unconsumed",
+    ),
+    (
+        CONFIGMAP_REFS_NOT_IN_LOCKSTEP_RULE_ID,
+        "configmap-refs-not-in-lockstep",
     ),
     (ORPHAN_CONFIGMAP_KEY_RULE_ID, "orphan-key"),
 ];
@@ -341,6 +407,9 @@ pub(crate) struct Report {
     /// ConfigMaps (plain or generated) resolved across checked services — the
     /// positive control that generator-sourced maps were actually seen.
     pub(crate) checked_configmaps: usize,
+    /// Overlay ConfigMap patch documents read by check 5 — the positive
+    /// control that overlays were actually seen.
+    pub(crate) checked_overlay_configmap_patches: usize,
     pub(crate) hits: Vec<Hit>,
 }
 
@@ -354,6 +423,10 @@ struct Workload {
     /// `(configMapKeyRef.name, key)` pairs. The ConfigMap name is retained —
     /// dropping it is what would let a reference to the wrong ConfigMap pass.
     key_refs: BTreeSet<(String, String)>,
+    /// The subset of `key_refs` marked `optional: true`. Check 2 accepts such
+    /// a ref against a key that only an OVERLAY patch supplies (the base
+    /// leaves it unset on purpose: a Rust default applies there).
+    optional_refs: BTreeSet<(String, String)>,
     /// A container in this workload uses `envFrom`. When set, the guard cannot
     /// see the full env set, so checks 1 and 3 (which assert about *absence* —
     /// a required var not declared, a ConfigMap key not referenced) must not
@@ -450,6 +523,7 @@ fn parse_workload(doc: &Value, rel_path: &Path, dir: &str) -> (Option<Workload>,
 
     let mut env_names: BTreeSet<String> = BTreeSet::new();
     let mut key_refs: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut optional_refs: BTreeSet<(String, String)> = BTreeSet::new();
     let mut ambiguous_cm_names: BTreeSet<String> = BTreeSet::new();
     let mut imports_unnamed_configmap = false;
     let mut uses_env_from = false;
@@ -539,6 +613,9 @@ fn parse_workload(doc: &Value, rel_path: &Path, dir: &str) -> (Option<Workload>,
                         }
                     }
                     key_refs.insert((cm_name.to_string(), cm_key.to_string()));
+                    if r.optional {
+                        optional_refs.insert((cm_name.to_string(), cm_key.to_string()));
+                    }
                 }
                 // Missing `name` and/or `key`. Dropping this silently would let
                 // the key it *should* have named surface as an orphan — a
@@ -570,6 +647,7 @@ fn parse_workload(doc: &Value, rel_path: &Path, dir: &str) -> (Option<Workload>,
             path: rel_path.to_path_buf(),
             env_names,
             key_refs,
+            optional_refs,
             uses_env_from,
             ambiguous_cm_names,
             imports_unnamed_configmap,
@@ -698,6 +776,12 @@ struct SharedUse {
     ambiguous: BTreeSet<String>,
     /// Some service imported a ConfigMap it could not identify.
     suppress_all: bool,
+    /// Per workload (any base): its `(shared map, key)` refs — check 5's
+    /// per-workload consumers of a shared map.
+    consumers: Vec<(PathBuf, BTreeSet<(String, String)>)>,
+    /// Overlay patches on SHARED generators (from a generator-only base's
+    /// overlay, or a service overlay patching a shared map).
+    overlay_patches: Vec<OverlayCmPatch>,
 }
 
 /// The detail line both duplicate-name rules share: `name` is declared at
@@ -735,11 +819,41 @@ pub(crate) fn analyze(repo_root: &Path) -> Result<Report> {
     report.hits.extend(ambiguity_hits(&shared));
     let mut shared_use = SharedUse::default();
 
-    for (_, dir) in crate::common::services::CANONICAL_SERVICES {
-        analyze_service(repo_root, dir, &shared, &mut shared_use, &mut report)?;
+    // Overlay patches of the generator-only bases (e.g. a test codec
+    // profile): their keys are checked across bases, per workload.
+    let mut shared_overlay_patches: Vec<OverlayCmPatch> = Vec::new();
+    for base in &shared.generator_only_bases {
+        for patch in overlay_configmap_patches(repo_root, base, &mut report)? {
+            if shared.generators.contains_key(&patch.cm_name) {
+                shared_overlay_patches.push(patch);
+            } else {
+                report.hits.push(Hit {
+                    rule_id: OVERLAY_CONFIGMAP_NOT_IN_BASE_RULE_ID,
+                    detail: format!(
+                        "{base}: overlay patch sets keys on ConfigMap {:?}, which is not a shared generator",
+                        patch.cm_name
+                    ),
+                    file: patch.file.clone(),
+                });
+            }
+        }
     }
+    for (_, dir) in crate::common::services::CANONICAL_SERVICES {
+        analyze_service(
+            repo_root,
+            dir,
+            &shared,
+            &shared_overlay_patches,
+            &mut shared_use,
+            &mut report,
+        )?;
+    }
+    shared_use.overlay_patches.extend(shared_overlay_patches);
     collect_non_canonical_refs(repo_root, &shared, &mut shared_use, &mut report)?;
     report.hits.extend(shared_orphan_hits(&shared, &shared_use));
+    report
+        .hits
+        .extend(shared_overlay_hits(&shared, &shared_use));
     report.checked_configmaps += shared.generators.len();
     Ok(report)
 }
@@ -751,6 +865,7 @@ fn analyze_service(
     repo_root: &Path,
     dir: &str,
     shared: &SharedGeneratorIndex,
+    shared_overlay_patches: &[OverlayCmPatch],
     shared_use: &mut SharedUse,
     report: &mut Report,
 ) -> Result<()> {
@@ -897,6 +1012,16 @@ fn analyze_service(
         .any(|w| w.imports_unnamed_configmap);
     shared_use.suppress_all |= suppress_all_orphans;
 
+    // The overlay ConfigMap patches for this service, read ONCE: check 2
+    // accepts an `optional: true` ref against a key only an overlay supplies,
+    // and check 5 (below) requires every overlay-supplied key be consumed.
+    let overlay_patches = overlay_configmap_patches(repo_root, dir, report)?;
+    let overlay_keys: BTreeSet<(&str, &str)> = overlay_patches
+        .iter()
+        .chain(shared_overlay_patches.iter())
+        .flat_map(|p| p.keys.iter().map(move |k| (p.cm_name.as_str(), k.as_str())))
+        .collect();
+
     for workload in &discovered.workloads {
         // Check 1 — per workload, not union.
         if !workload.uses_env_from {
@@ -929,6 +1054,13 @@ fn analyze_service(
                     ),
                     file: workload.path.clone(),
                 }),
+                // An OPTIONAL ref whose key the base deliberately leaves unset
+                // and an overlay supplies: the base pod starts without it (a
+                // Rust default applies), the overlay pod receives it.
+                Some(keys)
+                    if !keys.contains(key)
+                        && workload.optional_refs.contains(&(cm_name.clone(), key.clone()))
+                        && overlay_keys.contains(&(cm_name.as_str(), key.as_str())) => {}
                 Some(keys) if !keys.contains(key) => report.hits.push(Hit {
                     rule_id: KEY_NOT_IN_CONFIGMAP_RULE_ID,
                     detail: format!(
@@ -966,7 +1098,399 @@ fn analyze_service(
             }
         }
     }
+
+    // Check 6 — replica lockstep: within THIS service, every workload that
+    // reads a ConfigMap (local OR shared — never across bases: MC and MH
+    // legitimately read different profile subsets) reads the SAME keys of it,
+    // with the SAME `optional:`. Keyed by ConfigMap NAME, so per-instance maps
+    // (mc-0-config vs mc-1-config) are outside it by construction.
+    let mut lockstep_names: BTreeSet<&str> = discovered
+        .configmaps
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
+    lockstep_names.extend(
+        discovered
+            .workloads
+            .iter()
+            .flat_map(|w| w.key_refs.iter().map(|(n, _)| n.as_str()))
+            .filter(|n| is_shared(n)),
+    );
+    for name in lockstep_names {
+        if ambiguous_cms.contains(name) || (is_shared(name) && shared_use.ambiguous.contains(name))
+        {
+            continue;
+        }
+        report
+            .hits
+            .extend(lockstep_hits(dir, name, &discovered.workloads));
+    }
+
+    // Check 5 — overlay ConfigMap patches (declaration semantics on the patch
+    // document, no kustomize build), PER WORKLOAD like check 1: every `data:`
+    // key an overlay patch adds to one of THIS service's ConfigMaps must be
+    // consumed by EVERY workload that consumes that ConfigMap at all — a key
+    // on mc-0 but not mc-1 runs the two pods on different values. A patch on
+    // a SHARED generator is checked in the cross-base pass; a patch naming
+    // neither is a hit. Same per-map suppression as check 3.
+    for patch in overlay_patches {
+        let cm = patch.cm_name.as_str();
+        if by_name.contains_key(cm) {
+            if suppress_all_orphans || ambiguous_cms.contains(cm) {
+                continue;
+            }
+            let consumers: Vec<&Workload> = discovered
+                .workloads
+                .iter()
+                .filter(|w| w.key_refs.iter().any(|(n, _)| n == cm))
+                .collect();
+            let base_keys = by_name.get(cm).map(|c| c.keys.clone()).unwrap_or_default();
+            // Within one service the per-workload half is check 6 (replica
+            // lockstep); here only "read by nothing" is reported, so one
+            // defect never fires two rules.
+            report.hits.extend(unconsumed_overlay_hits(
+                dir,
+                &patch,
+                &base_keys,
+                consumers.iter().map(|w| (&w.path, &w.key_refs)),
+                false,
+            ));
+        } else if shared.generators.contains_key(cm) {
+            shared_use.overlay_patches.push(patch);
+        } else {
+            report.hits.push(Hit {
+                rule_id: OVERLAY_CONFIGMAP_NOT_IN_BASE_RULE_ID,
+                detail: format!(
+                    "{dir}: overlay patch sets keys on ConfigMap {cm:?}, which is neither this base's own nor a shared generator"
+                ),
+                file: patch.file.clone(),
+            });
+        }
+    }
+    // Record this service's consumers of SHARED maps, per workload, for the
+    // cross-base overlay pass.
+    for w in &discovered.workloads {
+        let shared_refs: BTreeSet<(String, String)> = w
+            .key_refs
+            .iter()
+            .filter(|(n, _)| is_shared(n))
+            .cloned()
+            .collect();
+        if !shared_refs.is_empty() {
+            shared_use.consumers.push((w.path.clone(), shared_refs));
+        }
+    }
     Ok(())
+}
+
+/// Check 6 for one ConfigMap name within one service: every reader (a
+/// workload with a `configMapKeyRef` naming it, not using `envFrom`) must read
+/// the union of keys its siblings read, and all readers of a key must agree on
+/// `optional:`. Deterministic: a missing key is one hit on each lacking
+/// workload; an `optional:` disagreement is one hit on each workload in the
+/// minority (on a tie, the HARD refs — a rollback to a ConfigMap without the
+/// key fails those pods only).
+fn lockstep_hits(dir: &str, name: &str, workloads: &[Workload]) -> Vec<Hit> {
+    let readers: Vec<&Workload> = workloads
+        .iter()
+        .filter(|w| !w.uses_env_from && w.key_refs.iter().any(|(n, _)| n == name))
+        .collect();
+    let mut hits = Vec::new();
+    if readers.len() < 2 {
+        return hits;
+    }
+    let union: BTreeSet<&str> = readers
+        .iter()
+        .flat_map(|w| {
+            w.key_refs
+                .iter()
+                .filter(|(n, _)| n == name)
+                .map(|(_, k)| k.as_str())
+        })
+        .collect();
+    for key in union {
+        let pair = (name.to_string(), key.to_string());
+        let (having, lacking): (Vec<&&Workload>, Vec<&&Workload>) =
+            readers.iter().partition(|w| w.key_refs.contains(&pair));
+        for w in lacking {
+            hits.push(Hit {
+                rule_id: CONFIGMAP_REFS_NOT_IN_LOCKSTEP_RULE_ID,
+                detail: format!(
+                    "{dir}: this workload reads ConfigMap {name:?} but not {key:?}, which a sibling workload of the same service reads — the two pods run different values (add the ref here, with the same `optional:` as the sibling)"
+                ),
+                file: w.path.clone(),
+            });
+        }
+        let (optional, hard): (Vec<&&Workload>, Vec<&&Workload>) =
+            having.iter().partition(|w| w.optional_refs.contains(&pair));
+        if !optional.is_empty() && !hard.is_empty() {
+            let minority = if optional.len() < hard.len() {
+                optional
+            } else {
+                hard
+            };
+            for w in minority {
+                hits.push(Hit {
+                    rule_id: CONFIGMAP_REFS_NOT_IN_LOCKSTEP_RULE_ID,
+                    detail: format!(
+                        "{dir}: this workload's ref to {key:?} in ConfigMap {name:?} disagrees on `optional:` with its sibling(s) — on a rollback to a ConfigMap without the key one pod starts and the other fails CreateContainerConfigError (make `optional:` the same on every replica)"
+                    ),
+                    file: w.path.clone(),
+                });
+            }
+        }
+    }
+    hits
+}
+
+/// Check 5's verdict for one overlay patch.
+///
+/// - A key the BASE ConfigMap already declares (the overlay changes its
+///   VALUE): every workload that reads it in the base receives the new value,
+///   and which workloads read a base key is the base's decision (a shared
+///   profile key MC reads and MH does not is legitimate). So it only needs
+///   SOME consumer.
+/// - A key ONLY the overlay supplies (the base leaves it unset): only when
+///   `per_workload` (shared generators, across bases; within a service this
+///   duty is check 6) EVERY workload consuming that ConfigMap must read it —
+///   one hit per consuming workload that lacks it, pointing at THAT
+///   workload's file.
+///
+/// No reader at all is one hit on the patch. `per_workload` is `false`
+/// within one service: that duty belongs to check 6 (replica lockstep) —
+/// do not re-enable it there, or one defect fires two rules.
+fn unconsumed_overlay_hits<'a>(
+    base: &str,
+    patch: &OverlayCmPatch,
+    base_keys: &BTreeSet<String>,
+    consumers: impl Iterator<Item = (&'a PathBuf, &'a BTreeSet<(String, String)>)>,
+    per_workload: bool,
+) -> Vec<Hit> {
+    let consumers: Vec<_> = consumers.collect();
+    let cm = &patch.cm_name;
+    let mut hits = Vec::new();
+    for key in &patch.keys {
+        let read_by_some = consumers
+            .iter()
+            .any(|(_, refs)| refs.contains(&(cm.clone(), key.clone())));
+        if base_keys.contains(key) && read_by_some {
+            continue;
+        }
+        if !read_by_some {
+            hits.push(Hit {
+                rule_id: OVERLAY_CONFIGMAP_KEY_UNCONSUMED_RULE_ID,
+                detail: format!(
+                    "{base}: overlay patch sets {key:?} on ConfigMap {cm:?}, but no workload has a configMapKeyRef for it — the override reaches the ConfigMap and is read by nothing"
+                ),
+                file: patch.file.clone(),
+            });
+            continue;
+        }
+        if !per_workload {
+            continue;
+        }
+        for (path, refs) in &consumers {
+            if !refs.contains(&(cm.clone(), key.clone())) {
+                hits.push(Hit {
+                    rule_id: OVERLAY_CONFIGMAP_KEY_UNCONSUMED_RULE_ID,
+                    detail: format!(
+                        "{base}: overlay patch {} sets {key:?} on ConfigMap {cm:?}, which this workload consumes WITHOUT a configMapKeyRef for {key:?} — this pod runs a different value than its siblings (add the ref to EVERY consuming workload, `optional: true` if the base leaves the key unset; never remove the overlay key to clear this)",
+                        patch.file.display()
+                    ),
+                    file: (*path).clone(),
+                });
+            }
+        }
+    }
+    hits
+}
+
+/// Check 5 for SHARED generators, across every base (the per-key rule of
+/// [`unconsumed_overlay_hits`], with consumers drawn from every base).
+fn shared_overlay_hits(shared: &SharedGeneratorIndex, used: &SharedUse) -> Vec<Hit> {
+    if used.suppress_all {
+        return Vec::new();
+    }
+    let mut hits = Vec::new();
+    for patch in &used.overlay_patches {
+        let cm = patch.cm_name.as_str();
+        if used.ambiguous.contains(cm) {
+            continue;
+        }
+        let Some(generator) = shared.generators.get(cm) else {
+            continue;
+        };
+        hits.extend(unconsumed_overlay_hits(
+            &generator.base,
+            patch,
+            &generator.keys,
+            used.consumers
+                .iter()
+                .filter(|(_, refs)| refs.iter().any(|(n, _)| n == cm))
+                .map(|(p, refs)| (p, refs)),
+            // Across bases there is no replica relation (check 6 is per
+            // service), so the per-workload half lives here.
+            true,
+        ));
+    }
+    hits
+}
+
+/// One overlay ConfigMap patch document: the patch file, the ConfigMap it
+/// names, and the `data:` keys it sets.
+#[derive(Debug, Clone)]
+struct OverlayCmPatch {
+    file: PathBuf,
+    cm_name: String,
+    keys: BTreeSet<String>,
+}
+
+/// Kustomization stanzas that can add ConfigMap keys in a form check 5 does
+/// not parse. Their presence in an overlay is a fail-loud
+/// [`UNSUPPORTED_CONFIGMAP_PATCH_FORM_RULE_ID`] hit (none exist today).
+const UNSUPPORTED_OVERLAY_STANZAS: &[&str] = &[
+    "configMapGenerator",
+    "patchesStrategicMerge",
+    "patchesJson6902",
+];
+
+/// Whether a `patches:` entry may touch a ConfigMap: it targets ConfigMap, or
+/// it has no `target:` (the patch documents name their own kinds).
+fn may_target_configmap(entry: &Value) -> bool {
+    match entry.get("target").and_then(|t| t.get("kind")) {
+        None => true,
+        Some(k) => k.as_str() == Some(CONFIGMAP_KIND),
+    }
+}
+
+/// Every overlay of `base`:
+/// `infra/kubernetes/overlays/<overlay>/services/<base>/kustomization.yaml`.
+/// Returns the ConfigMap documents of its `patches:` `path:` files. Every
+/// shape that could add ConfigMap keys but is not parsed here — an inline
+/// `patch:`, an unreadable `path:`, a kindless (JSON6902) patch document that
+/// may target a ConfigMap, or a `configMapGenerator` / `patchesStrategicMerge`
+/// / `patchesJson6902` stanza — is an
+/// [`UNSUPPORTED_CONFIGMAP_PATCH_FORM_RULE_ID`] hit, never a silent skip.
+///
+/// A missing overlays root is "no overlays" (`NotFound` only — fixtures have
+/// none); any other IO error propagates. The real-tree positive control is
+/// `the_real_tree_overlay_patches_are_read`.
+fn overlay_configmap_patches(
+    repo_root: &Path,
+    base: &str,
+    report: &mut Report,
+) -> Result<Vec<OverlayCmPatch>> {
+    let overlays_root = repo_root.join(INFRA_OVERLAYS_DIR);
+    let mut out = Vec::new();
+    let entries = match std::fs::read_dir(&overlays_root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", overlays_root.display())),
+    };
+    let mut overlay_dirs: Vec<PathBuf> = Vec::new();
+    for entry in entries {
+        let path = entry
+            .with_context(|| format!("reading entry in {}", overlays_root.display()))?
+            .path();
+        if path.is_dir() {
+            overlay_dirs.push(path);
+        }
+    }
+    overlay_dirs.sort();
+    let unsupported = |report: &mut Report, file: &Path, detail: String| {
+        report.hits.push(Hit {
+            rule_id: UNSUPPORTED_CONFIGMAP_PATCH_FORM_RULE_ID,
+            detail,
+            file: file.to_path_buf(),
+        });
+    };
+    for overlay in overlay_dirs {
+        let svc = overlay.join("services").join(base);
+        let kustomization = svc.join("kustomization.yaml");
+        if !kustomization.is_file() {
+            continue;
+        }
+        let rel_k = kustomization
+            .strip_prefix(repo_root)
+            .unwrap_or(&kustomization)
+            .to_path_buf();
+        let raw = std::fs::read_to_string(&kustomization)
+            .with_context(|| format!("reading {}", kustomization.display()))?;
+        let doc: Value = serde_norway::from_str(&raw)
+            .map_err(|e| anyhow::anyhow!("parsing YAML in {}: {e}", rel_k.display()))?;
+        for stanza in UNSUPPORTED_OVERLAY_STANZAS {
+            if doc.get(*stanza).is_some() {
+                unsupported(
+                    report,
+                    &rel_k,
+                    format!("{base}: overlay uses `{stanza}:`, which can add ConfigMap keys in a form env-config check 5 does not parse"),
+                );
+            }
+        }
+        let Some(patches) = doc.get("patches").and_then(Value::as_sequence) else {
+            continue;
+        };
+        for entry in patches {
+            let Some(path) = entry.get("path").and_then(Value::as_str) else {
+                if may_target_configmap(entry) {
+                    unsupported(
+                        report,
+                        &rel_k,
+                        format!("{base}: overlay `patches:` entry has no `path:` (an inline patch) and may target a ConfigMap; check 5 cannot audit it"),
+                    );
+                }
+                continue;
+            };
+            let patch_file = svc.join(path);
+            let rel_p = patch_file
+                .strip_prefix(repo_root)
+                .unwrap_or(&patch_file)
+                .to_path_buf();
+            let rel_str = rel_p.to_string_lossy().into_owned();
+            let parsed = resolve_cited_path(repo_root, &rel_str)
+                .and_then(|_| std::fs::read_to_string(&patch_file).ok())
+                .and_then(|raw| parse_docs(&raw).ok());
+            let Some(docs) = parsed else {
+                unsupported(
+                    report,
+                    &rel_k,
+                    format!("{base}: overlay patch {path:?} is missing, outside the repo, or not parseable YAML"),
+                );
+                continue;
+            };
+            for d in docs {
+                let kind = d.get("kind").and_then(Value::as_str);
+                match kind {
+                    Some(CONFIGMAP_KIND) => {
+                        if let Some(name) = metadata_name(&d) {
+                            out.push(OverlayCmPatch {
+                                file: rel_p.clone(),
+                                cm_name: name.to_string(),
+                                keys: configmap_keys(&d),
+                            });
+                        } else {
+                            unsupported(
+                                report,
+                                &rel_p,
+                                format!("{base}: overlay ConfigMap patch has no metadata.name"),
+                            );
+                        }
+                    }
+                    Some(_) => {}
+                    // No `kind` (e.g. a JSON6902 op list): its effect on a
+                    // ConfigMap is not parsed here.
+                    None if may_target_configmap(entry) => unsupported(
+                        report,
+                        &rel_p,
+                        format!("{base}: overlay patch {path:?} has a document without `kind` (a JSON6902 op list?) that may target a ConfigMap; check 5 cannot audit it"),
+                    ),
+                    None => {}
+                }
+            }
+        }
+    }
+    report.checked_overlay_configmap_patches += out.len();
+    Ok(out)
 }
 
 /// Record references to SHARED generators made by workloads in the
@@ -997,6 +1521,7 @@ fn collect_non_canonical_refs(
             let Some(pod) = pod_spec(&doc) else {
                 continue;
             };
+            let mut workload_refs: BTreeSet<(String, String)> = BTreeSet::new();
             for r in pod_configmap_refs(pod) {
                 let Some(name) = r.name.filter(|n| shared.generators.contains_key(*n)) else {
                     continue;
@@ -1004,6 +1529,7 @@ fn collect_non_canonical_refs(
                 match (r.kind, r.key) {
                     (ConfigMapRefKind::KeyRef, Some(key)) => {
                         shared_use.refs.insert((name.to_string(), key.to_string()));
+                        workload_refs.insert((name.to_string(), key.to_string()));
                     }
                     _ => {
                         shared_use.ambiguous.insert(name.to_string());
@@ -1016,6 +1542,9 @@ fn collect_non_canonical_refs(
                         });
                     }
                 }
+            }
+            if !workload_refs.is_empty() {
+                shared_use.consumers.push((rel.clone(), workload_refs));
             }
         }
     }
@@ -1152,8 +1681,11 @@ fn clean_outcome(report: &Report) -> Result<String> {
         anyhow::bail!("env-config-no-services-checked");
     }
     Ok(format!(
-        "env-config-clean-{}-services-{}-workloads-{}-configmaps",
-        report.checked_services, report.checked_workloads, report.checked_configmaps
+        "env-config-clean-{}-services-{}-workloads-{}-configmaps-{}-overlay-configmap-patches",
+        report.checked_services,
+        report.checked_workloads,
+        report.checked_configmaps,
+        report.checked_overlay_configmap_patches
     ))
 }
 
@@ -1533,6 +2065,355 @@ spec:
     }
 
     // -------------------------------------------------------------------------
+    // Check 5 — overlay ConfigMap patch keys must be consumed by EVERY
+    // consuming workload (and check 2's optional-ref acceptance of an
+    // overlay-only key).
+    // -------------------------------------------------------------------------
+
+    /// Write `services/<base>/kustomization.yaml` for the kind overlay with
+    /// `body`, plus any `(file, yaml)` patch files.
+    fn overlay(root: &std::path::Path, base: &str, body: &str, files: &[(&str, &str)]) {
+        let svc = root
+            .join(INFRA_OVERLAYS_DIR)
+            .join("kind/services")
+            .join(base);
+        std::fs::create_dir_all(&svc).expect("mkdir overlay");
+        std::fs::write(svc.join("kustomization.yaml"), body).expect("write overlay");
+        for (name, yaml) in files {
+            std::fs::write(svc.join(name), yaml).expect("write patch");
+        }
+    }
+
+    const ONE_PATCH: &str = "kind: Kustomization\npatches:\n  - path: cm-patch.yaml\n";
+
+    /// A Deployment reading `A` (hard) and, when `window`, `WINDOW` (optional)
+    /// from `mc-service-config`.
+    fn mc_deployment(name: &str, window: bool) -> String {
+        let mut d = deployment_ref(name, "mc-service-config", "A");
+        if window {
+            d.push_str(
+                "        - name: WINDOW\n          valueFrom:\n            configMapKeyRef:\n              name: mc-service-config\n              key: WINDOW\n              optional: true\n",
+            );
+        }
+        d
+    }
+
+    fn mc_two_pods(mc0_window: bool, mc1_window: bool) -> tempfile::TempDir {
+        let mc0 = mc_deployment("mc-0", mc0_window);
+        let mc1 = mc_deployment("mc-1", mc1_window);
+        let cm = configmap("mc-service-config", "A");
+        let td = fixture(&[(
+            "mc-service",
+            "",
+            &[
+                ("mc-0-deployment.yaml", &mc0),
+                ("mc-1-deployment.yaml", &mc1),
+                ("configmap.yaml", &cm),
+            ],
+        )]);
+        overlay(
+            td.path(),
+            "mc-service",
+            ONE_PATCH,
+            &[("cm-patch.yaml", &configmap("mc-service-config", "WINDOW"))],
+        );
+        td
+    }
+
+    /// Positive control: both pods consume the overlay key (optional, since
+    /// the base leaves it unset) — clean, and the patch was counted.
+    #[test]
+    fn an_overlay_key_every_consumer_reads_is_clean() {
+        let td = mc_two_pods(true, true);
+        let report = analyze(td.path()).expect("analyze");
+        assert!(report.hits.is_empty(), "hits: {:?}", report.hits);
+        assert_eq!(report.checked_overlay_configmap_patches, 1);
+    }
+
+    /// THE split: mc-0 reads the overlay-only key, mc-1 does not — exactly
+    /// ONE finding in total, on mc-1's file. Within one service the
+    /// per-workload half is check 6 (replica lockstep); check 5 does not also
+    /// fire, so one defect is one finding.
+    #[test]
+    fn an_overlay_key_one_of_two_replicas_lacks_is_one_finding_on_that_workload() {
+        let td = mc_two_pods(true, false);
+        let report = analyze(td.path()).expect("analyze");
+        assert_eq!(
+            report.hits.len(),
+            1,
+            "exactly one finding: {:?}",
+            report.hits
+        );
+        let hit = &report.hits[0];
+        assert_eq!(
+            hit.rule_id, CONFIGMAP_REFS_NOT_IN_LOCKSTEP_RULE_ID,
+            "{hit:?}"
+        );
+        assert!(hit.file.ends_with("mc-1-deployment.yaml"), "{hit:?}");
+        assert!(hit.detail.contains("WINDOW"));
+        assert!(run(td.path(), false).is_err());
+    }
+
+    /// G6-1: both replicas read the key but disagree on `optional:` — on a
+    /// rollback to a ConfigMap without it, one pod starts and one fails.
+    #[test]
+    fn replicas_disagreeing_on_optional_are_flagged() {
+        let mc0 = mc_deployment("mc-0", true);
+        let mut mc1 = mc_deployment("mc-1", false);
+        mc1.push_str(
+            "        - name: WINDOW\n          valueFrom:\n            configMapKeyRef:\n              name: mc-service-config\n              key: WINDOW\n",
+        );
+        let cm = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: mc-service-config\ndata:\n  A: \"1\"\n  WINDOW: \"30\"\n";
+        let td = fixture(&[(
+            "mc-service",
+            "",
+            &[
+                ("mc-0-deployment.yaml", &mc0),
+                ("mc-1-deployment.yaml", &mc1),
+                ("configmap.yaml", cm),
+            ],
+        )]);
+        let report = analyze(td.path()).expect("analyze");
+        let hits = hits_for(&report, CONFIGMAP_REFS_NOT_IN_LOCKSTEP_RULE_ID);
+        // A 1:1 tie flags the HARD ref (mc-1).
+        assert_eq!(hits.len(), 1, "hits: {:?}", report.hits);
+        assert!(
+            hits[0].file.ends_with("mc-1-deployment.yaml"),
+            "{:?}",
+            hits[0]
+        );
+        assert!(hits[0].detail.contains("optional"));
+    }
+
+    /// G6-2: lockstep also covers a SHARED map within one service (mc-0 reads
+    /// an optional profile key mc-1 does not) — and never across bases (MC
+    /// reads A, MH reads B: no lockstep finding).
+    #[test]
+    fn lockstep_covers_shared_maps_within_a_service_but_not_across_bases() {
+        let mc0 = profile_reader("mc-0", true);
+        let mc1 = profile_reader("mc-1", false);
+        let td = fixture(&[(
+            "mc-service",
+            "",
+            &[
+                ("mc-0-deployment.yaml", &mc0),
+                ("mc-1-deployment.yaml", &mc1),
+            ],
+        )]);
+        add_profile(td.path(), "MEDIA_X=1\nMEDIA_Z=2\n");
+        let report = analyze(td.path()).expect("analyze");
+        let hits = hits_for(&report, CONFIGMAP_REFS_NOT_IN_LOCKSTEP_RULE_ID);
+        assert_eq!(hits.len(), 1, "hits: {:?}", report.hits);
+        assert!(
+            hits[0].file.ends_with("mc-1-deployment.yaml"),
+            "{:?}",
+            hits[0]
+        );
+
+        // Cross-base control.
+        let mc = deployment_ref("mc-0", "media-codec-profile", "MEDIA_X");
+        let mh = deployment_ref("mh", "media-codec-profile", "MEDIA_Z");
+        let td = fixture(&[
+            ("mc-service", "", &[("mc-0-deployment.yaml", &mc)]),
+            ("mh-service", "", &[("deployment.yaml", &mh)]),
+        ]);
+        add_profile(td.path(), "MEDIA_X=1\nMEDIA_Z=2\n");
+        let report = analyze(td.path()).expect("analyze");
+        assert!(
+            hits_for(&report, CONFIGMAP_REFS_NOT_IN_LOCKSTEP_RULE_ID).is_empty(),
+            "hits: {:?}",
+            report.hits
+        );
+    }
+
+    /// No workload reads the overlay key at all (the Gate-2 defect): one hit,
+    /// on the patch.
+    #[test]
+    fn an_overlay_key_no_workload_reads_is_flagged_on_the_patch() {
+        let td = mc_two_pods(false, false);
+        let report = analyze(td.path()).expect("analyze");
+        let hits = hits_for(&report, OVERLAY_CONFIGMAP_KEY_UNCONSUMED_RULE_ID);
+        assert_eq!(hits.len(), 1, "hits: {:?}", report.hits);
+        assert!(hits[0].file.ends_with("cm-patch.yaml"), "{:?}", hits[0]);
+    }
+
+    /// Check 6: a BASE-declared optional key read by mc-0 but not mc-1 —
+    /// check 5's per-workload rule does not apply (the overlay only re-values
+    /// it), so replica lockstep is its own rule. Both reading it is clean.
+    #[test]
+    fn replicas_reading_different_keys_of_one_configmap_are_flagged() {
+        for (mc1_window, expected) in [(false, 1), (true, 0)] {
+            let mc0 = mc_deployment("mc-0", true);
+            let mc1 = mc_deployment("mc-1", mc1_window);
+            let cm = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: mc-service-config\ndata:\n  A: \"1\"\n  WINDOW: \"30\"\n";
+            let td = fixture(&[(
+                "mc-service",
+                "",
+                &[
+                    ("mc-0-deployment.yaml", &mc0),
+                    ("mc-1-deployment.yaml", &mc1),
+                    ("configmap.yaml", cm),
+                ],
+            )]);
+            let report = analyze(td.path()).expect("analyze");
+            let hits = hits_for(&report, CONFIGMAP_REFS_NOT_IN_LOCKSTEP_RULE_ID);
+            assert_eq!(
+                hits.len(),
+                expected,
+                "mc1_window={mc1_window} hits: {:?}",
+                report.hits
+            );
+            if expected == 1 {
+                assert!(
+                    hits[0].file.ends_with("mc-1-deployment.yaml"),
+                    "{:?}",
+                    hits[0]
+                );
+            }
+            assert!(
+                report.hits.len() == expected,
+                "no other finding: {:?}",
+                report.hits
+            );
+        }
+    }
+
+    /// The optional-ref acceptance is narrow: a key NEITHER the base nor any
+    /// overlay supplies is still `key_not_in_configmap` (a typo stays loud).
+    #[test]
+    fn an_optional_ref_to_a_key_nobody_supplies_is_still_flagged() {
+        let mut deploy = deployment_ref("mc-0", "mc-service-config", "A");
+        deploy.push_str(
+            "        - name: TYPO\n          valueFrom:\n            configMapKeyRef:\n              name: mc-service-config\n              key: TYPO\n              optional: true\n",
+        );
+        let td = fixture(&[(
+            "mc-service",
+            "",
+            &[
+                ("mc-0-deployment.yaml", &deploy),
+                ("configmap.yaml", &configmap("mc-service-config", "A")),
+            ],
+        )]);
+        let report = analyze(td.path()).expect("analyze");
+        assert_eq!(
+            hits_for(&report, KEY_NOT_IN_CONFIGMAP_RULE_ID).len(),
+            1,
+            "hits: {:?}",
+            report.hits
+        );
+    }
+
+    /// An overlay patch on a ConfigMap neither local nor shared is a hit.
+    #[test]
+    fn an_overlay_patch_on_an_unknown_configmap_is_flagged() {
+        let td = fixture(&[]);
+        overlay(
+            td.path(),
+            "mc-service",
+            ONE_PATCH,
+            &[("cm-patch.yaml", &configmap("nobody-config", "X"))],
+        );
+        let report = analyze(td.path()).expect("analyze");
+        assert_eq!(
+            hits_for(&report, OVERLAY_CONFIGMAP_NOT_IN_BASE_RULE_ID).len(),
+            1,
+            "hits: {:?}",
+            report.hits
+        );
+    }
+
+    fn assert_unsupported(td: &tempfile::TempDir) {
+        let report = analyze(td.path()).expect("analyze");
+        assert_eq!(
+            hits_for(&report, UNSUPPORTED_CONFIGMAP_PATCH_FORM_RULE_ID).len(),
+            1,
+            "hits: {:?}",
+            report.hits
+        );
+        let err = run(td.path(), false).expect_err("must fail");
+        assert_eq!(
+            crate::common::status::reason_token(&err),
+            "env-config-unsupported-configmap-patch-form-1-of-1-findings"
+        );
+    }
+
+    /// Fail-loud shapes: an inline patch that may target a ConfigMap…
+    #[test]
+    fn an_inline_configmap_patch_is_unsupported() {
+        let td = fixture(&[]);
+        overlay(
+            td.path(),
+            "mc-service",
+            "kind: Kustomization\npatches:\n  - patch: |-\n      - op: add\n        path: /data/X\n        value: \"1\"\n    target:\n      kind: ConfigMap\n",
+            &[],
+        );
+        assert_unsupported(&td);
+    }
+
+    /// …a `path:` file holding a kindless JSON6902 op list targeting a
+    /// ConfigMap…
+    #[test]
+    fn a_json6902_configmap_patch_file_is_unsupported() {
+        let td = fixture(&[]);
+        overlay(
+            td.path(),
+            "mc-service",
+            "kind: Kustomization\npatches:\n  - path: ops.yaml\n    target:\n      kind: ConfigMap\n      name: mc-service-config\n",
+            &[("ops.yaml", "- op: add\n  path: /data/X\n  value: \"1\"\n")],
+        );
+        assert_unsupported(&td);
+    }
+
+    /// …and a `configMapGenerator` stanza in an overlay.
+    #[test]
+    fn an_overlay_configmap_generator_is_unsupported() {
+        let td = fixture(&[]);
+        overlay(
+            td.path(),
+            "mc-service",
+            "kind: Kustomization\nconfigMapGenerator:\n  - name: mc-service-config\n    behavior: merge\n    literals:\n      - X=1\n",
+            &[],
+        );
+        assert_unsupported(&td);
+    }
+
+    /// A non-ConfigMap patch (e.g. a NetworkPolicy) is out of scope — no hit.
+    #[test]
+    fn a_non_configmap_patch_is_ignored() {
+        let td = fixture(&[]);
+        overlay(
+            td.path(),
+            "mc-service",
+            "kind: Kustomization\npatches:\n  - path: np.yaml\n    target:\n      kind: NetworkPolicy\n",
+            &[("np.yaml", "- op: add\n  path: /spec/x\n  value: 1\n")],
+        );
+        let report = analyze(td.path()).expect("analyze");
+        assert!(report.hits.is_empty(), "hits: {:?}", report.hits);
+    }
+
+    /// The real tree: the overlay readers DID see the MC join-window patch and
+    /// the shared codec-profile patch (a coverage signal distinct from any
+    /// content hit — `OVERLAY-COVERAGE-ABSENT`).
+    #[test]
+    fn the_real_tree_overlay_patches_are_read() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut report = Report::default();
+        let mc = overlay_configmap_patches(&root, "mc-service", &mut report).expect("read");
+        assert!(
+            mc.iter().any(|p| p.cm_name == "mc-service-config"
+                && p.keys.contains("MC_MEETING_JOIN_WINDOW_SECONDS")),
+            "OVERLAY-COVERAGE-ABSENT: the kind mc-service join-window patch was not read: {mc:?}"
+        );
+        let profile =
+            overlay_configmap_patches(&root, "media-codec-profile", &mut report).expect("read");
+        assert!(
+            !profile.is_empty(),
+            "OVERLAY-COVERAGE-ABSENT: the kind media-codec-profile patch was not read"
+        );
+        assert!(report.hits.is_empty(), "hits: {:?}", report.hits);
+    }
+
+    // -------------------------------------------------------------------------
     // Check 4 — configMapKeyRef.key must equal the env var name.
     // -------------------------------------------------------------------------
 
@@ -1701,8 +2582,15 @@ spec:
             crossed[0].detail
         );
         // mh-b no longer reads the VIDEO key, but mh-a still does, so no
-        // orphan: the only finding is the crossed ref.
-        assert_eq!(report.hits.len(), 1, "hits: {:?}", report.hits);
+        // orphan. Check 6 (replica lockstep) independently sees the same
+        // drift from the other side — mh-b reads mh-service-config without
+        // the VIDEO key its sibling reads — and ALSO blames mh-b. Exactly
+        // these two findings, both on the drifted instance.
+        let lockstep = hits_for(&report, CONFIGMAP_REFS_NOT_IN_LOCKSTEP_RULE_ID);
+        assert_eq!(lockstep.len(), 1, "hits: {:?}", report.hits);
+        assert!(lockstep[0].file.ends_with("mh-b-deployment.yaml"));
+        assert!(lockstep[0].detail.contains("MH_STREAM_COST_VIDEO_BPS"));
+        assert_eq!(report.hits.len(), 2, "hits: {:?}", report.hits);
     }
 
     // -------------------------------------------------------------------------
@@ -1981,6 +2869,10 @@ spec:
             DUPLICATE_CONFIGMAP_NAME_RULE_ID,
             CONFIGMAP_NAME_AMBIGUOUS_ACROSS_BASES_RULE_ID,
             CONFIGMAP_KEY_NAME_MISMATCH_RULE_ID,
+            OVERLAY_CONFIGMAP_KEY_UNCONSUMED_RULE_ID,
+            UNSUPPORTED_CONFIGMAP_PATCH_FORM_RULE_ID,
+            OVERLAY_CONFIGMAP_NOT_IN_BASE_RULE_ID,
+            CONFIGMAP_REFS_NOT_IN_LOCKSTEP_RULE_ID,
         ] {
             assert!(
                 RULE_PRECEDENCE.iter().any(|(r, _)| *r == id),
@@ -2370,12 +3262,13 @@ spec:
             checked_services: 4,
             checked_workloads: 6,
             checked_configmaps: 8,
+            checked_overlay_configmap_patches: 3,
             hits: Vec::new(),
         };
         let token = clean_outcome(&measured).expect("clean run yields a token");
         assert_eq!(
             token,
-            "env-config-clean-4-services-6-workloads-8-configmaps"
+            "env-config-clean-4-services-6-workloads-8-configmaps-3-overlay-configmap-patches"
         );
     }
 
@@ -2670,6 +3563,85 @@ data:
             orphans[0].file,
             PathBuf::from("infra/services/media-codec-profile/profile.env")
         );
+    }
+
+    /// A Deployment reading `MEDIA_X` (hard) from the profile and, when
+    /// `overlay_key`, `MEDIA_Z` (optional — only the overlay supplies it).
+    fn profile_reader(name: &str, overlay_key: bool) -> String {
+        let mut d = deployment_ref(name, "media-codec-profile", "MEDIA_X");
+        if overlay_key {
+            d.push_str(
+                "        - name: MEDIA_Z\n          valueFrom:\n            configMapKeyRef:\n              name: media-codec-profile\n              key: MEDIA_Z\n              optional: true\n",
+            );
+        }
+        d
+    }
+
+    /// Check 5 on a SHARED generator, across bases. An OVERLAY-ONLY key
+    /// (MEDIA_Z) must be read by every consumer of the profile: MC reads it,
+    /// MH does not → one hit, on MH's workload; both reading it is clean.
+    #[test]
+    fn a_shared_overlay_only_key_one_consumer_lacks_is_flagged_on_that_workload() {
+        for (mh_reads, expected) in [(false, 1), (true, 0)] {
+            let mc = profile_reader("mc-0", true);
+            let mh = profile_reader("mh", mh_reads);
+            let td = fixture(&[
+                ("mc-service", "", &[("mc-0-deployment.yaml", &mc)]),
+                ("mh-service", "", &[("deployment.yaml", &mh)]),
+            ]);
+            add_profile(td.path(), "MEDIA_X=1\n");
+            overlay(
+                td.path(),
+                "media-codec-profile",
+                ONE_PATCH,
+                &[(
+                    "cm-patch.yaml",
+                    &configmap("media-codec-profile", "MEDIA_Z"),
+                )],
+            );
+            let report = analyze(td.path()).expect("analyze");
+            let hits = hits_for(&report, OVERLAY_CONFIGMAP_KEY_UNCONSUMED_RULE_ID);
+            assert_eq!(
+                hits.len(),
+                expected,
+                "mh_reads={mh_reads} hits: {:?}",
+                report.hits
+            );
+            if expected == 1 {
+                assert!(
+                    hits[0].file.ends_with("mh-service/deployment.yaml"),
+                    "{:?}",
+                    hits[0]
+                );
+            }
+            assert_eq!(report.checked_overlay_configmap_patches, 1);
+        }
+    }
+
+    /// A BASE-declared shared key the overlay re-values (the real test codec
+    /// profile) needs only SOME reader: which workloads read a base key is the
+    /// base's decision (MC reads it, MH legitimately does not) — clean. With no
+    /// reader at all it is one hit on the patch.
+    #[test]
+    fn a_shared_overlay_revalued_base_key_needs_only_some_reader() {
+        let mc = deployment_ref("mc-0", "media-codec-profile", "MEDIA_X");
+        let mh = deployment_ref("mh", "media-codec-profile", "MEDIA_Y");
+        let td = fixture(&[
+            ("mc-service", "", &[("mc-0-deployment.yaml", &mc)]),
+            ("mh-service", "", &[("deployment.yaml", &mh)]),
+        ]);
+        add_profile(td.path(), "MEDIA_X=1\nMEDIA_Y=2\n");
+        overlay(
+            td.path(),
+            "media-codec-profile",
+            ONE_PATCH,
+            &[(
+                "cm-patch.yaml",
+                &configmap("media-codec-profile", "MEDIA_X"),
+            )],
+        );
+        let report = analyze(td.path()).expect("analyze");
+        assert!(report.hits.is_empty(), "hits: {:?}", report.hits);
     }
 
     #[test]

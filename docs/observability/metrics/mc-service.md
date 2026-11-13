@@ -22,7 +22,41 @@ All MC service metrics follow ADR-0011 naming conventions with the `mc_` prefix.
 - **Description**: Number of active meetings hosted by this MC instance
 - **Labels**: None
 - **Usage**: Monitor meeting load and capacity utilization
+- **Counted from ASSIGNMENT, not from the first join**: GC's assignment creates the meeting actor, so a meeting nobody has joined yet is counted. MC never holds a meeting this gauge does not show. A never-joined meeting leaves at its join window (`mc_meeting_join_window_seconds`): MC ends a never-joined meeting AT the window (an exact deadline); an observer should allow up to one `LIFETIME_TICK` of tolerance and can check `age_ms` on the end line. A joined one leaves the moment its last participant does. **A floor that persists with zero connections for longer than the join window + one `LIFETIME_TICK` is a DEFECT** (a meeting-lifecycle leak, `MCLowConnectionCount`), never a "normal idle level".
 - **Dashboard**: MC Overview - Active Meetings gauge
+
+### `mc_meetings_ended_total`
+- **Type**: Counter
+- **Description**: Meetings that ENDED, recorded once per meeting at the controller's reap, from the same value as the controller's "Meeting ended; releasing it on its media handlers" INFO line (which carries the same `cause` and `reason`)
+- **Labels**:
+  - `cause`: `MeetingEndCause::label()` — `empty`, `closed`
+  - `reason`: `MeetingEndCause::reason_label()` — for `empty`: `last_participant_left` (the last roster participant was removed: clean leave, clean close, or grace expiry) or `join_window_expired` (nobody was admitted within the join window); for `closed`: `closed`
+- **Cardinality**: the pairs of `MeetingEndCause::COUNTED` — `empty/last_participant_left`, `empty/join_window_expired`, `closed/closed`; zero-initialised from that list
+- **MC shutdown is NOT a meeting end and is not counted**: the meeting is not over and GC is not told. Do not add a `shutdown` series or sum this counter as "meetings over" across a deploy.
+- **No `key_custody`** (not a media-path family) and **no alert**: join-window ends are expected (GC-only joins, abandoned joins, a GC join whose client never connects). Its job is to make the never-joined class countable, where before it was only an unexplained floor on `mc_meetings_active`.
+- **Reading it**: a rising `join_window_expired` share relative to `last_participant_left` means GC joins are not turning into MC joins. If it coincides with `MCJoinsNotReachingMC`, the browser → MC path is down; otherwise suspect a client defect. See `mc-incident-response.md` Scenario 31.
+- **Recorded in**: `actors/controller.rs::reap_ended` via `observability/metrics.rs::record_meeting_ended`, only for an actor actually reaped, so the fence-backstop path can neither skip nor double-count a meeting
+- **Dashboard**: MC Overview - Meetings Ended by Cause
+
+### `mc_meeting_join_window_seconds`
+- **Type**: Gauge
+- **Description**: CONFIG ECHO of `MC_MEETING_JOIN_WINDOW_SECONDS` as the meeting actors enforce it, set once at boot from the same `MeetingTimers` every meeting actor receives (`Config::meeting_timers`), so published and enforced cannot drift
+- **Labels**: None (cardinality 1)
+- **Semantics**: a meeting no participant is admitted to within this long of its creation (GC's assignment) ends through the same path as an emptied meeting (`cause="empty"`, `reason="join_window_expired"`; handlers released if any were programmed, KEK dropped, GC notified after release). It is enforced as an EXACT deadline from creation (not a polling tick); an observer checks the end against window ≤ age ≤ window + one `LIFETIME_TICK` (the task's tolerance). MC logs the meeting's age on its MONOTONIC clock with the end: `age_ms` (plus `window_seconds`, `lifetime_tick_ms`) on the actor's "No participant joined within the join window; ending the meeting" line, and `age_ms` on the controller's "Meeting ended" line. Check the end against `age_ms`, never wall-clock log timestamps: on a host whose wall clock steps (WSL2 in Kind) those can disagree with the monotonic deadline by seconds. A parked first join is already on the roster and keeps the meeting. Only a successful admission disarms the window; a refused connect or join never moves it.
+- **Configured values**: set explicitly per environment — production in `infra/services/mc-service/config.env`, Kind in `infra/kubernetes/overlays/kind/services/mc-service/configmap-join-window-patch.yaml` (operator direction 2026-11-13: short enough that an abandoned GC join holds MC capacity and its GC row only briefly, well above a real client's GC-join → MC-admission latency); read the live value from this gauge. Keep the window well above the p99 client GC-join → MC-admission latency: a client that is consistently slower than the window fails every retry, because each SDK retry gets a FRESH meeting with the SAME window. Symptom: `join_window_expired` rising together with `mc_session_join_failures_total{error_type=meeting_not_found|teardown_in_progress}`. Remedy: raise the window.
+- **Fallback (key unset) — DERIVED, and also the maximum**: `common::meeting_token::MEETING_TOKEN_MAX_TTL_SECONDS` + `common::jwt::JWT_EXP_LEEWAY_SECONDS` + `SDK_JOIN_DEADLINE` (`crates/mc-service/src/actors/meeting_timers.rs::MAX_JOIN_WINDOW`; 975 s with today's constants). Why: GC assigns the meeting and then mints the assigning joiner's token. MC accepts that token until `iat + TTL + exp leeway`, and the joiner then has at most the SDK's join deadline to be admitted. Past that, no credential issued at assignment can still produce a participant, so a meeting that is still empty can only be a leak. A larger value would only re-open the leak, so it is also the ceiling.
+- **Floor**: `LIFETIME_TICK` (`crates/mc-service/src/actors/meeting_timers.rs::MIN_JOIN_WINDOW`). The window is not a join-correctness bound: a parked first join is already on the roster (so the park is not exposed), and a join that loses the GC-join → MC-admission race is refused `meeting_not_found` / `teardown_in_progress` (keyless) and the SDK re-joins through GC with a fresh assignment. The window is enforced as an EXACT deadline; `LIFETIME_TICK` is only the observer tolerance the end is checked against ("window + one tick"), so a window below it could not be told apart from a much later end, and 0 / sub-tick is the degenerate configuration. Values outside [floor, ceiling], or unparseable, refuse boot.
+- **Assumes AC's and MC's wall clocks are synced**: `exp` is set on AC's clock and checked on MC's. If AC runs ahead, a token can outlive the window by the skew. The result is a refused join that the SDK's GC re-join recovers. Do NOT "fix" a skew-induced refusal by adding `DEFAULT_CLOCK_SKEW` to the default.
+- **Late joiners**: GC's reuse path does not tell MC about a later GC join, so a user who GC-joins a never-joined meeting and reaches MC after its window gets `meeting_not_found` or `teardown_in_progress`. The SDK re-runs the GC join (bounded, `JOIN_RETRY`), which re-assigns once GC has processed `NotifyMeetingEnded`. Residual: with a slow or unreachable MH, the refusal lasts until teardown completes (up to `teardown_fence_hold_max_seconds`, MC's startup line), the bounded retries run out, and the user must join again.
+- **Recorded in**: `main.rs` via `observability/metrics.rs::set_meeting_timers`
+- **Dashboard**: MC Overview - Meeting Join Window
+
+### `mc_meeting_disconnect_grace_seconds`
+- **Type**: Gauge
+- **Description**: CONFIG ECHO of `MC_DISCONNECT_GRACE_PERIOD_SECONDS` (ADR-0023; default 30) as every meeting actor enforces it — how long an abruptly disconnected participant stays on the roster for a reconnect. Same boot-time source as `mc_meeting_join_window_seconds`.
+- **Labels**: None (cardinality 1)
+- **Recorded in**: `main.rs` via `observability/metrics.rs::set_meeting_timers`
+- **Dashboard**: MC Overview - Disconnect Grace
 
 ---
 
@@ -77,7 +111,7 @@ All MC service metrics follow ADR-0011 naming conventions with the `mc_` prefix.
 
 ### `mc_gc_notify_meeting_ended_total`
 - **Type**: Counter
-- **Description**: `NotifyMeetingEnded` calls to GC — MC telling GC a meeting ENDED (emptied or closed) after its handlers were released (ADR-0010 §3)
+- **Description**: `NotifyMeetingEnded` calls to GC — MC telling GC a meeting ENDED (emptied — last participant left OR nobody joined within the join window — or closed) after its handlers were released (ADR-0010 §3). A never-joined meeting never registered on any MH, so its "release" is empty and the notify follows its teardown at once.
 - **Labels**:
   - `status`: `success`, `error`
 - **Cardinality**: 2; zero-initialised
@@ -194,7 +228,7 @@ All MC service metrics follow ADR-0011 naming conventions with the `mc_` prefix.
 - **Cardinality**: Low (2 status values)
 - **Usage**: Monitor join latency, identify slow joins. Extended to 5s because join includes actor processing.
 - **Mixes two populations since story 2 task 12.** A join whose meeting id is still being torn down on its media handlers can be PARKED behind the controller's teardown fence and served when the teardown completes: up to `teardown_fence_hold_max_seconds` later (MC's startup line), far past the top bucket, so those observations land in `+Inf`. A p99 excursion here is therefore either "MC is slow" or "one meeting's teardown wedged and its rejoins were parked". Separate them with `mc_media_push_quiesce_total{outcome="timed_out"}`, `mc_media_teardown_fence_backstop_total` and `mc_session_join_failures_total{error_type="teardown_in_progress"}` (the parked-queue overflow), all of which move only in the second case. The buckets are deliberately unchanged: this histogram backs the MC session-join SLO (`docs/observability/slos.md`), and re-bucketing would break burn-rate comparability. The parked population is bounded and rare (a rejoin during teardown normally reaches GC's live row and fails `meeting_not_found` instead), so it cannot move a 30-day p99 objective.
-- **A third population since story 4 MC-A: first-join parking (register before token, ADR-0039 §3).** Every join admitted before a meeting's initial media handlers have a `RegisterMeeting` verdict has its JoinResponse PARKED until every initial handler has acked or failed, or until the 8 s park deadline (`actors/join_park.rs::FIRST_JOIN_PARK_DEADLINE`, kept below the SDK's 15 s join deadline by a drift test). Normally that costs one in-cluster MC→MH round trip. Worst case is the deadline, which sits above the top 5 s bucket, so a deadline release lands in `+Inf`; a failing-but-answering MH releases after the pusher's retries (about 3 s plus RPC time). A p99 excursion from a dead or hung initial MH coincides with the WARN `Parked joins released without every initial media handler registered` (`release_reason` = `verdicts` | `deadline`, `unacked_handler_ids`) and the pusher's `RegisterMeeting retries exhausted` / `failed terminally` lines and non-`match` `mc_media_policy_pushes_total`. A parked join answered because its meeting ended is a `failure` with `error_type="draining"`, the existing value. The buckets are deliberately unchanged, for the same burn-rate reason.
+- **A third population since story 4 MC-A: first-join parking (register before token, ADR-0039 §3).** Every join admitted before a meeting's initial media handlers have a `RegisterMeeting` verdict has its JoinResponse PARKED until every initial handler has acked or failed, or until the 8 s park deadline (`actors/join_park.rs::FIRST_JOIN_PARK_DEADLINE`, kept below the SDK's 15 s join deadline by a drift test). Normally that costs one in-cluster MC→MH round trip. Worst case is the deadline, which sits above the top 5 s bucket, so a deadline release lands in `+Inf`; a failing-but-answering MH releases after the pusher's retries (about 3 s plus RPC time). A p99 excursion from a dead or hung initial MH coincides with the WARN `Parked joins released without every initial media handler registered` (`release_reason` = `verdicts` | `deadline`, `unacked_handler_ids`) and the pusher's `RegisterMeeting retries exhausted` / `failed terminally` lines and non-`match` `mc_media_policy_pushes_total`. A parked join answered because its meeting ENDED (last leave, join window, close) is a `failure` with `error_type="teardown_in_progress"` (since the join-window devloop; the SDK re-joins through GC on it); `draining` is only for a parked join answered at MC-wide shutdown. The buckets are deliberately unchanged, for the same burn-rate reason.
 - **Recorded in**: `connection.rs` measuring full join flow
 - **Alert**: `MCHighJoinLatency` (info, p95 >2s for 5m, success only)
 - **Dashboard**: MC Overview - Session Join Latency (P50/P95/P99) (Join Flow row)
@@ -226,6 +260,19 @@ All MC service metrics follow ADR-0011 naming conventions with the `mc_` prefix.
     Rising together with `mc_media_push_quiesce_total{outcome="timed_out"}` is the signature of a
     wedged teardown (see the EndMeeting scenario in `docs/runbooks/mc-incident-response.md`). The
     WIRE code is the same `CONFLICT` as `conflict` — only this operator-facing label splits them.
+    **Since the join-window devloop it also covers every join that reaches a meeting which is
+    ENDING** (the actor decided to end — last leave, join window, close — but has not exited, or
+    has exited and the join hit its closed mailbox or dropped reply). Those were `draining` or
+    `internal` before. `draining` now means MC-wide shutdown only, and `internal` is no longer
+    emitted for an ended meeting. An actor PANIC also surfaces here for a join that hits it; the
+    panic itself is counted on `mc_actor_panics_total`.
+  - `meeting_not_found` / `teardown_in_progress` **are retried by the SDK** (join-window devloop):
+    on either, `MeetingSession.join()` re-runs GC `joinMeeting` (bounded, `JOIN_RETRY`: 4 attempts,
+    equal jitter), which re-assigns once GC has processed `NotifyMeetingEnded`. Read a rise
+    alongside `mc_meetings_ended_total{reason="join_window_expired"}`: there it is the expected
+    window race, not a user-visible failure. A user sees it only if the retries run out, i.e. a
+    teardown slower than the retry span (a slow or unreachable MH; bound
+    `teardown_fence_hold_max_seconds`).
   - **`sender_id_space_exhausted` is RETIRED (story 2 task 9, R-16) and is never emitted.** It meant
     MC refused a joiner because the meeting's 65535 `sender_id`s were used up. MC now performs an
     immediate KEK-epoch reset instead — a new KEK plus a fresh namespace that excludes every id
@@ -1562,8 +1609,9 @@ client-controlled string, `handler_ref`, participant-id, or raw close-reason tex
 - Clean tab-close: ≈ network RTT (sub-second). `Connection::closed()` fires immediately
   and the grace period is skipped.
 - Crash / network-loss: `MC_QUIC_MAX_IDLE_TIMEOUT_SECONDS` + `MC_DISCONNECT_GRACE_PERIOD_SECONDS`
-  + the 5s grace-check interval. With defaults: `10 + 30 + 5 = 45s`. See the MC incident
-  runbook for the operational budget + PromQL.
+  (enforced by every meeting actor; echoed as `mc_meeting_disconnect_grace_seconds`)
+  + one `LIFETIME_TICK` (`actors/meeting_timers.rs`, the grace-check interval). With defaults:
+  `10 + 30 + 5 = 45s`. See the MC incident runbook for the operational budget + PromQL.
 
 ---
 

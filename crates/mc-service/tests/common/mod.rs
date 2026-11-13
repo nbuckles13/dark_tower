@@ -743,6 +743,22 @@ pub async fn build_test_stack_with_notifier(
     keypair_label: &str,
     meeting_ended: Arc<dyn mc_service::actors::controller::MeetingEndedNotifier>,
 ) -> TestStackHandles {
+    build_test_stack_with_timers(
+        keypair_label,
+        meeting_ended,
+        mc_service::actors::MeetingTimers::default(),
+    )
+    .await
+}
+
+/// [`build_test_stack_with_notifier`] with explicit meeting lifetime timers
+/// (join window, disconnect grace) — the controller hands them to every
+/// meeting actor exactly as `main.rs` hands it `Config::meeting_timers()`.
+pub async fn build_test_stack_with_timers(
+    keypair_label: &str,
+    meeting_ended: Arc<dyn mc_service::actors::controller::MeetingEndedNotifier>,
+    timers: mc_service::actors::MeetingTimers,
+) -> TestStackHandles {
     let mock_server = MockServer::start().await;
     let keypair = TestKeypair::new(42, keypair_label);
     let jwks_url = mount_jwks_mock(&mock_server, &keypair).await;
@@ -761,6 +777,7 @@ pub async fn build_test_stack_with_notifier(
         Arc::new(PolicyGenerations::new()),
         mc_test_utils::kek::kek_lifecycle(),
         meeting_ended,
+        timers,
     ));
 
     let handoffs = Arc::new(SeededHandoffs::new());

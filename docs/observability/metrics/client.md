@@ -236,11 +236,12 @@ down, then polls is reliable where "join, then query" flakes.
 
 **Pre-existing label-key mismatch — harmless today, and why it will not stay silent.**
 The SDK emits these metrics with BARE label keys — `status`, `failure_stage`,
-`close_reason` (`session/MeetingSession.ts`) and `mh_index_bucket`
-(`media/MediaTransport.ts`) — while GC's telemetry filter `ALLOWLIST`
+`close_reason`, `retried` (`session/MeetingSession.ts`; `retried` since the
+2026-11-12 join-window devloop) and `mh_index_bucket` (`media/MediaTransport.ts`) —
+while GC's telemetry filter `ALLOWLIST`
 (`crates/gc-service/src/services/telemetry_filter.rs`) carries only the `dt.`-dotted
 spellings (`dt.failure_stage`, `dt.close_reason`, `dt.mh_index_bucket`) and no
-`status` at all. So GC strips all four today. That is harmless ONLY because every
+`status` or `retried` at all. So GC strips all five today. That is harmless ONLY because every
 metric here is `Exported: no`: the collector's name allowlist drops the whole series
 anyway. The day any of them is exported, `dt-guard client-metrics-export` rule 1
 (`label_key_not_forwarded`) fires on the stripped key. Fix the spelling on one side
@@ -256,7 +257,33 @@ then, deliberately; do not widen `keep_keys` to make the finding go away.
   - `failure_stage`: `none` (on success), `signup`, `credential_invalid`,
     `gc_create_token`, `gc_join`, `mc_signaling_connect`, `mc_join_response`,
     `mh_connect`, `internal`
-- **Cardinality**: Low (one series per status × stage, before implicit labels).
+  - `retried`: `true`, `false` (join-window devloop, 2026-11-12). Whether this
+    `join()` re-ran its GC join after MC refused it because the meeting ended or is
+    ending (`NOT_FOUND` = `meeting_not_found`, `CONFLICT` = `teardown_in_progress`;
+    `JOIN_RETRY` in `config/clientConfig.ts`, at most 4 attempts, equal jitter).
+    Config-independent, two values.
+- **Cardinality**: Low (one series per status × stage × retried, before implicit labels).
+- **Still ONE emission per `join()` call**, whatever the number of attempts, so the
+  success rate stays per user-level join. A join that succeeds after a retry is
+  `{status=success, failure_stage=none, retried=true}`. One that exhausted its retries
+  is `{status=failure, failure_stage=mc_join_response, retried=true}`.
+- **Why a join is retried**: an MC meeting exists only while it has participants. A
+  meeting nobody joins ends at MC's join window (`mc_meeting_join_window_seconds`), and
+  GC's reuse path does not tell MC about a later GC join. A fresh GC join re-assigns the
+  meeting once GC has processed MC's `NotifyMeetingEnded`.
+- **What the retry does NOT cover (named residual)**: the budget covers a normal
+  teardown plus GC's `NotifyMeetingEnded` processing, NOT MC's `TEARDOWN_MAX`
+  (`teardown_fence_hold_max_seconds` on MC's startup line). A slow-MH release that
+  outlasts it surfaces as `SignalingError(Conflict)` ("Meeting is restarting, please try
+  again") for the caller to retry. A rising `{status=failure, retried=true}` share with a
+  healthy MC points at a slow or unreachable MH (MC incident runbook Scenario 31).
+- **Side effects on the sibling series**: `dt_client_signaling_connection_total` stays
+  per signaling CONNECTION, so a retried join adds one `failure` there per rejected
+  attempt. `dt_client_time_to_signaling_ready_ms` and the first-MH histogram stay
+  measured from the start of `join()`, so they INCLUDE retry time (user-perceived
+  latency).
+- **Console**: one `[dt-join-retry]` line per retry, carrying the attempt number, the
+  bounded code and the delay. It never carries a meeting id, token or URL.
 - **Emission honesty** (task #14 — which stages the browser client actually
   emits):
   - `gc_create_token` is **RESERVED, never emitted by this client**. The browser

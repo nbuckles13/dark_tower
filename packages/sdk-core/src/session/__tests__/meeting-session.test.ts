@@ -697,18 +697,29 @@ describe('MeetingSession — signaling close_reason mapping (R-25)', () => {
   async function joinWithMcError(code: ErrorCode): Promise<InMemoryMetricsSink> {
     const sink = new InMemoryMetricsSink();
     const mocks = new Map<string, MockWebTransport>();
-    const session = makeSession(mocks, { metricsSink: sink });
-    const joinP = session.join({
-      orgSubdomain: 'demo',
-      meetingCode: MEETING_CODE,
-      credentials: LOGIN,
+    // A hand-driven scheduler: a RETRYABLE code (NOT_FOUND) enters the join-retry
+    // backoff, which this test does not drive; it disconnects instead.
+    const session = makeSession(mocks, {
+      metricsSink: sink,
+      transportScheduler: new FakeScheduler(),
     });
+    const settled = session
+      .join({
+        orgSubdomain: 'demo',
+        meetingCode: MEETING_CODE,
+        credentials: LOGIN,
+      })
+      .catch(() => {});
     await waitFor(() => mocks.has(MC_ENDPOINT));
     const mc = mocks.get(MC_ENDPOINT)!;
     mc.simulateReady();
     await waitFor(() => mc.getOpenedBidiStreams().length > 0);
     mc.simulateServerMessage(0, framedError(code, 'x'));
-    await joinP.catch(() => {});
+    await waitFor(
+      () => sink.getCounter('dt_client_signaling_connection_total', { status: 'failure' }) > 0,
+    );
+    session.disconnect();
+    await settled;
     return sink;
   }
 
@@ -3332,5 +3343,329 @@ describe('MeetingSession — handler-set reconcile (story 4 C1)', () => {
     // Same pipeline object: no rebuild on a set change.
     expect(await rig.session.startMedia()).toBe(pipeline);
     rig.session.disconnect();
+  });
+});
+
+describe('MeetingSession.join — GC re-join on an ended meeting (join-window devloop)', () => {
+  /** A GC fetch that counts joins and mints a DISTINCT meeting token per join. */
+  function countingGcFetch(): {
+    fetchImpl: FetchLike;
+    gcJoins: () => number;
+    /** Hold the GC join number `n` (1-based) until the returned release is called. */
+    holdJoin: (n: number) => () => void;
+  } {
+    let joins = 0;
+    const holds = new Map<number, Promise<void>>();
+    const inner = fakeFetch();
+    const fetchImpl = (async (input: string | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.includes('/api/v1/meetings/')) {
+        joins += 1;
+        const held = holds.get(joins);
+        if (held) await held;
+        return new Response(
+          JSON.stringify({
+            token: `meeting-jwt-${joins}`,
+            expiresIn: 3600,
+            meetingId: MEETING_ID,
+            meetingName: 'Standup',
+            mcAssignment: {
+              mcId: 'mc1',
+              webtransportEndpoint: MC_ENDPOINT,
+              grpcEndpoint: 'https://mc.localhost:50051',
+            },
+          }),
+          { status: 200, headers: JSON_HEADERS },
+        );
+      }
+      return inner(input, init);
+    }) as unknown as FetchLike;
+    const holdJoin = (n: number): (() => void) => {
+      let release!: () => void;
+      holds.set(
+        n,
+        new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+      );
+      return release;
+    };
+    return { fetchImpl, gcJoins: () => joins, holdJoin };
+  }
+
+  function retryRig() {
+    const sink = new InMemoryMetricsSink();
+    const sched = new FakeScheduler();
+    const rec = makeDialRecorder();
+    const gc = countingGcFetch();
+    const session = makeSession(new Map(), {
+      connect: rec.connect,
+      fetchImpl: gc.fetchImpl,
+      transportScheduler: sched,
+      transportRandom: () => 0,
+      metricsSink: sink,
+    });
+    const joinP = session.join({
+      orgSubdomain: 'demo',
+      meetingCode: MEETING_CODE,
+      credentials: LOGIN,
+    });
+    return { sink, sched, rec, gc, session, joinP };
+  }
+
+  /** The MC dial of attempt `n` (1-based): ready, then its JoinRequest token. */
+  async function mcAttempt(rec: ReturnType<typeof makeDialRecorder>, n: number) {
+    await waitFor(() => rec.count(MC_ENDPOINT) === n);
+    const mc = rec.latest(MC_ENDPOINT);
+    mc.simulateReady();
+    await waitFor(() => mc.getOpenedBidiStreams().length > 0);
+    await waitFor(() =>
+      decodeClientMessages(mc.getOutboundBidiWrites(0)).some(
+        (m) => m.message.case === 'joinRequest',
+      ),
+    );
+    const join = decodeClientMessages(mc.getOutboundBidiWrites(0)).find(
+      (m) => m.message.case === 'joinRequest',
+    );
+    const token = join?.message.case === 'joinRequest' ? join.message.value.joinToken : '';
+    return { mc, token };
+  }
+
+  /** Fire the ONE join-retry backoff timer of `delayMs` and return its delay. */
+  async function fireBackoff(sched: FakeScheduler, delayMs: number): Promise<number> {
+    await waitFor(() => sched.pending().some((t) => t.delayMs === delayMs));
+    const timer = sched.pending().find((t) => t.delayMs === delayMs)!;
+    sched.fire(timer.id);
+    return timer.delayMs;
+  }
+
+  async function settleMh(rec: ReturnType<typeof makeDialRecorder>): Promise<void> {
+    await waitFor(() => MEDIA_SERVERS.every((u) => rec.count(u) > 0));
+    for (const url of MEDIA_SERVERS) rec.latest(url).simulateReady();
+  }
+
+  it('NotFound then success: a SECOND GC join, each MC join carrying its own token, retried=true', async () => {
+    const { sink, sched, rec, gc, joinP } = retryRig();
+    const first = await mcAttempt(rec, 1);
+    expect(first.token).toBe('meeting-jwt-1');
+    first.mc.simulateServerMessage(0, framedError(ErrorCode.NOT_FOUND, 'gone'));
+
+    expect(await fireBackoff(sched, 250)).toBe(250);
+    const second = await mcAttempt(rec, 2);
+    // Positive control: the retry really went back through GC.
+    expect(gc.gcJoins()).toBe(2);
+    expect(second.token).toBe('meeting-jwt-2');
+    second.mc.simulateServerMessage(0, framedJoinResponse({ handlerSet: MEDIA_SET }));
+    await settleMh(rec);
+
+    await expect(joinP).resolves.toBeDefined();
+    sink.assertCounter(
+      'dt_client_join_attempts_total',
+      { status: 'success', failure_stage: 'none', retried: 'true' },
+      1,
+    );
+    expect(sink.getCounter('dt_client_join_attempts_total', { status: 'failure' })).toBe(0);
+    // The rejected attempt's transport was released before the retry.
+    await expect(first.mc.closed).resolves.toBeDefined();
+  });
+
+  it('Conflict, then NotFound, then success (mixed retryable codes)', async () => {
+    const { sched, rec, gc, joinP } = retryRig();
+    (await mcAttempt(rec, 1)).mc.simulateServerMessage(
+      0,
+      framedError(ErrorCode.CONFLICT, 'tearing down'),
+    );
+    await fireBackoff(sched, 250);
+    (await mcAttempt(rec, 2)).mc.simulateServerMessage(0, framedError(ErrorCode.NOT_FOUND, 'gone'));
+    await fireBackoff(sched, 500);
+    const third = await mcAttempt(rec, 3);
+    expect(third.token).toBe('meeting-jwt-3');
+    third.mc.simulateServerMessage(0, framedJoinResponse({ handlerSet: MEDIA_SET }));
+    await settleMh(rec);
+    await expect(joinP).resolves.toBeDefined();
+    expect(gc.gcJoins()).toBe(3);
+  });
+
+  it('NotFound on every attempt: exactly maxAttempts GC joins, the last rejection rethrown, the minimum span waited', async () => {
+    const { sink, sched, rec, gc, joinP } = retryRig();
+    joinP.catch(() => {});
+    let waited = 0;
+    const delays = [250, 500, 1_000];
+    for (let n = 1; n <= 4; n += 1) {
+      const attempt = await mcAttempt(rec, n);
+      expect(attempt.token).toBe(`meeting-jwt-${n}`);
+      attempt.mc.simulateServerMessage(0, framedError(ErrorCode.NOT_FOUND, 'gone'));
+      if (n < 4) waited += await fireBackoff(sched, delays[n - 1]!);
+    }
+    const err = await joinP.catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(SignalingError);
+    expect((err as SignalingError).signalingCode).toBe(SignalingErrorCode.NotFound);
+    expect(gc.gcJoins()).toBe(4);
+    // random = 0: the cumulative scheduled backoff IS the guaranteed minimum span.
+    const { JOIN_RETRY_MIN_SPAN_MS } = await import('../joinRetry.js');
+    expect(waited).toBe(JOIN_RETRY_MIN_SPAN_MS);
+    sink.assertCounter(
+      'dt_client_join_attempts_total',
+      { status: 'failure', failure_stage: 'mc_join_response', retried: 'true' },
+      1,
+    );
+    sink.assertCounter('dt_client_signaling_connection_total', { status: 'failure' }, 4);
+  });
+
+  for (const code of [
+    ErrorCode.UNAUTHORIZED,
+    ErrorCode.FORBIDDEN,
+    ErrorCode.INVALID_REQUEST,
+    ErrorCode.INTERNAL_ERROR,
+    ErrorCode.CAPACITY_EXCEEDED,
+  ]) {
+    it(`${ErrorCode[code]} is NOT retried: exactly one GC join`, async () => {
+      const { sink, sched, rec, gc, joinP } = retryRig();
+      (await mcAttempt(rec, 1)).mc.simulateServerMessage(0, framedError(code, 'no'));
+      await expect(joinP).rejects.toBeDefined();
+      expect(gc.gcJoins()).toBe(1);
+      expect(rec.count(MC_ENDPOINT)).toBe(1);
+      // No join-retry backoff of ANY draw: equal jitter puts the first wait in
+      // [250, 500).
+      expect(sched.pending().some((t) => t.delayMs >= 250 && t.delayMs < 500)).toBe(false);
+      sink.assertCounter(
+        'dt_client_join_attempts_total',
+        { status: 'failure', retried: 'false' },
+        1,
+      );
+    });
+  }
+
+  it('a join deadline (local Timeout) is NOT retried', async () => {
+    const sink = new InMemoryMetricsSink();
+    const rec = makeDialRecorder();
+    const gc = countingGcFetch();
+    const session = makeSession(new Map(), {
+      connect: rec.connect,
+      fetchImpl: gc.fetchImpl,
+      joinTimeoutMs: 20,
+      metricsSink: sink,
+    });
+    const joinP = session.join({
+      orgSubdomain: 'demo',
+      meetingCode: MEETING_CODE,
+      credentials: LOGIN,
+    });
+    await waitFor(() => rec.count(MC_ENDPOINT) === 1);
+    rec.latest(MC_ENDPOINT).simulateReady();
+    await expect(joinP).rejects.toBeDefined();
+    expect(gc.gcJoins()).toBe(1);
+  });
+
+  it('disconnect() during the backoff: no further GC join, join() rejects with the last rejection', async () => {
+    const { sched, rec, gc, session, joinP } = retryRig();
+    (await mcAttempt(rec, 1)).mc.simulateServerMessage(0, framedError(ErrorCode.NOT_FOUND, 'gone'));
+    await waitFor(() => sched.pending().some((t) => t.delayMs === 250));
+    session.disconnect();
+    const err = await joinP.catch((e: unknown) => e);
+    expect((err as SignalingError).signalingCode).toBe(SignalingErrorCode.NotFound);
+    expect(gc.gcJoins()).toBe(1);
+    expect(sched.pending().some((t) => t.delayMs >= 250 && t.delayMs < 500)).toBe(false);
+  });
+
+  it("disconnect() while a RETRY's GC join is in flight: no second MC dial, join() rejects with the last rejection", async () => {
+    const { sched, rec, gc, session, joinP } = retryRig();
+    const releaseSecondGc = gc.holdJoin(2);
+    (await mcAttempt(rec, 1)).mc.simulateServerMessage(0, framedError(ErrorCode.NOT_FOUND, 'gone'));
+    await fireBackoff(sched, 250);
+    await waitFor(() => gc.gcJoins() === 2);
+    session.disconnect();
+    releaseSecondGc();
+    const err = await joinP.catch((e: unknown) => e);
+    expect((err as SignalingError).signalingCode).toBe(SignalingErrorCode.NotFound);
+    await flushMicrotasks();
+    // Nothing was built after the teardown: no second signalling client dialed MC.
+    expect(rec.count(MC_ENDPOINT)).toBe(1);
+    expect(session.state).toBe(MeetingSessionState.Disconnecting);
+  });
+
+  it('disconnect() while the FIRST GC join is in flight: no MC dial at all', async () => {
+    const rec = makeDialRecorder();
+    const gc = countingGcFetch();
+    const releaseFirstGc = gc.holdJoin(1);
+    const session = makeSession(new Map(), { connect: rec.connect, fetchImpl: gc.fetchImpl });
+    const joinP = session.join({
+      orgSubdomain: 'demo',
+      meetingCode: MEETING_CODE,
+      credentials: LOGIN,
+    });
+    await waitFor(() => gc.gcJoins() === 1);
+    session.disconnect();
+    releaseFirstGc();
+    const err = await joinP.catch((e: unknown) => e);
+    expect((err as SignalingError).signalingCode).toBe(SignalingErrorCode.Transport);
+    await flushMicrotasks();
+    expect(rec.count(MC_ENDPOINT)).toBe(0);
+  });
+
+  it('`retried` is per join(): a later join() on the same instance is labelled from scratch', async () => {
+    const { sink, sched, rec, session, joinP } = retryRig();
+    (await mcAttempt(rec, 1)).mc.simulateServerMessage(0, framedError(ErrorCode.NOT_FOUND, 'gone'));
+    await fireBackoff(sched, 250);
+    const second = await mcAttempt(rec, 2);
+    second.mc.simulateServerMessage(0, framedJoinResponse({ handlerSet: MEDIA_SET }));
+    await settleMh(rec);
+    await joinP;
+    session.disconnect();
+    // Single-use: a second join() on a torn-down session fails before any MC
+    // dial — and its ONE emission must not inherit the first join's retry.
+    await expect(
+      session.join({ orgSubdomain: 'demo', meetingCode: MEETING_CODE, credentials: LOGIN }),
+    ).rejects.toBeDefined();
+    sink.assertCounter('dt_client_join_attempts_total', { status: 'success', retried: 'true' }, 1);
+    sink.assertCounter('dt_client_join_attempts_total', { status: 'failure', retried: 'false' }, 1);
+    expect(
+      sink.getCounter('dt_client_join_attempts_total', { status: 'failure', retried: 'true' }),
+    ).toBe(0);
+  });
+
+  it('a first-try success is labelled retried=false', async () => {
+    const sink = new InMemoryMetricsSink();
+    const mocks = new Map<string, MockWebTransport>();
+    const session = makeSession(mocks, { metricsSink: sink });
+    const joinP = session.join({
+      orgSubdomain: 'demo',
+      meetingCode: MEETING_CODE,
+      credentials: LOGIN,
+    });
+    await driveJoin(mocks, 'all');
+    await joinP;
+    sink.assertCounter(
+      'dt_client_join_attempts_total',
+      { status: 'success', failure_stage: 'none', retried: 'false' },
+      1,
+    );
+  });
+
+  it('a retry re-enters fetching-token, and the [dt-join-retry] line carries no meeting id, token or URL', async () => {
+    const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+    const { sched, rec, session, joinP } = retryRig();
+    const states: string[] = [];
+    session.on('stateChange', (st) => states.push(st));
+    (await mcAttempt(rec, 1)).mc.simulateServerMessage(0, framedError(ErrorCode.NOT_FOUND, 'gone'));
+    await fireBackoff(sched, 250);
+    const second = await mcAttempt(rec, 2);
+    second.mc.simulateServerMessage(0, framedJoinResponse({ handlerSet: MEDIA_SET }));
+    await settleMh(rec);
+    await joinP;
+    expect(states.slice(0, 3)).toEqual([
+      MeetingSessionState.ConnectingMc,
+      MeetingSessionState.FetchingToken,
+      MeetingSessionState.ConnectingMc,
+    ]);
+    const lines = info.mock.calls
+      .filter((c) => c[0] === '[dt-join-retry]')
+      .map((c) => String(c[1]));
+    expect(lines).toEqual(['attempt 1/4 rejected NOT_FOUND; re-joining via GC in 250 ms']);
+    for (const line of lines) {
+      expect(line).not.toContain(MEETING_ID);
+      expect(line).not.toContain('meeting-jwt');
+      expect(line).not.toContain('https://');
+    }
   });
 });

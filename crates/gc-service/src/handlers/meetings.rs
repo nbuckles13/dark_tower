@@ -38,15 +38,15 @@ use axum::{
     Extension, Json,
 };
 use common::jwt::UserClaims;
+// GC requests AC's cap on every meeting/guest token, by construction. MC's
+// default join window is derived from the same constant (ADR-0010 §3).
+use common::meeting_token::MEETING_TOKEN_MAX_TTL_SECONDS;
 use ring::rand::{SecureRandom, SystemRandom};
 use sqlx::PgPool;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{info, instrument, warn};
 use uuid::Uuid;
-
-/// Default token TTL in seconds (15 minutes).
-const DEFAULT_TOKEN_TTL_SECONDS: u32 = 900;
 
 /// Default capabilities for meeting participants.
 const DEFAULT_PARTICIPANT_CAPABILITIES: &[&str] = &["audio", "video", "screen_share", "chat"];
@@ -466,7 +466,7 @@ pub async fn join_meeting(
             .iter()
             .map(|s| (*s).to_string())
             .collect(),
-        ttl_seconds: DEFAULT_TOKEN_TTL_SECONDS,
+        ttl_seconds: MEETING_TOKEN_MAX_TTL_SECONDS,
     };
 
     let token_response = ac_client
@@ -655,7 +655,7 @@ pub async fn get_guest_token(
         meeting_id: meeting.meeting_id,
         meeting_org_id: meeting.org_id,
         waiting_room: meeting.waiting_room_enabled,
-        ttl_seconds: DEFAULT_TOKEN_TTL_SECONDS,
+        ttl_seconds: MEETING_TOKEN_MAX_TTL_SECONDS,
     };
 
     let token_response = ac_client

@@ -84,6 +84,17 @@ pub const DEFAULT_CLOCK_SKEW: Duration = Duration::from_secs(300);
 /// excessively large clock skew tolerance.
 pub const MAX_CLOCK_SKEW: Duration = Duration::from_secs(600);
 
+/// `exp` leeway, in seconds, of THIS module's verifier: a token is accepted
+/// until `exp + JWT_EXP_LEEWAY_SECONDS`.
+///
+/// The value is `jsonwebtoken`'s own `Validation` default, made explicit so it
+/// is a named source rather than a library default — MC derives its default
+/// meeting join window from it. It governs ONLY `common::jwt`'s verifier
+/// (the meeting/guest/service tokens checked through it); MH's `media_dial`
+/// validator and AC's own validators keep their own settings. Not an `iat`
+/// tolerance: that is [`DEFAULT_CLOCK_SKEW`] / [`MAX_CLOCK_SKEW`].
+pub const JWT_EXP_LEEWAY_SECONDS: u64 = 60;
+
 // =============================================================================
 // Error Types
 // =============================================================================
@@ -1098,6 +1109,16 @@ impl JwksClient {
 // JWT Verification
 // =============================================================================
 
+/// THE validation rules [`verify_token`] applies: `EdDSA`, `exp` checked with
+/// an explicit [`JWT_EXP_LEEWAY_SECONDS`]. `aud` is not validated — scopes are
+/// checked instead.
+fn token_validation() -> Validation {
+    let mut validation = Validation::new(Algorithm::EdDSA);
+    validation.validate_exp = true;
+    validation.leeway = JWT_EXP_LEEWAY_SECONDS;
+    validation
+}
+
 /// Verify JWT signature and extract claims.
 ///
 /// Generic over the claims type — allows both service `Claims` and `UserClaims`
@@ -1136,13 +1157,8 @@ pub fn verify_token<T: DeserializeOwned>(token: &str, jwk: &Jwk) -> Result<T, Jw
     // Create decoding key
     let decoding_key = DecodingKey::from_ed_der(&public_key_bytes);
 
-    // Configure validation
-    let mut validation = Validation::new(Algorithm::EdDSA);
-    validation.validate_exp = true;
-    // Don't validate aud - we'll check scopes instead
-
     // Decode and verify
-    let token_data = decode::<T>(token, &decoding_key, &validation).map_err(|e| {
+    let token_data = decode::<T>(token, &decoding_key, &token_validation()).map_err(|e| {
         tracing::debug!(target: "common.jwt", error = %e, "Token verification failed"); // guard:ignore(logs verification error string not a token)
         JwtError::InvalidSignature
     })?;
@@ -3030,6 +3046,57 @@ mod tests {
         assert_eq!(decoded.email, "user@example.com");
         assert_eq!(decoded.roles, vec!["user", "admin"]);
         assert_eq!(decoded.jti, "jti-789");
+    }
+
+    /// The exp leeway is assigned explicitly from the named constant (value-
+    /// neutral: jsonwebtoken's default), and nothing else is relaxed.
+    #[test]
+    fn token_validation_pins_the_exp_leeway() {
+        assert_eq!(JWT_EXP_LEEWAY_SECONDS, 60);
+        let validation = token_validation();
+        assert_eq!(validation.leeway, JWT_EXP_LEEWAY_SECONDS);
+        assert!(validation.validate_exp);
+        assert_eq!(validation.algorithms, vec![Algorithm::EdDSA]);
+    }
+
+    fn verify_service_token_expired_by(seconds: i64) -> Result<ServiceClaims, JwtError> {
+        let (kid, pkcs8_bytes, public_key_bytes) = generate_ed25519_keypair();
+        let now = chrono::Utc::now().timestamp();
+        let claims = ServiceClaims::new(
+            "test-service".to_string(),
+            now - seconds,
+            now - 600,
+            "read".to_string(),
+            None,
+        );
+        let token = sign_jwt(&claims, &kid, &pkcs8_bytes);
+        let jwk = Jwk {
+            kty: "OKP".to_string(),
+            kid,
+            crv: Some("Ed25519".to_string()),
+            x: Some(URL_SAFE_NO_PAD.encode(&public_key_bytes)),
+            alg: Some("EdDSA".to_string()),
+            key_use: Some("sig".to_string()),
+        };
+        verify_token::<ServiceClaims>(&token, &jwk)
+    }
+
+    /// Behavioural pin of the leeway: a token expired by less than it is still
+    /// accepted; one expired by leeway + 1 s is refused.
+    #[test]
+    fn verify_token_honours_exactly_the_exp_leeway() {
+        let leeway = i64::try_from(JWT_EXP_LEEWAY_SECONDS).expect("leeway fits i64");
+        assert!(
+            verify_service_token_expired_by(leeway / 2).is_ok(),
+            "a token expired by less than the leeway must be accepted"
+        );
+        assert!(
+            matches!(
+                verify_service_token_expired_by(leeway + 1),
+                Err(JwtError::InvalidSignature)
+            ),
+            "a token expired by leeway + 1 s must be refused"
+        );
     }
 
     #[test]
