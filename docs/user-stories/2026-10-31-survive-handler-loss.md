@@ -2462,7 +2462,7 @@ tasks:
   slug: 2026-11-12-mc-planned-transfer
   tag: story-2026-10-31-survive-handler-loss-task-MC-F
 - id: 25
-  status: pending
+  status: completed
   specialist: meeting-controller
   deps:
   - 17
@@ -2513,6 +2513,7 @@ tasks:
     SAME-COMMIT OBLIGATIONS: (a) the disagreement fraction and minimum-count keys get Configuration Reference rows in docs/runbooks/mc-deployment.md (defaults as stated above); (b) n/a; (c) each series with panel (infra/grafana/dashboards/mc-media.json) + catalog (docs/observability/metrics/mc-service.md) + zero-init + ADR-0032 test; (d) test-gates items; (e) no meeting/participant/handler labels.
 
     Tier: light — MC-internal instrumentation over state MC-D and MC-B2 already maintain; no wire, crypto or cross-service change.
+  slug: 2026-11-13-mc-handler-loss-metric
   tag: story-2026-10-31-survive-handler-loss-task-MC-E
   tier: light
   tier_reason: 'MC-only telemetry over existing inputs: no wire or proto change (P3 owns deletions), no auth/crypto, no GSA, one service'
