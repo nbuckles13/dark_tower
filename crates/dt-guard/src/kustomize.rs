@@ -368,7 +368,9 @@ fn check_dashboard_coverage(repo_root: &Path) -> Result<Vec<Hit>> {
 fn build_targets(repo_root: &Path) -> Result<Vec<(PathBuf, String)>> {
     let mut out: Vec<(PathBuf, String)> = Vec::new();
     let services_dir = repo_root.join(INFRA_SERVICES_DIR);
-    let overlays_dir = repo_root.join("infra/kubernetes/overlays/kind");
+    let overlays_dir = repo_root
+        .join(crate::common::services::INFRA_OVERLAYS_DIR)
+        .join("kind");
     let obs_base = repo_root.join("infra/kubernetes/observability");
     let obs_overlay = overlays_dir.join("observability");
     for svc in infra_service_bases(repo_root)? {
@@ -947,7 +949,9 @@ mod tests {
         );
         let env_root = crate::kustomize_tools::run_kustomize_build(
             tool,
-            &root.join("infra/kubernetes/overlays/kind"),
+            &root
+                .join(crate::common::services::INFRA_OVERLAYS_DIR)
+                .join("kind"),
         )
         .expect("build root");
         assert!(env_root.success, "{}", env_root.stderr_head);

@@ -86,6 +86,9 @@ pub struct ConfigMapRef<'a> {
     pub key: Option<&'a str>,
     /// The `env[].name` the value lands in, for `KeyRef` only.
     pub env_name: Option<&'a str>,
+    /// `configMapKeyRef.optional: true` (`KeyRef` only): the kubelet starts
+    /// the container even when the key is absent from the ConfigMap.
+    pub optional: bool,
 }
 
 /// ConfigMap references of ONE container: `envFrom` imports first, then
@@ -101,6 +104,7 @@ pub fn container_configmap_refs(container: &Value) -> Vec<ConfigMapRef<'_>> {
                     name: cm.get("name").and_then(Value::as_str),
                     key: None,
                     env_name: None,
+                    optional: false,
                 });
             }
         }
@@ -116,6 +120,7 @@ pub fn container_configmap_refs(container: &Value) -> Vec<ConfigMapRef<'_>> {
                     name: cm.get("name").and_then(Value::as_str),
                     key: cm.get("key").and_then(Value::as_str),
                     env_name: entry.get("name").and_then(Value::as_str),
+                    optional: cm.get("optional").and_then(Value::as_bool) == Some(true),
                 });
             }
         }
@@ -143,6 +148,7 @@ pub fn volume_configmap_refs(pod: &Value) -> Vec<ConfigMapRef<'_>> {
                 name: cm.get("name").and_then(Value::as_str),
                 key: None,
                 env_name: None,
+                optional: false,
             });
         }
         if let Some(sources) = vol
@@ -157,6 +163,7 @@ pub fn volume_configmap_refs(pod: &Value) -> Vec<ConfigMapRef<'_>> {
                         name: cm.get("name").and_then(Value::as_str),
                         key: None,
                         env_name: None,
+                        optional: false,
                     });
                 }
             }

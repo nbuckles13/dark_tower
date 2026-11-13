@@ -49,6 +49,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // emitted yet, and ConfigError carries no secret material. Mirrors AC's
     // task #25 main.rs ordering.
     let config = Config::from_env()?;
+    // Loaded here with `Config` so an invalid GC_CLEANUP_INTERVAL_SECONDS /
+    // GC_INACTIVITY_HOURS / GC_RETENTION_DAYS fails startup before any
+    // connection is opened, rather than being defaulted.
+    let cleanup_config = AssignmentCleanupConfig::from_env()?;
 
     // R-55: initialize the OpenTelemetry SDK only when explicitly enabled
     // (OTEL_ENABLED=true). `init_otel` is async, eagerly probes the collector,
@@ -242,7 +246,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Start assignment cleanup background task
     let cleanup_pool = db_pool.clone();
     let cleanup_token = cancel_token.clone();
-    let cleanup_config = AssignmentCleanupConfig::from_env();
     info!(
         cleanup_interval_seconds = cleanup_config.check_interval_seconds,
         inactivity_hours = cleanup_config.inactivity_hours,

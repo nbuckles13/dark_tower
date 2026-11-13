@@ -21,6 +21,11 @@ use std::path::Path;
 /// Repo-relative directory holding every Kustomize service base.
 pub const INFRA_SERVICES_DIR: &str = "infra/services";
 
+/// Root of the per-environment Kustomize overlays (`<root>/<env>/...`). THE
+/// one spelling: `env-config` check 5 walks every overlay's `services/<base>`;
+/// `kustomize` selects the `kind` overlay from it.
+pub const INFRA_OVERLAYS_DIR: &str = "infra/kubernetes/overlays";
+
 /// Every Kustomize base under `infra/services/` — the directory names, sorted.
 ///
 /// THE ONE enumeration of service bases. `kustomize` R-15/R-16 build and

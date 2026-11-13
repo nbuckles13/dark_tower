@@ -564,6 +564,9 @@ pub enum ConfigError {
 
     #[error("Invalid MH endpoint allowlist configuration: {0}")]
     InvalidMhEndpointAllowlist(String),
+
+    #[error("Invalid assignment cleanup configuration: {0}")]
+    InvalidAssignmentCleanupConfig(String),
 }
 
 impl Config {

@@ -25,6 +25,7 @@
 
 import {
   handlerSetConfigLogLine,
+  JOIN_RETRY,
   transmitRewrapLatencyMs,
   type MediaConfig,
 } from '../config/clientConfig.js';
@@ -52,6 +53,7 @@ import {
   bestEffortMuteReport,
 } from './mediaWiring.js';
 import { readIsHost } from './meetingRole.js';
+import { isRetryableJoinRejection, joinRetryDelayMs } from './joinRetry.js';
 import { MediaMetrics } from '../media/setup/mediaMetrics.js';
 import type { MuteSnapshot } from '../media/lifecycle/muteState.js';
 import { RosterIdentityKeys } from '../media/setup/rosterKeys.js';
@@ -345,6 +347,13 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
    * Only this boolean survives `join()`; see `meetingRole.ts`.
    */
   #isHost = false;
+  /**
+   * Whether this `join()` re-ran its GC join after an MC "meeting ended / ending"
+   * refusal — the `retried` label on `dt_client_join_attempts_total`.
+   */
+  #joinRetried = false;
+  /** Ends an in-progress join-retry backoff early (set only while one runs). */
+  #cancelBackoff: (() => void) | undefined;
   /** What the join declared per published kind (`#declarePublish`). */
   #declaredClientMute: readonly PublishedKindDeclaration[] = [];
 
@@ -399,6 +408,8 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
    */
   async join(options: JoinOptions): Promise<JoinedEvent> {
     this.#joinStartMs = this.#clock();
+    // Per-join telemetry state, reset with its siblings.
+    this.#joinRetried = false;
     this.#metricLabels = {
       client_version: __SDK_VERSION__,
       org_id: options.orgSubdomain,
@@ -425,65 +436,118 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
       // `MeetingApiClient`. The values never reach a log, error, or metric label.
       const userToken = await this.#authenticate(options);
 
-      stage = FailureStage.GcJoin;
-      let joinResp: Awaited<ReturnType<MeetingApiClient['joinMeeting']>>;
-      try {
-        joinResp = await this.#meetingClient.joinMeeting(options.meetingCode, { userToken });
-      } catch (err) {
-        // Split credential rejection out of `gc_join` (see `gcJoinFailureStage`).
-        stage = gcJoinFailureStage(err);
-        throw err;
-      }
-      this.#metricLabels = {
-        ...this.#metricLabels,
-        meeting_id_hash: await meetingIdHash(joinResp.meetingId),
-      };
-      // The host hint (story 2 R-11). The decoded payload never leaves
-      // `readIsHost`; only the boolean and a bounded failure token come back.
-      const role = readIsHost(joinResp.token);
-      this.#isHost = role.isHost;
-      if ('failure' in role) {
-        console.warn(
-          '[dt-meeting-role]',
-          `could not read the meeting role from the meeting token (${role.failure}); ` +
-            'host controls stay hidden. MC still authorises every request.',
-        );
-      }
-
-      // ADR-0036 §4 step 1: generate the identity signing keypair BEFORE the
-      // join request, so its public half can travel on it. Per meeting, never
-      // persisted, private half non-extractable.
-      this.#identity = await MeetingIdentity.create();
-
-      // Story 3 R-8: when video is published or received, prove VP8 encode AND
-      // decode BEFORE the join, so `CODEC_VP8` is declared only when both pass.
-      // A failure does not fail the join: it is held and fails `startMedia()`
-      // loudly (never an audio-only degradation).
-      this.#vp8 = await probeVideoCodec(
-        this.#slots.publish.includes('video') || this.#mediaConfig.receive.videoSlots > 0,
-        this.#mediaConfig.video.capabilityProbe,
-        this.#vp8Probe,
-      );
-
-      // --- connecting-mc: MC signaling join ---
-      this.#setState(MeetingSessionState.ConnectingMc);
-      stage = FailureStage.McSignalingConnect;
-      const signaling = this.#createSignaling();
-      this.#signaling = signaling;
-      // The media transport exists BEFORE the join so the join-time handler set
-      // (and any set pushed right behind it) has a home: sets are held, not
-      // dialed, until `arm` below (ADR-0039 §4).
-      const media = this.#createMedia(signaling, mediaMetrics);
-      this.#media = media;
-      this.#wireMedia(signaling, media);
+      // GC join -> MC join, re-run as a whole (bounded, `JOIN_RETRY`) when MC
+      // answers that the meeting ended or is ending: an MC meeting exists only
+      // while it has participants, a meeting nobody joined ends at MC's join
+      // window, and GC's reuse path does not tell MC about a later GC join. A
+      // fresh GC join re-assigns the meeting once GC has processed MC's
+      // NotifyMeetingEnded. Each attempt is self-contained: its own GC join
+      // (so its own meeting token and handler set), its own signalling client,
+      // transport and roster; nothing from a rejected attempt survives it.
+      let attempt = 0;
+      // The last MC rejection, rethrown when a disconnect() cancels a retry.
+      let lastRejection: SignalingError | undefined;
+      let signaling: SignalingClient;
+      let media: MediaTransport;
       let joined: JoinedEvent;
-      try {
-        joined = await this.#joinSignaling(signaling, joinResp, options);
-      } catch (err) {
-        // Distinguish a server join-REJECTION (mc_join_response) from a connect-level
-        // failure (mc_signaling_connect) for the `failure_stage` label (F3/F1).
-        stage = signalingFailureStage(err);
-        throw err;
+      for (;;) {
+        stage = FailureStage.GcJoin;
+        // R-23: the response (and the meeting token on it) is LOOP-local.
+        let joinResp: Awaited<ReturnType<MeetingApiClient['joinMeeting']>>;
+        try {
+          joinResp = await this.#meetingClient.joinMeeting(options.meetingCode, { userToken });
+        } catch (err) {
+          // Split credential rejection out of `gc_join` (see `gcJoinFailureStage`).
+          stage = gcJoinFailureStage(err);
+          throw err;
+        }
+        this.#metricLabels = {
+          ...this.#metricLabels,
+          meeting_id_hash: await meetingIdHash(joinResp.meetingId),
+        };
+        // The host hint (story 2 R-11). The decoded payload never leaves
+        // `readIsHost`; only the boolean and a bounded failure token come back.
+        const role = readIsHost(joinResp.token);
+        this.#isHost = role.isHost;
+        if ('failure' in role) {
+          console.warn(
+            '[dt-meeting-role]',
+            `could not read the meeting role from the meeting token (${role.failure}); ` +
+              'host controls stay hidden. MC still authorises every request.',
+          );
+        }
+
+        if (attempt === 0) {
+          // ADR-0036 §4 step 1: generate the identity signing keypair BEFORE the
+          // join request, so its public half can travel on it. Per meeting, never
+          // persisted, private half non-extractable. Once per join(): a retry
+          // joins the SAME meeting.
+          this.#identity = await MeetingIdentity.create();
+
+          // Story 3 R-8: when video is published or received, prove VP8 encode AND
+          // decode BEFORE the join, so `CODEC_VP8` is declared only when both pass.
+          // A failure does not fail the join: it is held and fails `startMedia()`
+          // loudly (never an audio-only degradation).
+          this.#vp8 = await probeVideoCodec(
+            this.#slots.publish.includes('video') || this.#mediaConfig.receive.videoSlots > 0,
+            this.#mediaConfig.video.capabilityProbe,
+            this.#vp8Probe,
+          );
+        }
+
+        // disconnect() may have landed during any await of this iteration
+        // (auth, the GC join, the id hash, identity, VP8 probe). It already
+        // tore down; building a signalling client or transport now would
+        // outlive it (KEK, dial tokens, live connections). Every attempt,
+        // the first included, checks here.
+        if (this.#torn) {
+          throw (
+            lastRejection ??
+            new SignalingError(SignalingErrorCode.Transport, 'join cancelled by disconnect()')
+          );
+        }
+
+        // --- connecting-mc: MC signaling join ---
+        this.#setState(MeetingSessionState.ConnectingMc);
+        stage = FailureStage.McSignalingConnect;
+        signaling = this.#createSignaling();
+        this.#signaling = signaling;
+        // The media transport exists BEFORE the join so the join-time handler set
+        // (and any set pushed right behind it) has a home: sets are held, not
+        // dialed, until `arm` below (ADR-0039 §4).
+        media = this.#createMedia(signaling, mediaMetrics);
+        this.#media = media;
+        this.#wireMedia(signaling, media);
+        try {
+          joined = await this.#joinSignaling(signaling, joinResp, options);
+          break;
+        } catch (err) {
+          // Distinguish a server join-REJECTION (mc_join_response) from a connect-level
+          // failure (mc_signaling_connect) for the `failure_stage` label (F3/F1).
+          stage = signalingFailureStage(err);
+          if (!isRetryableJoinRejection(err) || attempt + 1 >= JOIN_RETRY.maxAttempts) {
+            throw err;
+          }
+          lastRejection = err;
+          // Release the rejected attempt BEFORE waiting: its transport, its
+          // signalling client, any KEK and roster keys it received.
+          this.#releaseRejectedAttempt(media, signaling);
+          const delayMs = joinRetryDelayMs(attempt, this.#transportRandom ?? Math.random);
+          attempt += 1;
+          this.#joinRetried = true;
+          // Bounded and PII-free: no meeting id, no token, no URL.
+          console.info(
+            '[dt-join-retry]',
+            `attempt ${attempt}/${JOIN_RETRY.maxAttempts} rejected ` +
+              `${err.signalingCode}; re-joining via GC in ${delayMs} ms`,
+          );
+          await this.#sleep(delayMs);
+          if (this.#torn) {
+            // disconnect() during the backoff: no further attempt.
+            throw err;
+          }
+          this.#setState(MeetingSessionState.FetchingToken);
+        }
       }
 
       // --- joining: dial the join-time handler set ---
@@ -865,6 +929,9 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
   disconnect(): void {
     if (this.#torn) return;
     this.#torn = true;
+    // A join-retry backoff in progress ends now; `join()` sees `#torn` and
+    // rethrows the last rejection instead of starting another attempt.
+    this.#cancelBackoff?.();
     // The `Disconnecting` stateChange notification fires FIRST but must NOT be able
     // to skip transport teardown: a throwing `stateChange` listener would otherwise
     // leak the MC/MH connections. Run teardown in a `finally` so it always executes
@@ -1148,7 +1215,57 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
   }
 
   #emitJoinAttempt(status: 'success' | 'failure', failureStage: FailureStage): void {
-    this.#counter('dt_client_join_attempts_total', { status, failure_stage: failureStage });
+    // ONE emission per join() call (success rate stays per user-level join);
+    // `retried` says whether that join re-ran its GC join (`JOIN_RETRY`).
+    this.#counter('dt_client_join_attempts_total', {
+      status,
+      failure_stage: failureStage,
+      retried: this.#joinRetried ? 'true' : 'false',
+    });
+  }
+
+  /**
+   * Release a join attempt MC refused with a retryable code, so nothing from it
+   * survives into the next attempt: its transport (and the handler set and dial
+   * tokens it held), its signalling client, any KEK and the roster keys it
+   * received. The meeting identity is kept: the retry joins the SAME meeting.
+   */
+  #releaseRejectedAttempt(media: MediaTransport, signaling: SignalingClient): void {
+    try {
+      media.disconnect();
+    } catch {
+      // ignore — best-effort teardown, as `disconnect()`
+    }
+    try {
+      signaling.close();
+    } catch {
+      // ignore
+    }
+    this.#kekSource.clear();
+    this.#rosterKeys?.clear();
+    this.#media = undefined;
+    this.#signaling = undefined;
+  }
+
+  /**
+   * The join-retry backoff wait, on the injected scheduler (tests drive it),
+   * else the global timer. `disconnect()` cuts it short (`#cancelBackoff`), so a
+   * torn-down session never sits out a backoff or starts another attempt.
+   */
+  #sleep(delayMs: number): Promise<void> {
+    return new Promise((resolve) => {
+      const scheduler = this.#transportScheduler;
+      const done = (): void => {
+        this.#cancelBackoff = undefined;
+        resolve();
+      };
+      const handle = scheduler ? scheduler.setTimeout(done, delayMs) : setTimeout(done, delayMs);
+      this.#cancelBackoff = () => {
+        if (scheduler) scheduler.clearTimeout(handle);
+        else clearTimeout(handle as ReturnType<typeof setTimeout>);
+        done();
+      };
+    });
   }
 
   #emitSignalingConnection(status: 'success' | 'failure', closeReason: CloseReason): void {

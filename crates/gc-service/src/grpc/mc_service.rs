@@ -489,8 +489,11 @@ impl GlobalControllerService for McService {
 
     /// Handle meeting ended notification from a Meeting Controller.
     ///
-    /// Called when a meeting ends (last participant leaves). Marks the
-    /// assignment as ended (soft delete) for audit trail.
+    /// Called when a meeting ends on MC: the last participant left, or no
+    /// participant connected within MC's join window (ADR-0010 §3). The notify
+    /// carries no cause; GC handles both the same way. Marks the assignment as
+    /// ended (soft delete) for audit trail; the next join revives the row as a
+    /// new incarnation (`atomic_assign`).
     #[instrument(skip_all, name = "gc.grpc.notify_meeting_ended")]
     async fn notify_meeting_ended(
         &self,

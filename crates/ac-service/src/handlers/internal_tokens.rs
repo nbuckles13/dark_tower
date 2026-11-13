@@ -15,13 +15,11 @@ use crate::observability::ErrorCategory;
 use crate::repositories::signing_keys;
 use crate::repositories::users::{self, User};
 use axum::{extract::State, Extension, Json};
+use common::meeting_token::MEETING_TOKEN_MAX_TTL_SECONDS;
 use common::secret::ExposeSecret;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::instrument;
-
-/// Maximum allowed TTL for meeting/guest tokens (15 minutes).
-const MAX_TOKEN_TTL_SECONDS: u32 = 900;
 
 /// Required scope for internal token endpoints.
 const REQUIRED_SCOPE: &str = "internal:meeting-token";
@@ -59,7 +57,7 @@ pub async fn handle_meeting_token(
     }
 
     // Validate TTL (max 15 minutes)
-    let ttl = payload.ttl_seconds.min(MAX_TOKEN_TTL_SECONDS);
+    let ttl = payload.ttl_seconds.min(MEETING_TOKEN_MAX_TTL_SECONDS);
 
     // Issue the meeting token
     let result = issue_meeting_token_internal(&state, &payload, ttl).await;
@@ -112,7 +110,7 @@ pub async fn handle_guest_token(
     }
 
     // Validate TTL (max 15 minutes)
-    let ttl = payload.ttl_seconds.min(MAX_TOKEN_TTL_SECONDS);
+    let ttl = payload.ttl_seconds.min(MEETING_TOKEN_MAX_TTL_SECONDS);
 
     // Issue the guest token
     let result = issue_guest_token_internal(&state, &payload, ttl).await;
@@ -485,11 +483,6 @@ mod tests {
     }
 
     #[test]
-    fn test_max_ttl_constant() {
-        assert_eq!(MAX_TOKEN_TTL_SECONDS, 900, "Max TTL should be 15 minutes");
-    }
-
-    #[test]
     fn test_required_scope_constant() {
         assert_eq!(
             REQUIRED_SCOPE, "internal:meeting-token",
@@ -500,7 +493,8 @@ mod tests {
     // P0 Security Tests - Scope Validation
 
     /// Test that scope validation correctly rejects claims missing the required scope.
-    /// This tests the security control at lines 47-56 that checks for internal:meeting-token.
+    /// This tests the scope check in `handle_meeting_token` / `handle_guest_token` that
+    /// requires `internal:meeting-token`.
     #[test]
     fn test_meeting_token_scope_validation_missing() {
         // Simulate scope validation logic used in handlers
@@ -592,7 +586,7 @@ mod tests {
     // P0 Crypto Tests - Invalid Key Format
 
     /// Test that sign_meeting_jwt rejects invalid PKCS8 private key format.
-    /// This tests the error path at lines 276-279 where Ed25519KeyPair::from_pkcs8
+    /// This tests the error path in `sign_meeting_jwt` where Ed25519KeyPair::from_pkcs8
     /// fails due to malformed key data.
     #[test]
     fn test_sign_meeting_jwt_invalid_pkcs8_format_returns_error() {
@@ -636,7 +630,7 @@ mod tests {
     }
 
     /// Test that sign_guest_jwt rejects invalid PKCS8 private key format.
-    /// This tests the error path at lines 303-306 where Ed25519KeyPair::from_pkcs8
+    /// This tests the error path in `sign_guest_jwt` where Ed25519KeyPair::from_pkcs8
     /// fails due to malformed key data.
     #[test]
     fn test_sign_guest_jwt_invalid_pkcs8_format_returns_error() {
@@ -681,27 +675,28 @@ mod tests {
 
     // P1 Tests - TTL Capping
 
-    /// Test that TTL values are properly capped to MAX_TOKEN_TTL_SECONDS (900).
-    /// This tests the logic at line 59: `payload.ttl_seconds.min(MAX_TOKEN_TTL_SECONDS)`.
+    /// Test that TTL values are properly capped to MEETING_TOKEN_MAX_TTL_SECONDS (900).
+    /// This tests the clamp in `handle_meeting_token` / `handle_guest_token`:
+    /// `payload.ttl_seconds.min(MEETING_TOKEN_MAX_TTL_SECONDS)`.
     #[test]
     fn test_meeting_token_ttl_capping() {
         // Test case 1: TTL above max should be capped
         let requested_ttl: u32 = 3600; // 1 hour
-        let capped_ttl = requested_ttl.min(MAX_TOKEN_TTL_SECONDS);
+        let capped_ttl = requested_ttl.min(MEETING_TOKEN_MAX_TTL_SECONDS);
         assert_eq!(
-            capped_ttl, MAX_TOKEN_TTL_SECONDS,
+            capped_ttl, MEETING_TOKEN_MAX_TTL_SECONDS,
             "TTL of {} should be capped to {}",
-            requested_ttl, MAX_TOKEN_TTL_SECONDS
+            requested_ttl, MEETING_TOKEN_MAX_TTL_SECONDS
         );
 
         // Test case 2: TTL at max should remain unchanged
         let requested_ttl_at_max: u32 = 900;
-        let capped_ttl_at_max = requested_ttl_at_max.min(MAX_TOKEN_TTL_SECONDS);
+        let capped_ttl_at_max = requested_ttl_at_max.min(MEETING_TOKEN_MAX_TTL_SECONDS);
         assert_eq!(capped_ttl_at_max, 900, "TTL at max should remain 900");
 
         // Test case 3: TTL below max should remain unchanged
         let requested_ttl_below: u32 = 300; // 5 minutes
-        let capped_ttl_below = requested_ttl_below.min(MAX_TOKEN_TTL_SECONDS);
+        let capped_ttl_below = requested_ttl_below.min(MEETING_TOKEN_MAX_TTL_SECONDS);
         assert_eq!(
             capped_ttl_below, 300,
             "TTL below max should remain unchanged"
@@ -709,12 +704,12 @@ mod tests {
 
         // Test case 4: TTL of 0 should remain 0
         let requested_ttl_zero: u32 = 0;
-        let capped_ttl_zero = requested_ttl_zero.min(MAX_TOKEN_TTL_SECONDS);
+        let capped_ttl_zero = requested_ttl_zero.min(MEETING_TOKEN_MAX_TTL_SECONDS);
         assert_eq!(capped_ttl_zero, 0, "TTL of 0 should remain 0");
 
         // Test case 5: TTL at boundary (901) should be capped
         let requested_ttl_boundary: u32 = 901;
-        let capped_ttl_boundary = requested_ttl_boundary.min(MAX_TOKEN_TTL_SECONDS);
+        let capped_ttl_boundary = requested_ttl_boundary.min(MEETING_TOKEN_MAX_TTL_SECONDS);
         assert_eq!(
             capped_ttl_boundary, 900,
             "TTL of 901 should be capped to 900"
@@ -722,7 +717,7 @@ mod tests {
 
         // Test case 6: Very large TTL should be capped
         let requested_ttl_large: u32 = u32::MAX;
-        let capped_ttl_large = requested_ttl_large.min(MAX_TOKEN_TTL_SECONDS);
+        let capped_ttl_large = requested_ttl_large.min(MEETING_TOKEN_MAX_TTL_SECONDS);
         assert_eq!(
             capped_ttl_large, 900,
             "Very large TTL should be capped to 900"

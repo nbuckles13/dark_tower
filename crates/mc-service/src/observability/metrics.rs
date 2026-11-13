@@ -962,6 +962,48 @@ pub fn record_connect_settle(outcome: SettleOutcome) {
     .increment(1);
 }
 
+/// Label key of `mc_meetings_ended_total`'s cause (`MeetingEndCause::label`).
+/// MC-local: `common::observability::labels` has no end-cause key.
+pub const MEETING_END_CAUSE_LABEL: &str = "cause";
+/// Label key of `mc_meetings_ended_total`'s reason
+/// (`MeetingEndCause::reason_label`).
+pub const MEETING_END_REASON_LABEL: &str = "reason";
+
+/// Record one meeting END (not a shutdown), once per meeting, at the
+/// controller's reap — from the same value as the controller's
+/// "Meeting ended; releasing it on its media handlers" line.
+///
+/// Metric: `mc_meetings_ended_total`
+/// Labels: `cause` x `reason`, the pairs of `MeetingEndCause::COUNTED`
+/// (`empty/last_participant_left`, `empty/join_window_expired`,
+/// `closed/closed`)
+///
+/// No `key_custody` (not a media-path family) and no alert: join-window ends
+/// are expected (GC-only joins, abandoned joins). It makes the
+/// never-joined-meeting class countable instead of a floor on
+/// `mc_meetings_active`.
+pub fn record_meeting_ended(cause: crate::actors::MeetingEndCause) {
+    counter!(
+        "mc_meetings_ended_total",
+        MEETING_END_CAUSE_LABEL => cause.label(),
+        MEETING_END_REASON_LABEL => cause.reason_label()
+    )
+    .increment(1);
+}
+
+/// Publish the meeting actors' lifetime timers as MC enforces them.
+///
+/// Metrics: `mc_meeting_join_window_seconds`,
+/// `mc_meeting_disconnect_grace_seconds` (no labels, cardinality 1 each)
+///
+/// A CONFIG ECHO set once at boot from the SAME `MeetingTimers` every meeting
+/// actor receives (`Config::meeting_timers`), so published and enforced
+/// cannot drift.
+pub fn set_meeting_timers(timers: crate::actors::MeetingTimers) {
+    gauge!("mc_meeting_join_window_seconds").set(timers.join_window.as_secs_f64());
+    gauge!("mc_meeting_disconnect_grace_seconds").set(timers.disconnect_grace.as_secs_f64());
+}
+
 /// Publish the configured connect settle window.
 ///
 /// Metric: `mc_media_connect_settle_window_seconds`
@@ -2721,6 +2763,14 @@ pub fn zero_initialize_counters() {
     for c in DisconnectCause::ALL {
         counter!("mc_participant_disconnects_total", "cause" => c.label()).increment(0);
     }
+    for c in crate::actors::MeetingEndCause::COUNTED {
+        counter!(
+            "mc_meetings_ended_total",
+            MEETING_END_CAUSE_LABEL => c.label(),
+            MEETING_END_REASON_LABEL => c.reason_label()
+        )
+        .increment(0);
+    }
 
     // --- enum-less string vocabularies ---
     for s in STATUS_SUCCESS_ERROR {
@@ -2857,6 +2907,21 @@ mod tests {
         present_at_zero(r#"mc_webtransport_connections_total{status="rejected"}"#);
         present_at_zero(r#"mc_actor_panics_total{actor_type="controller"}"#);
         present_at_zero(r#"mc_session_join_failures_total{error_type="jwt_validation"}"#);
+        // Every counted meeting end (cause, reason) pair, from the enum; and
+        // NO shutdown series (a shutdown is not a meeting end).
+        for cause in crate::actors::MeetingEndCause::COUNTED {
+            present_at_zero(&format!(
+                r#"mc_meetings_ended_total{{cause="{}",reason="{}"}}"#,
+                cause.label(),
+                cause.reason_label()
+            ));
+        }
+        assert!(
+            !rendered
+                .lines()
+                .any(|l| l.starts_with(r#"mc_meetings_ended_total{cause="shutdown""#)),
+            "mc_meetings_ended_total must not render a shutdown series"
+        );
         // Media enum-ALL counter (exposition preserves emission label order:
         // outcome then key_custody).
         present_at_zero(
@@ -4377,6 +4442,34 @@ mod tests {
                 .with_labels(&[(KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR)])
                 .assert_value(refresh);
         }
+    }
+
+    #[test]
+    fn meeting_timer_gauges_echo_the_enforced_timers() {
+        let snap = MetricAssertion::snapshot();
+        set_meeting_timers(crate::actors::MeetingTimers {
+            join_window: std::time::Duration::from_secs(40),
+            disconnect_grace: std::time::Duration::from_secs(12),
+        });
+        snap.gauge("mc_meeting_join_window_seconds")
+            .assert_value(40.0);
+        snap.gauge("mc_meeting_disconnect_grace_seconds")
+            .assert_value(12.0);
+    }
+
+    /// One increment on exactly its own (cause, reason) cell; the sibling
+    /// reason is untouched.
+    #[test]
+    fn meetings_ended_counts_the_cause_and_reason_cell() {
+        use crate::actors::{EmptyReason, MeetingEndCause};
+        let snap = MetricAssertion::snapshot();
+        record_meeting_ended(MeetingEndCause::Empty(EmptyReason::JoinWindowExpired));
+        snap.counter("mc_meetings_ended_total")
+            .with_labels(&[("cause", "empty"), ("reason", "join_window_expired")])
+            .assert_delta(1);
+        snap.counter("mc_meetings_ended_total")
+            .with_labels(&[("cause", "empty"), ("reason", "last_participant_left")])
+            .assert_delta(0);
     }
 
     /// `rate_limited` is its own cell: an over-rate update counts there once

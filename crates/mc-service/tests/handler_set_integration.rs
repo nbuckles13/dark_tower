@@ -614,8 +614,12 @@ async fn a_later_assignment_change_does_not_alter_a_live_meetings_handlers() {
 // T7: a parked reply is answered when the meeting ends — never leaked
 // ============================================================================
 
+/// Answered `MeetingTeardownInProgress` (since the join-window devloop: an
+/// ENDING meeting refuses with the code the SDK re-joins through GC on;
+/// `Draining` is MC-wide shutdown only) — an `Err`, so it carries no KEK, no
+/// handler set and no dial token (security R1).
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn a_parked_join_is_answered_draining_when_the_meeting_ends() {
+async fn a_parked_join_is_answered_teardown_in_progress_when_the_meeting_ends() {
     let mh = Arc::new(MockMhRegistrationClient::new());
     mh.hold_handler(H_A);
     let meeting = spawn_meeting("t7", &[mh_handler(H_A)]);
@@ -625,8 +629,8 @@ async fn a_parked_join_is_answered_draining_when_the_meeting_ends() {
     meeting.close_meeting("test".to_string()).await.unwrap();
     let reply = (&mut a.reply).await.unwrap();
     assert!(
-        matches!(reply, Err(McError::Draining)),
-        "answered Draining, not dropped: {reply:?}"
+        matches!(reply, Err(McError::MeetingTeardownInProgress)),
+        "answered TeardownInProgress, not dropped: {reply:?}"
     );
     assert!(
         t0.elapsed() < FIRST_JOIN_PARK_DEADLINE,

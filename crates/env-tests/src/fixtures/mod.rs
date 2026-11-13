@@ -10,6 +10,7 @@ pub mod gc_client;
 pub mod gc_fleet;
 pub mod injection;
 pub mod kube;
+pub mod loki;
 pub mod mc_session;
 pub mod media;
 pub mod metric_hygiene;

@@ -72,22 +72,32 @@ test.describe('MC token rejection (R-45)', () => {
     // dependence on rejection detail leaking (fail-closed contract).
     await expectLastErrorCode(page, SdkErrorCode.Signaling);
 
-    // (2) Server-side proof: MC's auth-gate rejection counter moved. This is
-    // what a dead/unreachable MC (whose transport failure also renders
-    // SIGNALING: in the DOM) cannot fake. Label anchor: see McJoinFailureErrorType
-    // in mcMetrics.ts (step 5 AND step 6 both record jwt_validation).
-    await waitForMcSessionJoinFailureAbove(baseline, 'jwt_validation');
-
-    // (3) Terminal condition established (error rendered + counter moved) —
-    // point-in-time scan.
+    // (2) No join succeeded for the corrupted attempt. Asserted NOW — a
+    // point-in-time scan BEFORE the recovery below — because the recovery
+    // produces a legitimate 'joined' event that a later scan would see.
     await expectNoJoinedEvent(page, 'mc-token-rejection');
 
-    // Recovery (gap 3): the rejection is transient to the corrupted binding, not
-    // the session. Clear the meetingId rewrite (recovery MUST run WITHOUT it) and
-    // rejoin the SAME real meeting in the SAME page session — MC now sees a
-    // matching binding and admits the join.
+    // (3) Recovery (gap 3) runs IMMEDIATELY, before the counter wait: the real
+    // meeting was assigned by the GC join above but never got an MC participant,
+    // so MC ends it at its join window (MC_MEETING_JOIN_WINDOW_SECONDS, short in
+    // Kind) — and the counter wait below can take up to a minute on a slow
+    // Prometheus. Recovering first gives the meeting its participant within
+    // seconds, so the window never comes into play (join-window devloop,
+    // 2026-11-12; this spec runs with retries: 0, so it must not depend on the
+    // SDK's re-join retry). Clear the meetingId rewrite (recovery MUST run
+    // WITHOUT it) and rejoin the SAME real meeting in the SAME page session — MC
+    // now sees a matching binding and admits the join.
     await clearJoinResponseRewrite(page, meetingCode);
     const joined = await recoverByJoining(page, meetingCode);
+
+    // (4) Server-side proof: MC's auth-gate rejection counter moved. This is
+    // what a dead/unreachable MC (whose transport failure also renders
+    // SIGNALING: in the DOM) cannot fake. Label anchor: see McJoinFailureErrorType
+    // in mcMetrics.ts (step 5 AND step 6 both record jwt_validation). Still valid
+    // after the recovery: the counter is monotonic and the recovery join is a
+    // success, never a jwt_validation failure.
+    await waitForMcSessionJoinFailureAbove(baseline, 'jwt_validation');
+
     expect(
       joined.participantId,
       'recovery: a valid join must succeed once the meetingId rewrite is cleared',

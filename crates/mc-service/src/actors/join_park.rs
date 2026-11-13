@@ -53,6 +53,17 @@ use tokio::time::Instant;
 /// is why the park needs its own bound.
 pub const FIRST_JOIN_PARK_DEADLINE: Duration = Duration::from_secs(8);
 
+/// The SDK's join deadline (`DEFAULT_JOIN_TIMEOUT_MS`,
+/// `packages/sdk-core/src/signaling/SignalingClient.ts`): how long a client
+/// waits for its JoinResponse.
+///
+/// A mirror of the client's value, pinned EQUAL to it by the drift test in
+/// this module (the SDK source is read in exactly that one place). It bounds
+/// the park above and feeds the meeting join window's floor and derived
+/// default (`actors::meeting_timers`), so a client change that moved it
+/// without this constant would silently undercount both.
+pub const SDK_JOIN_DEADLINE: Duration = Duration::from_secs(15);
+
 /// Why parked replies were released (a log field, never a label).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReleaseReason {
@@ -202,12 +213,58 @@ mod tests {
         assert!(!park.is_pending());
     }
 
-    /// The SDK join deadline this park must stay below, read from the SDK
-    /// source itself (the single source of truth for the client's value).
+    /// Read an integer literal token (`15_000`, `500`) loudly.
+    fn parse_int_token(name: &str, token: &str) -> u64 {
+        let digits = token.trim().replace('_', "");
+        let value: u64 = digits.parse().unwrap_or_else(|e| {
+            panic!("EXTRACTION FAILED: `{name}` literal {token:?} is not an integer: {e}")
+        });
+        // Self-check: the whole token was the number (no expression, no unit
+        // suffix silently dropped).
+        assert_eq!(
+            value.to_string(),
+            digits,
+            "EXTRACTION FAILED: `{name}` {token:?} is not a plain integer literal"
+        );
+        value
+    }
+
+    /// THE extraction of a TS integer constant: the `[export ]const NAME =
+    /// <literal>;` line of `source`. Every failure is an `EXTRACTION FAILED`
+    /// panic — never confusable with the value checks that follow.
+    fn extract_ts_int_const(source: &str, file: &str, name: &str) -> u64 {
+        let declaration = format!("const {name} =");
+        let line = source
+            .lines()
+            .map(str::trim_start)
+            .find(|l| {
+                l.strip_prefix("export ")
+                    .unwrap_or(l)
+                    .starts_with(&declaration)
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "EXTRACTION FAILED: no `{declaration} ...` line in {file} (renamed or \
+                     moved?) — update this drift test, never skip it"
+                )
+            });
+        // The literal token: everything between `=` and `;`, e.g. `15_000`.
+        let token = line
+            .split_once('=')
+            .and_then(|(_, rhs)| rhs.split_once(';'))
+            .map(|(literal, _)| literal.trim())
+            .unwrap_or_else(|| panic!("EXTRACTION FAILED: no `= <literal>;` in {line:?}"));
+        parse_int_token(name, token)
+    }
+
+    /// The SDK join deadline, read from the SDK source itself (the single
+    /// source of truth for the client's value) and pinned EQUAL to
+    /// [`SDK_JOIN_DEADLINE`]; then the park's margin below it.
     ///
-    /// Two distinct failures, so a vacuous pass is impossible: the EXTRACTION
+    /// Distinct failures, so a vacuous pass is impossible: the EXTRACTION
     /// fails loudly if the constant is missing, renamed or unparseable; the
-    /// MARGIN check fails if the park deadline crept too close.
+    /// MIRROR check fails if the SDK moved its deadline; the MARGIN check
+    /// fails if the park deadline crept too close.
     #[test]
     fn the_park_deadline_stays_below_the_sdk_join_deadline() {
         /// Headroom between a released JoinResponse and the client giving up:
@@ -218,39 +275,69 @@ mod tests {
             include_str!("../../../../packages/sdk-core/src/signaling/SignalingClient.ts");
         const NAME: &str = "DEFAULT_JOIN_TIMEOUT_MS";
 
-        let declaration = format!("const {NAME} =");
-        let line = SDK_SOURCE
-            .lines()
-            .find(|l| l.trim_start().starts_with(&declaration))
-            .unwrap_or_else(|| {
-                panic!(
-                    "EXTRACTION FAILED: no `{declaration} ...` line in SignalingClient.ts \
-                     (renamed or moved?) — update this drift test, never skip it"
-                )
-            });
-        // The literal token: everything between `=` and `;`, e.g. `15_000`.
-        let token = line
-            .split_once('=')
-            .and_then(|(_, rhs)| rhs.split_once(';'))
-            .map(|(literal, _)| literal.trim())
-            .unwrap_or_else(|| panic!("EXTRACTION FAILED: no `= <literal>;` in {line:?}"));
-        let digits = token.replace('_', "");
-        let sdk_ms: u64 = digits.parse().unwrap_or_else(|e| {
-            panic!("EXTRACTION FAILED: `{NAME}` literal {token:?} is not an integer: {e}")
-        });
-        // Self-check: the whole token was the number (no expression, no unit
-        // suffix silently dropped).
+        let sdk_ms = extract_ts_int_const(SDK_SOURCE, "SignalingClient.ts", NAME);
         assert_eq!(
-            sdk_ms.to_string(),
-            digits,
-            "EXTRACTION FAILED: {token:?} is not a plain integer literal"
+            SDK_JOIN_DEADLINE,
+            Duration::from_millis(sdk_ms),
+            "MIRROR DRIFT: SDK_JOIN_DEADLINE no longer equals the SDK's {NAME} ({sdk_ms} ms); \
+             update it — the join window's floor and derived default sum it"
         );
-
-        let sdk = Duration::from_millis(sdk_ms);
         assert!(
-            FIRST_JOIN_PARK_DEADLINE + MARGIN < sdk,
+            FIRST_JOIN_PARK_DEADLINE + MARGIN < SDK_JOIN_DEADLINE,
             "MARGIN VIOLATED: park deadline {FIRST_JOIN_PARK_DEADLINE:?} + margin {MARGIN:?} \
-             must be below the SDK join deadline {sdk:?}"
+             must be below the SDK join deadline {SDK_JOIN_DEADLINE:?}"
+        );
+    }
+
+    /// The SDK's mirror of `END_MEETING_BACKOFF` (`MC_END_MEETING_BACKOFF_MS`,
+    /// `packages/sdk-core/src/config/clientConfig.ts`) is pinned EQUAL to the
+    /// MC constant. The join-retry span formula lives ONLY in TS
+    /// (`session/joinRetry.ts`), whose test asserts the derived span exceeds
+    /// that mirror — so the formula is never restated here, and this pin keeps
+    /// the mirror honest.
+    #[test]
+    fn the_sdk_end_meeting_backoff_mirror_equals_mcs() {
+        const SDK_CONFIG: &str =
+            include_str!("../../../../packages/sdk-core/src/config/clientConfig.ts");
+        const NAME: &str = "MC_END_MEETING_BACKOFF_MS";
+        let sdk_ms = extract_ts_int_const(SDK_CONFIG, "clientConfig.ts", NAME);
+        assert_eq!(
+            crate::media_routing::teardown::END_MEETING_BACKOFF,
+            Duration::from_millis(sdk_ms),
+            "MIRROR DRIFT: the SDK's {NAME} ({sdk_ms} ms) no longer equals MC's \
+             END_MEETING_BACKOFF; the join-retry floor is sized against it"
+        );
+    }
+
+    /// Positive control: the extractor reads an `export const` fixture.
+    #[test]
+    fn the_ts_extractor_reads_an_export_const() {
+        let fixture = "// x\nexport const MC_END_MEETING_BACKOFF_MS = 1_000;\n";
+        assert_eq!(
+            extract_ts_int_const(fixture, "fixture", "MC_END_MEETING_BACKOFF_MS"),
+            1000
+        );
+    }
+
+    /// And it fails as EXTRACTION — never as a value verdict — when the
+    /// constant is missing or is not a plain literal.
+    #[test]
+    #[should_panic(expected = "EXTRACTION FAILED")]
+    fn the_ts_extractor_fails_loudly_on_a_missing_constant() {
+        let _ = extract_ts_int_const(
+            "export const OTHER = 1;",
+            "fixture",
+            "MC_END_MEETING_BACKOFF_MS",
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "EXTRACTION FAILED")]
+    fn the_ts_extractor_fails_loudly_on_an_expression() {
+        let _ = extract_ts_int_const(
+            "export const MC_END_MEETING_BACKOFF_MS = 2 * 500;",
+            "fixture",
+            "MC_END_MEETING_BACKOFF_MS",
         );
     }
 }

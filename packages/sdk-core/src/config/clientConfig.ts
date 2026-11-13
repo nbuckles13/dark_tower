@@ -601,6 +601,46 @@ export const HANDLER_SET_CONFIG_RANGES: Readonly<
  */
 export const MH_KEEPALIVE_FLOOR_MS = 2_000;
 
+/**
+ * The bounded GC re-join inside `MeetingSession.join()` (join-window devloop,
+ * 2026-11-12).
+ *
+ * An MC meeting exists only while it has participants: a meeting nobody joins
+ * ends at MC's join window, and GC's reuse path does not tell MC about a later
+ * GC join. A join that reaches MC after the end is refused `NOT_FOUND`
+ * (`meeting_not_found`) or `CONFLICT` (`teardown_in_progress`), and a fresh GC
+ * join re-assigns the meeting once GC has processed MC's `NotifyMeetingEnded`.
+ * `join()` therefore re-runs the GC join on exactly those two codes, during the
+ * initial join only.
+ *
+ * Equal jitter (`session/joinRetry.ts`): wait n is `w(n)/2 + U[0, w(n)/2)`,
+ * `w(n) = min(capMs, baseMs * 2^n)`. The guaranteed minimum cumulative backoff
+ * (`JOIN_RETRY_MIN_SPAN_MS`, derived from these values) must exceed
+ * {@link MC_END_MEETING_BACKOFF_MS} — one release retry, the first step off a
+ * healthy teardown — which `session/__tests__/joinRetry.test.ts` asserts with
+ * the real formula.
+ *
+ * The budget covers a normal teardown plus GC's `NotifyMeetingEnded`
+ * processing, NOT MC's `TEARDOWN_MAX` (`teardown_fence_hold_max_seconds` on
+ * MC's startup line). A slow-MH release that outlasts it surfaces as
+ * `SignalingError(Conflict)` for the caller to retry. Not a runtime knob.
+ */
+export const JOIN_RETRY = {
+  maxAttempts: 4,
+  baseMs: 500,
+  capMs: 2000,
+} as const;
+
+/**
+ * MC's `END_MEETING_BACKOFF` (`crates/mc-service/src/media_routing/teardown.rs`)
+ * in ms: the delay before MC's one release retry. The {@link JOIN_RETRY} floor
+ * is sized above it. A MIRROR, pinned EQUAL to the MC constant by the Rust test
+ * `the_sdk_end_meeting_backoff_mirror_equals_mcs`
+ * (`crates/mc-service/src/actors/join_park.rs`), which reads this line — keep it
+ * a plain integer literal.
+ */
+export const MC_END_MEETING_BACKOFF_MS = 1000;
+
 /** Media-path configuration. */
 export interface MediaConfig {
   readonly audio: AudioConfig;

@@ -19,7 +19,12 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 /// Default binding token TTL (ADR-0023: 30 seconds).
-const BINDING_TOKEN_TTL: Duration = Duration::from_secs(30);
+///
+/// Also the CEILING of `MC_DISCONNECT_GRACE_PERIOD_SECONDS` (config.rs): a
+/// grace longer than the window in which a reconnect's binding token is still
+/// valid serves no reconnect — it only keeps a departed participant on the
+/// roster, deferring the leave KEK rotation and keeping the meeting alive.
+pub(crate) const BINDING_TOKEN_TTL: Duration = Duration::from_secs(30);
 
 /// Session binding token manager.
 ///

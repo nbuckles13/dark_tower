@@ -496,8 +496,10 @@ impl MeetingAssignmentsRepository {
 
         let count = result?.rows_affected();
 
+        // DEBUG, not INFO: the caller (`McAssignmentService::end_assignment`,
+        // target `gc.service.assignment`) is the single INFO record of an end.
         if count > 0 {
-            tracing::info!(
+            tracing::debug!(
                 target: "gc.repository.assignments",
                 meeting_id = %meeting_id,
                 region = ?region,
@@ -509,11 +511,14 @@ impl MeetingAssignmentsRepository {
         Ok(count)
     }
 
-    /// End stale assignments (meetings with no activity).
+    /// Backstop: end assignments MC never reported ended.
     ///
-    /// Soft-deletes assignments where the meeting has had no activity
-    /// (defined as `assigned_at` being older than the inactivity threshold).
-    /// This handles meetings where the MC crashed or failed to notify GC.
+    /// Soft-deletes active assignments whose MC is no longer healthy and whose
+    /// `assigned_at` is older than `inactivity_hours`. This handles meetings
+    /// whose MC crashed before it could send `NotifyMeetingEnded`. It is NOT an
+    /// inactivity timer (GC has no participant data); MC ends empty and
+    /// never-joined meetings itself (ADR-0010 §3). A row whose MC is healthy is
+    /// never touched, so this cannot hand a live meeting to a second MC.
     ///
     /// # Arguments
     ///
@@ -588,8 +593,10 @@ impl MeetingAssignmentsRepository {
 
         let count = result?.rows_affected();
 
+        // DEBUG, not INFO: the caller (`assignment_cleanup::run_cleanup`) is
+        // the single WARN/INFO record; this keeps only `batch_size`.
         if count > 0 {
-            tracing::info!(
+            tracing::debug!(
                 target: "gc.repository.assignments",
                 inactivity_hours = inactivity_hours,
                 count = count,
@@ -650,8 +657,10 @@ impl MeetingAssignmentsRepository {
 
         let count = result?.rows_affected();
 
+        // DEBUG, not INFO: the caller (`assignment_cleanup::run_cleanup`) is
+        // the single WARN/INFO record; this keeps only `batch_size`.
         if count > 0 {
-            tracing::info!(
+            tracing::debug!(
                 target: "gc.repository.assignments",
                 retention_days = retention_days,
                 count = count,

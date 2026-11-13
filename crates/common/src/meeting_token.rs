@@ -8,6 +8,16 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use uuid::Uuid;
 
+/// The upper bound on the lifetime of every meeting and guest token AC issues,
+/// in seconds (15 minutes).
+///
+/// THE single declaration: AC clamps every requested `ttl_seconds` to it, GC
+/// requests it, the serde default for an omitted `ttl_seconds` is it, and
+/// MC's default join window (`MC_MEETING_JOIN_WINDOW_SECONDS`) is derived from
+/// it. Changing it moves all of those together, deliberately — including how
+/// long MC keeps a meeting nobody has joined.
+pub const MEETING_TOKEN_MAX_TTL_SECONDS: u32 = 900;
+
 /// Request to AC for a meeting token (authenticated user).
 ///
 /// Sent by GC to `POST /api/v1/auth/internal/meeting-token`.
@@ -38,7 +48,7 @@ pub struct MeetingTokenRequest {
     #[serde(default)]
     pub capabilities: Vec<String>,
 
-    /// Token TTL in seconds (max 900 = 15 minutes).
+    /// Token TTL in seconds (capped by AC at [`MEETING_TOKEN_MAX_TTL_SECONDS`]).
     #[serde(default = "default_meeting_ttl")]
     pub ttl_seconds: u32,
 }
@@ -64,7 +74,7 @@ pub struct GuestTokenRequest {
     #[serde(default = "default_waiting_room")]
     pub waiting_room: bool,
 
-    /// Token TTL in seconds (max 900 = 15 minutes).
+    /// Token TTL in seconds (capped by AC at [`MEETING_TOKEN_MAX_TTL_SECONDS`]).
     #[serde(default = "default_meeting_ttl")]
     pub ttl_seconds: u32,
 }
@@ -143,7 +153,7 @@ impl fmt::Display for MeetingRole {
 
 /// Default TTL for meeting tokens (15 minutes).
 fn default_meeting_ttl() -> u32 {
-    900
+    MEETING_TOKEN_MAX_TTL_SECONDS
 }
 
 /// Default waiting room setting (true).
@@ -155,6 +165,14 @@ fn default_waiting_room() -> bool {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// Pinned on purpose: changing the meeting-token lifetime cap is a
+    /// deliberate act that also moves the MC derived join window.
+    #[test]
+    fn meeting_token_max_ttl_is_pinned() {
+        assert_eq!(MEETING_TOKEN_MAX_TTL_SECONDS, 900);
+        assert_eq!(default_meeting_ttl(), MEETING_TOKEN_MAX_TTL_SECONDS);
+    }
 
     // =========================================================================
     // ParticipantType tests
@@ -290,14 +308,15 @@ mod tests {
 
     #[test]
     fn test_meeting_token_request_defaults_on_minimal_json() {
-        let json = r#"{
+        let json = serde_json::json!({
             "subject_user_id": "550e8400-e29b-41d4-a716-446655440001",
             "meeting_id": "550e8400-e29b-41d4-a716-446655440002",
             "meeting_org_id": "550e8400-e29b-41d4-a716-446655440003",
             "home_org_id": "550e8400-e29b-41d4-a716-446655440004"
-        }"#;
+        })
+        .to_string();
 
-        let req: MeetingTokenRequest = serde_json::from_str(json).unwrap();
+        let req: MeetingTokenRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(
             req.participant_type,
             ParticipantType::Member,
@@ -336,14 +355,15 @@ mod tests {
 
     #[test]
     fn test_guest_token_request_defaults_on_minimal_json() {
-        let json = r#"{
+        let json = serde_json::json!({
             "guest_id": "550e8400-e29b-41d4-a716-446655440001",
             "display_name": "Alice",
             "meeting_id": "550e8400-e29b-41d4-a716-446655440002",
             "meeting_org_id": "550e8400-e29b-41d4-a716-446655440003"
-        }"#;
+        })
+        .to_string();
 
-        let req: GuestTokenRequest = serde_json::from_str(json).unwrap();
+        let req: GuestTokenRequest = serde_json::from_str(&json).unwrap();
         assert!(req.waiting_room, "default waiting_room should be true");
         assert_eq!(req.ttl_seconds, 900, "default ttl_seconds should be 900");
     }

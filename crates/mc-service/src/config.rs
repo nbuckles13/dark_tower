@@ -15,7 +15,10 @@ use common::secret::SecretString;
 use std::collections::HashMap;
 use std::env;
 use std::fmt;
+use std::time::Duration;
 use thiserror::Error;
+
+use crate::actors::meeting_timers::{MAX_JOIN_WINDOW, MIN_JOIN_WINDOW};
 
 /// Default WebTransport bind address.
 pub const DEFAULT_WEBTRANSPORT_BIND_ADDRESS: &str = "0.0.0.0:4433";
@@ -26,14 +29,8 @@ pub const DEFAULT_GRPC_BIND_ADDRESS: &str = "0.0.0.0:50052";
 /// Default health endpoint bind address.
 pub const DEFAULT_HEALTH_BIND_ADDRESS: &str = "0.0.0.0:8081";
 
-/// Default binding token TTL in seconds (ADR-0023).
-pub const DEFAULT_BINDING_TOKEN_TTL_SECONDS: u64 = 30;
-
 /// Default clock skew allowance in seconds (ADR-0023).
 pub const DEFAULT_CLOCK_SKEW_SECONDS: u64 = 5;
-
-/// Default nonce grace window in seconds (ADR-0023).
-pub const DEFAULT_NONCE_GRACE_WINDOW_SECONDS: u64 = 5;
 
 /// Default participant disconnect grace period in seconds (ADR-0023).
 pub const DEFAULT_DISCONNECT_GRACE_PERIOD_SECONDS: u64 = 30;
@@ -290,17 +287,18 @@ pub struct Config {
     /// Maximum total participants across all meetings.
     pub max_participants: u32,
 
-    /// Binding token TTL in seconds (default: 30, per ADR-0023).
-    pub binding_token_ttl_seconds: u64,
-
     /// Clock skew allowance in seconds (default: 5, per ADR-0023).
     pub clock_skew_seconds: u64,
 
-    /// Nonce grace window in seconds (default: 5, per ADR-0023).
-    pub nonce_grace_window_seconds: u64,
-
     /// Participant disconnect grace period in seconds (default: 30, per ADR-0023).
+    /// Enforced by every meeting actor via [`Self::meeting_timers`].
     pub disconnect_grace_period_seconds: u64,
+
+    /// How long a meeting no participant has joined is kept before it ends
+    /// (`MC_MEETING_JOIN_WINDOW_SECONDS`). OPTIONAL: unset = the derived
+    /// default `actors::meeting_timers::MAX_JOIN_WINDOW`; bounded to
+    /// `MIN_JOIN_WINDOW..=MAX_JOIN_WINDOW`, fail-loud.
+    pub meeting_join_window_seconds: u64,
 
     /// QUIC max-idle-timeout in seconds for the WebTransport server (default: 10).
     ///
@@ -492,15 +490,14 @@ impl fmt::Debug for Config {
             .field("mc_id", &self.mc_id)
             .field("max_meetings", &self.max_meetings)
             .field("max_participants", &self.max_participants)
-            .field("binding_token_ttl_seconds", &self.binding_token_ttl_seconds)
             .field("clock_skew_seconds", &self.clock_skew_seconds)
-            .field(
-                "nonce_grace_window_seconds",
-                &self.nonce_grace_window_seconds,
-            )
             .field(
                 "disconnect_grace_period_seconds",
                 &self.disconnect_grace_period_seconds,
+            )
+            .field(
+                "meeting_join_window_seconds",
+                &self.meeting_join_window_seconds,
             )
             .field(
                 "quic_max_idle_timeout_seconds",
@@ -698,30 +695,48 @@ impl Config {
         // MC_CLOCK_SKEW_SECONDS is also bounded by the shared JWT ceiling
         // (`common::jwt::MAX_CLOCK_SKEW`, as AC enforces), which is what makes
         // `main.rs`'s "bounded to <= MAX_CLOCK_SKEW" cast justifications true.
-        let binding_token_ttl_seconds = optional_seconds(
-            vars,
-            "MC_BINDING_TOKEN_TTL_SECONDS",
-            u64::MAX,
-            DEFAULT_BINDING_TOKEN_TTL_SECONDS,
-        )?;
+        //
+        // `MC_BINDING_TOKEN_TTL_SECONDS` and `MC_NONCE_GRACE_WINDOW_SECONDS`
+        // were REMOVED (2026-11-12 join-window devloop, closing the docs/TODO.md
+        // "parsed but never consumed" entry): neither was enforced — the binding
+        // TTL is `actors::session::BINDING_TOKEN_TTL`, which also caps the
+        // disconnect grace — so a key an operator could set while a different
+        // value ran was a hazard. Both are now unread (see
+        // `test_retired_keys_are_not_read`).
         let clock_skew_seconds = optional_seconds(
             vars,
             "MC_CLOCK_SKEW_SECONDS",
             common::jwt::MAX_CLOCK_SKEW.as_secs(),
             DEFAULT_CLOCK_SKEW_SECONDS,
         )?;
-        let nonce_grace_window_seconds = optional_seconds(
-            vars,
-            "MC_NONCE_GRACE_WINDOW_SECONDS",
-            u64::MAX,
-            DEFAULT_NONCE_GRACE_WINDOW_SECONDS,
-        )?;
+        // Ceiling = the binding-token TTL (security S-1): a longer grace cannot
+        // serve any reconnect (the binding token has expired), it only keeps a
+        // departed participant on the roster — deferring the leave KEK
+        // rotation and keeping the meeting alive. Configurable DOWNWARD only.
+        // Floor 0 fails closed (immediate removal).
         let disconnect_grace_period_seconds = optional_seconds(
             vars,
             "MC_DISCONNECT_GRACE_PERIOD_SECONDS",
-            u64::MAX,
+            crate::actors::session::BINDING_TOKEN_TTL.as_secs(),
             DEFAULT_DISCONNECT_GRACE_PERIOD_SECONDS,
         )?;
+        // The join window: OPTIONAL (unset = the derived default), bounded on
+        // BOTH sides. The floor (`LIFETIME_TICK`) is the observer tolerance the
+        // end is checked against (the window itself is an exact deadline) and
+        // refuses a degenerate 0 / sub-tick window; the ceiling (the derived default) keeps the never-joined
+        // leak from being configured back in. See `actors::meeting_timers`.
+        let meeting_join_window_seconds = vars
+            .get("MC_MEETING_JOIN_WINDOW_SECONDS")
+            .map(|raw| {
+                bounded(
+                    "MC_MEETING_JOIN_WINDOW_SECONDS",
+                    raw,
+                    MIN_JOIN_WINDOW.as_secs(),
+                    MAX_JOIN_WINDOW.as_secs(),
+                )
+            })
+            .transpose()?
+            .unwrap_or(MAX_JOIN_WINDOW.as_secs());
 
         // QUIC max-idle-timeout: FAIL-LOUD parse (mirrors the OTEL_SAMPLE_RATE
         // pattern; every numeric MC key is fail-loud since story 4 MC-A). A
@@ -1062,10 +1077,9 @@ impl Config {
             mc_id,
             max_meetings,
             max_participants,
-            binding_token_ttl_seconds,
             clock_skew_seconds,
-            nonce_grace_window_seconds,
             disconnect_grace_period_seconds,
+            meeting_join_window_seconds,
             quic_max_idle_timeout_seconds,
             binding_token_secret,
             ac_endpoint,
@@ -1154,6 +1168,17 @@ impl Config {
     #[must_use]
     pub fn kek_lifecycle(&self) -> crate::media_admission::KekLifecycle {
         crate::media_admission::KekLifecycle::new(self.kek_rotation_debounce_seconds)
+    }
+
+    /// The meeting actors' lifetime timers — the ONE place the two keys become
+    /// durations. Every meeting actor and both config gauges read the value
+    /// returned here.
+    #[must_use]
+    pub fn meeting_timers(&self) -> crate::actors::MeetingTimers {
+        crate::actors::MeetingTimers {
+            join_window: Duration::from_secs(self.meeting_join_window_seconds),
+            disconnect_grace: Duration::from_secs(self.disconnect_grace_period_seconds),
+        }
     }
 
     /// Build an [`OtelConfig`] iff OTel is enabled (R-55).
@@ -1616,15 +1641,13 @@ mod tests {
         }
     }
 
-    /// The four ADR-0023 seconds keys: absent = default; unparseable refuses
+    /// The two ADR-0023 seconds keys: absent = default; unparseable refuses
     /// boot naming the key; MC_CLOCK_SKEW_SECONDS is bounded by the shared
     /// JWT ceiling (MAX passes, MAX+1 refuses).
     #[test]
     fn session_seconds_keys_fail_loudly_on_a_bad_value() {
         let keys = [
-            "MC_BINDING_TOKEN_TTL_SECONDS",
             "MC_CLOCK_SKEW_SECONDS",
-            "MC_NONCE_GRACE_WINDOW_SECONDS",
             "MC_DISCONNECT_GRACE_PERIOD_SECONDS",
         ];
         for key in keys {
@@ -1645,9 +1668,7 @@ mod tests {
             vars.insert(key.to_string(), "7".to_string());
             let config = Config::from_vars(&vars).expect("valid value loads");
             let got = match key {
-                "MC_BINDING_TOKEN_TTL_SECONDS" => config.binding_token_ttl_seconds,
                 "MC_CLOCK_SKEW_SECONDS" => config.clock_skew_seconds,
-                "MC_NONCE_GRACE_WINDOW_SECONDS" => config.nonce_grace_window_seconds,
                 _ => config.disconnect_grace_period_seconds,
             };
             assert_eq!(got, 7, "{key}");
@@ -1674,6 +1695,9 @@ mod tests {
             "MC_AUDIO_CODEC",
             "MC_AUDIO_MAX_BITRATE_BPS",
             "MC_AUDIO_FRAME_RATE_HZ",
+            // Removed 2026-11-12 (never consumed; see `from_vars`).
+            "MC_BINDING_TOKEN_TTL_SECONDS",
+            "MC_NONCE_GRACE_WINDOW_SECONDS",
         ] {
             vars.insert(key.to_string(), "garbage".to_string());
         }
@@ -1697,15 +1721,7 @@ mod tests {
         assert_eq!(config.gc_grpc_url, "http://localhost:50051");
         assert_eq!(config.max_meetings, 1000);
         assert_eq!(config.max_participants, 10000);
-        assert_eq!(
-            config.binding_token_ttl_seconds,
-            DEFAULT_BINDING_TOKEN_TTL_SECONDS
-        );
         assert_eq!(config.clock_skew_seconds, DEFAULT_CLOCK_SKEW_SECONDS);
-        assert_eq!(
-            config.nonce_grace_window_seconds,
-            DEFAULT_NONCE_GRACE_WINDOW_SECONDS
-        );
         assert_eq!(
             config.disconnect_grace_period_seconds,
             DEFAULT_DISCONNECT_GRACE_PERIOD_SECONDS
@@ -1746,11 +1762,10 @@ mod tests {
         vars.insert("GC_GRPC_URL".to_string(), "http://gc:50051".to_string());
         vars.insert("MC_MAX_MEETINGS".to_string(), "500".to_string());
         vars.insert("MC_MAX_PARTICIPANTS".to_string(), "5000".to_string());
-        vars.insert("MC_BINDING_TOKEN_TTL_SECONDS".to_string(), "60".to_string());
         vars.insert("MC_CLOCK_SKEW_SECONDS".to_string(), "10".to_string());
         vars.insert(
             "MC_DISCONNECT_GRACE_PERIOD_SECONDS".to_string(),
-            "45".to_string(),
+            "25".to_string(),
         );
         vars.insert(
             "MC_QUIC_MAX_IDLE_TIMEOUT_SECONDS".to_string(),
@@ -1766,10 +1781,92 @@ mod tests {
         assert_eq!(config.gc_grpc_url, "http://gc:50051");
         assert_eq!(config.max_meetings, 500);
         assert_eq!(config.max_participants, 5000);
-        assert_eq!(config.binding_token_ttl_seconds, 60);
         assert_eq!(config.clock_skew_seconds, 10);
-        assert_eq!(config.disconnect_grace_period_seconds, 45);
+        assert_eq!(config.disconnect_grace_period_seconds, 25);
         assert_eq!(config.quic_max_idle_timeout_seconds, 15);
+    }
+
+    // =========================================================================
+    // Meeting join window + grace → MeetingTimers (join-window devloop)
+    // =========================================================================
+
+    fn with_window(raw: &str) -> Result<Config, ConfigError> {
+        let mut vars = base_vars();
+        vars.insert(
+            "MC_MEETING_JOIN_WINDOW_SECONDS".to_string(),
+            raw.to_string(),
+        );
+        Config::from_vars(&vars)
+    }
+
+    #[test]
+    fn join_window_unset_is_the_derived_default() {
+        let config = Config::from_vars(&base_vars()).expect("Config should load");
+        assert_eq!(
+            config.meeting_join_window_seconds,
+            crate::actors::meeting_timers::MAX_JOIN_WINDOW.as_secs()
+        );
+        assert_eq!(config.meeting_join_window_seconds, 975);
+    }
+
+    #[test]
+    fn join_window_accepts_its_bounds_and_refuses_beyond_them() {
+        assert_eq!(with_window("5").unwrap().meeting_join_window_seconds, 5);
+        assert_eq!(with_window("10").unwrap().meeting_join_window_seconds, 10);
+        assert_eq!(with_window("975").unwrap().meeting_join_window_seconds, 975);
+        assert_eq!(with_window("30").unwrap().meeting_join_window_seconds, 30);
+        for refused in ["4", "976", "0", "", "abc", "-5", "30s"] {
+            assert!(
+                matches!(with_window(refused), Err(ConfigError::InvalidValue(_))),
+                "MC_MEETING_JOIN_WINDOW_SECONDS={refused:?} must refuse boot"
+            );
+        }
+    }
+
+    /// The grace is capped at the binding-token TTL (security S-1): its
+    /// ceiling is accepted, ceiling + 1 refuses boot, 0 is legal.
+    #[test]
+    fn disconnect_grace_is_capped_at_the_binding_token_ttl() {
+        let ceiling = crate::actors::session::BINDING_TOKEN_TTL.as_secs();
+        let with_grace = |raw: String| {
+            let mut vars = base_vars();
+            vars.insert("MC_DISCONNECT_GRACE_PERIOD_SECONDS".to_string(), raw);
+            Config::from_vars(&vars)
+        };
+        assert_eq!(
+            with_grace(ceiling.to_string())
+                .unwrap()
+                .disconnect_grace_period_seconds,
+            ceiling
+        );
+        assert_eq!(
+            with_grace("0".to_string())
+                .unwrap()
+                .disconnect_grace_period_seconds,
+            0
+        );
+        assert!(matches!(
+            with_grace((ceiling + 1).to_string()),
+            Err(ConfigError::InvalidValue(_))
+        ));
+        assert!(DEFAULT_DISCONNECT_GRACE_PERIOD_SECONDS <= ceiling);
+    }
+
+    /// Distinct values, so a swapped field or a dropped key is caught.
+    #[test]
+    fn meeting_timers_carries_each_key_to_its_own_field() {
+        let mut vars = base_vars();
+        vars.insert(
+            "MC_MEETING_JOIN_WINDOW_SECONDS".to_string(),
+            "40".to_string(),
+        );
+        vars.insert(
+            "MC_DISCONNECT_GRACE_PERIOD_SECONDS".to_string(),
+            "12".to_string(),
+        );
+        let timers = Config::from_vars(&vars).unwrap().meeting_timers();
+        assert_eq!(timers.join_window, Duration::from_secs(40));
+        assert_eq!(timers.disconnect_grace, Duration::from_secs(12));
     }
 
     // =========================================================================

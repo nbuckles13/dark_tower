@@ -11,6 +11,9 @@ resources:
 # overlay pattern.
 patches:
   - path: configmap-otel-patch.yaml
+  # Join-window devloop: a short MC_MEETING_JOIN_WINDOW_SECONDS for the Layer 7
+  # budget (prod keeps the derived default). Rationale in the patch file.
+  - path: configmap-join-window-patch.yaml
 
 labels:
   - pairs:

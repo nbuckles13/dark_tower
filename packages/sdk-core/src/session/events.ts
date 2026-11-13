@@ -47,6 +47,14 @@ import type {
  * Explicit `MeetingSession` lifecycle states (R-22). Const-object union (mirroring
  * the codebase `SignalingErrorCode` idiom) so consumers branch on stable values and
  * observability/UI map them without coupling to internals.
+ *
+ * Order: `idle -> fetching-token -> connecting-mc -> joining -> joined`. ONE
+ * backward edge: when MC refuses the join because the meeting ended or is
+ * ending (`NOT_FOUND` / `CONFLICT`, see `JOIN_RETRY`), `join()` re-enters
+ * `fetching-token` to re-run its GC join, at most `JOIN_RETRY.maxAttempts - 1`
+ * times, so `connecting-mc -> fetching-token` is a legal transition during the
+ * initial join only. A retried attempt emits no `error` event; the embedder
+ * sees it only as state changes.
  */
 export const MeetingSessionState = {
   Idle: 'idle',

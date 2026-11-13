@@ -1,0 +1,36 @@
+# Join-window override for the Kind dev cluster (join-window devloop;
+# values per operator direction 2026-11-13). The prod base sets
+# MC_MEETING_JOIN_WINDOW_SECONDS (infra/services/mc-service/config.env); this
+# patch RE-VALUES it for Kind (the value below). This is the ONE place the Kind value
+# lives: the env-test (47_mc_join_window.rs) reads it back from the
+# mc_meeting_join_window_seconds gauge, never from a literal, and fails fast if
+# it exceeds its LAYER7_WINDOW_BUDGET (i.e. this override did not apply).
+#
+# Why this value:
+# - Layer 7 budget: the join-window env-test waits about one window (plus at
+#   most one LIFETIME_TICK), so the window bounds what that test adds to every
+#   run. The operator asked for "5 or 10 s"; the safer end for the other
+#   suites.
+# - At or above MC's floor (LIFETIME_TICK, 5 s).
+# - Well above every env-test's first-GC-join -> first-MC-connect gap (a few
+#   seconds at most; audited by the test specialist across every Rust env-test
+#   incl. 40_resilience and the browser e2e specs, which connect inside one SDK
+#   join()). For the BROWSER specs a join that still loses the race is refused
+#   and the SDK re-joins through GC. The Rust env-test fixtures
+#   (fixtures/gc_client.rs, fixtures/mc_session.rs) have NO GC re-join: for
+#   every Rust env-test this value is a HARD bound on the first participant's
+#   GC-join -> MC-connect gap, and a test that loses it fails rather than
+#   recovers — which is why the rule below is "raise the value".
+#   mc-token-rejection.spec.ts was reordered so its meeting gets its
+#   participant within seconds.
+# - Measured GC "User joined meeting" -> MC first join over a Layer 7 run:
+#   recorded in docs/devloop-outputs/2026-11-12-mc-empty-meeting-join-window/main.md.
+#   If that gap ever approaches this value, RAISE this value (1 s of Layer 7
+#   per second) — never serialise or slow the tests to fit it.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mc-service-config
+  namespace: dark-tower
+data:
+  MC_MEETING_JOIN_WINDOW_SECONDS: "10"

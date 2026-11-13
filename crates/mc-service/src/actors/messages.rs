@@ -712,12 +712,36 @@ pub enum UnmuteRelay {
     NoHostConnected,
 }
 
+/// Why an EMPTY meeting ended — the bounded sub-reason of
+/// [`MeetingEndCause::Empty`]. Both end the meeting through the same path;
+/// the reason only tells them apart in logs and `mc_meetings_ended_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmptyReason {
+    /// The last roster participant was removed: a clean leave, a clean close,
+    /// or a grace expiry (a grace expiry is a leave).
+    LastParticipantLeft,
+    /// No participant was ever admitted within the meeting's join window
+    /// (`MC_MEETING_JOIN_WINDOW_SECONDS`, measured from actor creation).
+    JoinWindowExpired,
+}
+
+impl EmptyReason {
+    /// Bounded log / metric form.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::LastParticipantLeft => "last_participant_left",
+            Self::JoinWindowExpired => "join_window_expired",
+        }
+    }
+}
+
 /// Why a meeting actor ended. Decides whether GC is told the meeting ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MeetingEndCause {
-    /// The last roster participant was removed (clean leave, clean close, or
-    /// grace expiry). ADR-0010 §3: "last participant leaves, MC notifies GC".
-    Empty,
+    /// The meeting has no participants (ADR-0010 §3): its last participant
+    /// left, or nobody joined within the join window. MC notifies GC.
+    Empty(EmptyReason),
     /// Closed explicitly (`MeetingMessage::CloseMeeting`).
     Closed,
     /// MC is shutting down. The meeting is NOT over — a successor MC may take
@@ -731,17 +755,53 @@ pub enum MeetingEndCause {
 }
 
 impl MeetingEndCause {
+    /// The causes that are a meeting END, i.e. the series of
+    /// `mc_meetings_ended_total`. `Shutdown` is deliberately absent: the
+    /// meeting is not over and GC is not told. [`Self::counted`] is the
+    /// wildcard-free match that forces a new variant to be classified here.
+    pub const COUNTED: [Self; 3] = [
+        Self::Empty(EmptyReason::LastParticipantLeft),
+        Self::Empty(EmptyReason::JoinWindowExpired),
+        Self::Closed,
+    ];
+
+    /// Whether this cause is a meeting end counted on
+    /// `mc_meetings_ended_total` (exhaustive; see [`Self::COUNTED`]).
+    #[must_use]
+    pub fn counted(self) -> bool {
+        match self {
+            Self::Empty(EmptyReason::LastParticipantLeft | EmptyReason::JoinWindowExpired)
+            | Self::Closed => true,
+            Self::Shutdown => false,
+        }
+    }
+
     /// Whether GC should be told the meeting ended.
     #[must_use]
     pub fn notifies_gc(self) -> bool {
-        matches!(self, Self::Empty | Self::Closed)
+        match self {
+            Self::Empty(EmptyReason::LastParticipantLeft | EmptyReason::JoinWindowExpired)
+            | Self::Closed => true,
+            Self::Shutdown => false,
+        }
     }
 
-    /// Bounded log form.
+    /// Bounded log / metric form of the cause.
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
-            Self::Empty => "empty",
+            Self::Empty(_) => "empty",
+            Self::Closed => "closed",
+            Self::Shutdown => "shutdown",
+        }
+    }
+
+    /// Bounded log / metric form of the reason: the [`EmptyReason`] for an
+    /// empty meeting, otherwise the cause itself.
+    #[must_use]
+    pub fn reason_label(self) -> &'static str {
+        match self {
+            Self::Empty(reason) => reason.label(),
             Self::Closed => "closed",
             Self::Shutdown => "shutdown",
         }
@@ -762,6 +822,11 @@ pub enum MeetingLifecycleEvent {
     Ended {
         meeting_id: String,
         cause: MeetingEndCause,
+        /// The meeting's age when it ended, on MC's MONOTONIC clock, from the
+        /// same `Instant` the join-window deadline is anchored to — so a
+        /// log reader can check "ended at window" without trusting wall-clock
+        /// log timestamps (which a host clock step can skew).
+        age: std::time::Duration,
     },
     /// That teardown has finished — sent from a `Drop` guard, so it is sent on
     /// EVERY exit path of the teardown task, a panic included. The controller
@@ -985,6 +1050,47 @@ impl SignalingPayload {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// Every cause, enumerated by a wildcard-free match: a new variant fails
+    /// to compile here until it is classified as counted or not.
+    fn every_cause() -> Vec<MeetingEndCause> {
+        let all = [
+            MeetingEndCause::Empty(EmptyReason::LastParticipantLeft),
+            MeetingEndCause::Empty(EmptyReason::JoinWindowExpired),
+            MeetingEndCause::Closed,
+            MeetingEndCause::Shutdown,
+        ];
+        for cause in all {
+            match cause {
+                MeetingEndCause::Empty(
+                    EmptyReason::LastParticipantLeft | EmptyReason::JoinWindowExpired,
+                )
+                | MeetingEndCause::Closed
+                | MeetingEndCause::Shutdown => {}
+            }
+        }
+        all.to_vec()
+    }
+
+    #[test]
+    fn counted_list_is_exactly_the_counted_causes() {
+        let counted: Vec<_> = every_cause().into_iter().filter(|c| c.counted()).collect();
+        assert_eq!(counted, MeetingEndCause::COUNTED.to_vec());
+        assert!(!MeetingEndCause::Shutdown.counted());
+    }
+
+    /// Security A2: a join-window end behaves exactly like a last-leave end.
+    #[test]
+    fn join_window_end_behaves_like_last_leave() {
+        let window = MeetingEndCause::Empty(EmptyReason::JoinWindowExpired);
+        let left = MeetingEndCause::Empty(EmptyReason::LastParticipantLeft);
+        assert_eq!(window.notifies_gc(), left.notifies_gc());
+        assert!(window.notifies_gc());
+        assert_eq!(window.label(), "empty");
+        assert_eq!(left.label(), "empty");
+        assert_eq!(window.reason_label(), "join_window_expired");
+        assert_eq!(left.reason_label(), "last_participant_left");
+    }
 
     #[test]
     fn test_participant_status_equality() {

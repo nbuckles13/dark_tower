@@ -154,48 +154,20 @@ async fn test_all_services_have_logs_in_loki() {
         assert_eventually(ConsistencyCategory::LogAggregation, || {
             let loki_url = loki_url.clone();
             let query = query.clone();
-            let http_client = cluster.http_client().clone();
+            let cluster = &cluster;
             async move {
-                let url = format!("{}/loki/api/v1/query_range", loki_url);
-
-                let response = match http_client
-                    .get(&url)
-                    .query(&[
-                        ("query", query.as_str()),
-                        ("start", &start_ns.to_string()),
-                        ("end", &end_ns.to_string()),
-                        ("limit", "1"),
-                    ])
-                    .send()
-                    .await
+                // A query FAILURE fails at once with its own token: Loki has
+                // passed the availability precondition above, so an error here
+                // is not "this service has no logs yet" and must never be
+                // reported as a Promtail-pipeline gap.
+                match env_tests::fixtures::loki::query_range(
+                    cluster, &loki_url, &query, start_ns, end_ns, 1,
+                )
+                .await
                 {
-                    Ok(r) => r,
-                    Err(_) => return false,
-                };
-
-                if !response.status().is_success() {
-                    return false;
+                    Ok(entries) => !entries.is_empty(),
+                    Err(e) => panic!("loki-query-failed: `{query}`: {e}"),
                 }
-
-                let body = match response.text().await {
-                    Ok(b) => b,
-                    Err(_) => return false,
-                };
-
-                let json: serde_json::Value = match serde_json::from_str(&body) {
-                    Ok(v) => v,
-                    Err(_) => return false,
-                };
-
-                let status_ok = json.get("status").and_then(|s| s.as_str()) == Some("success");
-                let has_results = json
-                    .get("data")
-                    .and_then(|d| d.get("result"))
-                    .and_then(|r| r.as_array())
-                    .map(|a| !a.is_empty())
-                    .unwrap_or(false);
-
-                status_ok && has_results
             }
         })
         .await

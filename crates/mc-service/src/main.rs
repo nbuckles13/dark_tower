@@ -130,7 +130,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         health_bind_address = %config.health_bind_address,
         max_meetings = config.max_meetings,
         max_participants = config.max_participants,
-        binding_token_ttl_seconds = config.binding_token_ttl_seconds,
         // ADR-0036 §5/§6 client-signalling knobs, logged as EFFECTIVE values.
         //
         // The ConfigMap cannot answer "what did this process actually receive?" —
@@ -338,6 +337,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let kek_lifecycle = Arc::new(config.kek_lifecycle());
     kek_lifecycle.publish_config_gauges();
 
+    // The meeting actors' lifetime timers (join window, disconnect grace),
+    // built ONCE: every meeting actor and both config gauges read this value.
+    let meeting_timers = config.meeting_timers();
+    mc_service::observability::metrics::set_meeting_timers(meeting_timers);
+
     // Meeting-ended notifications to GC (ADR-0010 §3). The controller queues
     // one per meeting that ended AND whose handlers are released; the GC task
     // below drains them once the GC client exists. See `MeetingEndedQueue`.
@@ -351,6 +355,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&policy_generations),
         Arc::clone(&kek_lifecycle),
         Arc::new(meeting_ended_queue),
+        meeting_timers,
     ));
     info!("Actor system initialized");
 
