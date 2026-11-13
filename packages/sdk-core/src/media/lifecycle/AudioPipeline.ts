@@ -44,7 +44,12 @@ import type { MediaConfig } from '../../config/clientConfig.js';
 import { ClientConfigError, validateMediaConfig } from '../../config/clientConfig.js';
 import { EgressPipeline, type DatagramSender } from '../pipeline/egress.js';
 import { isSupportedHeaderVersion } from '../frame/frameCodec.js';
-import { IngressPipeline, type AcceptedFrame } from '../pipeline/ingress.js';
+import {
+  IngressPipeline,
+  type AcceptedFrame,
+  type SlotPresentedListener,
+} from '../pipeline/ingress.js';
+import { TransportRecency } from './transportRecency.js';
 import { ReceiveLanes, type SlotAssignment } from '../pipeline/receiveLanes.js';
 import { FirstMediaObserver } from '../setup/measurement.js';
 import {
@@ -288,6 +293,11 @@ export interface AudioPipelineOptions {
   readonly metricExportIntervalMs: number;
   /** Test-only receive verification (story 2 R-30). Absent in production. */
   readonly verification?: ReceiveVerificationRecorder;
+  /**
+   * Slot-continuity evidence (story 4 C2): an AUDIO slot presented a frame via
+   * a handler (`session/slotContinuity.ts`). Omitted: not reported.
+   */
+  readonly onSlotPresented?: SlotPresentedListener;
   readonly clock?: () => number;
   /** Timer seam, so rotation is testable without wall-clock waits. */
   readonly setInterval?: (fn: () => void, ms: number) => ReturnType<typeof setInterval>;
@@ -311,6 +321,8 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
   readonly #replay: ReplayWindow;
   readonly #firstMedia: FirstMediaObserver;
   readonly #clock: () => number;
+  /** Arrival transports for the replay window's duplicate classification. */
+  readonly #recency: TransportRecency;
   readonly #setInterval: (fn: () => void, ms: number) => ReturnType<typeof setInterval>;
   readonly #clearInterval: (handle: ReturnType<typeof setInterval>) => void;
 
@@ -373,6 +385,7 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
     this.#config = options.config;
     this.#metrics = options.metrics;
     this.#clock = options.clock ?? Date.now;
+    this.#recency = new TransportRecency(options.config.handlers.reconnectAbandonMs, this.#clock);
     this.#setInterval = options.setInterval ?? ((fn, ms) => setInterval(fn, ms));
     this.#clearInterval = options.clearInterval ?? ((h) => clearInterval(h));
     this.#transmitKeys = options.transmitKeys;
@@ -646,6 +659,8 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
       firstMedia: this.#firstMedia,
       onAccepted: (frame) => this.emit('frameAccepted', frame),
       declaredSlotIds: this.#options.declaredSlotIds,
+      arrivalFor: (ref) => this.#recency.arrival(ref),
+      ...(this.#options.onSlotPresented ? { onPresented: this.#options.onSlotPresented } : {}),
       ...(this.#options.verification ? { verification: this.#options.verification } : {}),
     });
     const ingress = this.#ingress;
@@ -653,7 +668,7 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
       readableFor: (ref) => this.#options.readableFor(ref),
       declaredSlotIds: this.#options.declaredSlotIds,
       hopRestartBackwardJumpFrames: this.#config.ingress.hopRestartBackwardJumpFrames,
-      accept: (datagram, monitor) => ingress.accept(datagram, monitor),
+      accept: (datagram, monitor, ref) => ingress.accept(datagram, monitor, ref),
       isStopped: () => this.#stopped,
       register: (name, dispose) => this.#teardown.register(name, dispose),
       transportFault: (message) => this.#fault(MediaFaultStage.Transport, message, false),
@@ -671,6 +686,7 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
     );
     this.#teardown.register('receive-bookkeeping', () => {
       this.#transports?.clear();
+      this.#recency.clear();
       this.#firstMedia.clear();
     });
 
@@ -819,6 +835,7 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
   forgetHandler(ref: HandlerRef): void {
     this.#egress?.forget(ref);
     this.#transports?.stop(ref);
+    this.#recency.forget(ref);
   }
 
   /** The handler `ref` (re)connected: start reading it if an assignment names it. */

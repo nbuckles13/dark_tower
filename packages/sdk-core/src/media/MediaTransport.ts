@@ -49,8 +49,6 @@ import { TypedEventEmitter } from '../events/TypedEventEmitter.js';
 import { encodeFramedMessage, sendFramedMessage, writeFrame } from '../framing/sendFramed.js';
 import { FrameDecoder } from '../framing/length-prefix.js';
 import { MediaConnectionError, MediaConnectionErrorCode } from '../errors/MediaConnectionError.js';
-import { getMetricsSink } from '../telemetry/telemetryConfig.js';
-import type { MetricLabels, MetricsSink } from '../telemetry/MetricsSink.js';
 import { connect as defaultConnect } from '../transport/BrowserWebTransport.js';
 import type { IWebTransport, WebTransportBidirectionalStream } from '../transport/IWebTransport.js';
 import { capMhUrl } from '../validation/limits.js';
@@ -71,6 +69,7 @@ import { FaultOnce } from './lifecycle/faultOnce.js';
 
 import {
   DEFAULT_MH_CONNECT_TIMEOUT_MS,
+  DEFAULT_TRANSPORT_SCHEDULER,
   type DatagramQueueSettings,
   type MediaConnectionState,
   type MediaDatagramChannel,
@@ -87,8 +86,10 @@ import {
   type HandlerSetIntake,
   type HandlerSetView,
 } from './handlerSet.js';
-import { classifyClose } from './closeCode.js';
+import { classifyClose, disconnectCauseOf } from './closeCode.js';
 import { redialDelayMs } from './redialBackoff.js';
+import { isHandlerLoss, type MhDialPhase } from './setup/mediaMetrics.js';
+import { TransportTelemetry, type RefTelemetry } from './transportTelemetry.js';
 
 /** Static, bounded failure reasons (never a raw cause string — R-23/security). */
 const REASON_TRANSPORT = 'media handler connection failed';
@@ -99,17 +100,7 @@ const REASON_DECLINED = 'media handler declined the dial credential';
 /** The bounded event-once contract WARN for a 0/unknown MH close code. */
 const CLOSE_CODE_FAULT = 'a media handler closed with an unknown or zero close code';
 
-/** Bucket a raw MH index into the bounded `mh_index_bucket` label set (`0|1|2+`). */
-function mhIndexBucket(index: number): string {
-  return index === 0 ? '0' : index === 1 ? '1' : '2+';
-}
-
 const identityRunInContext: RunInContext = (fn) => fn();
-
-const defaultScheduler: TransportScheduler = {
-  setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
-  clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
-};
 
 /** The last state reported to MC for a ref (report on CHANGE only). */
 type ReportedState = MhConnectionStatusReport['state'];
@@ -125,8 +116,6 @@ type ReportedState = MhConnectionStatusReport['state'];
 interface RefRecord {
   readonly ref: HandlerRef;
   readonly url: string;
-  /** Position in the latest set — the `mh_index_bucket` of the next dial. */
-  index: number;
   state: MediaConnectionState;
   /** The current (dialing or connected) transport. */
   transport: IWebTransport | undefined;
@@ -161,6 +150,8 @@ interface RefRecord {
       }
     | undefined;
   lastReported: ReportedState | undefined;
+  /** This ref's connection telemetry (`transportTelemetry.ts`). Holds no credential. */
+  readonly telemetry: RefTelemetry;
 }
 
 /** Counts of how sessions ended, by disposition (numbers only). */
@@ -181,8 +172,7 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
   readonly #connectFn: WebTransportConnectFn;
   readonly #clock: () => number;
   readonly #connectTimeoutMs: number;
-  readonly #metricsSink: MetricsSink | undefined;
-  readonly #metricLabels: MetricLabels;
+  readonly #telemetry: TransportTelemetry;
   readonly #runInContext: RunInContext;
   readonly #datagramQueue: DatagramQueueSettings | undefined;
   readonly #controlSink: MhControlSink | undefined;
@@ -237,14 +227,20 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
     this.#connectFn = options.connect ?? defaultConnect;
     this.#clock = options.clock ?? Date.now;
     this.#connectTimeoutMs = options.connectTimeoutMs ?? DEFAULT_MH_CONNECT_TIMEOUT_MS;
-    this.#metricsSink = options.metricsSink ?? getMetricsSink();
-    this.#metricLabels = options.metricLabels ?? {};
     this.#runInContext = options.runInContext ?? identityRunInContext;
     this.#datagramQueue = options.datagramQueue;
     this.#controlSink = options.controlSink;
     this.#handlers = options.handlers ?? DEFAULT_CLIENT_CONFIG.media.handlers;
-    this.#scheduler = options.scheduler ?? defaultScheduler;
+    this.#scheduler = options.scheduler ?? DEFAULT_TRANSPORT_SCHEDULER;
     this.#random = options.random ?? Math.random;
+    this.#telemetry = new TransportTelemetry({
+      metrics: options.connectionMetrics,
+      clock: this.#clock,
+      scheduler: this.#scheduler,
+      admissionWindowMs: this.#handlers.admissionWindowMs,
+      reconnectAbandonMs: this.#handlers.reconnectAbandonMs,
+      ...(options.onFirstEstablished ? { onFirstEstablished: options.onFirstEstablished } : {}),
+    });
   }
 
   // ----------------------------------------------------------------------------
@@ -269,10 +265,6 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
     for (const ref of diff.removed) this.#removeRef(ref);
     // Wholesale replacement: a NEW map, never a merge (see the field).
     this.#dialTokens = new Map(intake.dialTokens);
-    intake.view.handlers.forEach((h, index) => {
-      const rec = this.#refs.get(h.ref);
-      if (rec) rec.index = index;
-    });
     if (intake.view.handlers.length > 0) this.#cancelEmptySetNotice();
     for (const ref of diff.retained) {
       const rec = this.#refs.get(ref);
@@ -284,7 +276,7 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
         // set repeating it keeps the park. Then exactly one dial.
         if (rec.tokenGen > rec.dialTokenGen) {
           rec.attempt = 0;
-          void this.#dial(rec);
+          void this.#dial(rec, 'redial');
         }
       } else if (rec.graceTimer !== undefined) {
         // A set update inside the HANDLER_RELEASED grace that keeps the ref:
@@ -293,7 +285,7 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
         this.#scheduleRedial(rec);
       }
     }
-    if (this.#armed) this.#reconcile();
+    if (this.#armed) this.#reconcile('added');
   }
 
   /**
@@ -316,7 +308,7 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
     if (this.#armed || this.#terminated) return;
     this.#armed = true;
     if (this.#set.handlers.length === 0) this.#startEmptySetNotice();
-    await Promise.allSettled(this.#reconcile());
+    await Promise.allSettled(this.#reconcile('join'));
     if (this.#terminated) return;
     const anyConnected = [...this.#refs.values()].some((r) => r.state === 'connected');
     if (this.#set.handlers.length > 0 && !anyConnected) {
@@ -333,8 +325,8 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
   }
 
   /**
-   * How sessions ended, by disposition — numbers only. The C2 hook for the
-   * R-42 series; NOT exported from the package.
+   * How sessions ended, by disposition — numbers only (local diagnostics; the
+   * R-42 series are `transportTelemetry.ts`'s). NOT exported from the package.
    */
   diagnostics(): MediaTransportDiagnostics {
     return { ...this.#diagnostics };
@@ -348,7 +340,7 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
     if (this.#terminated) return;
     this.#terminated = true;
     this.#cancelEmptySetNotice();
-    for (const ref of [...this.#refs.keys()]) this.#removeRef(ref);
+    for (const ref of [...this.#refs.keys()]) this.#removeRef(ref, 'teardown');
     this.#dialTokens.clear();
   }
 
@@ -461,15 +453,15 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
    * Dial every member of the latest set that has no record. A ref with a record
    * is connecting, connected, awaiting a redial, or parked — none is redialed
    * here. Returns the dials started (so `arm` can await the join-time ones).
+   * `phase` labels the dials: `join` from `arm`, `added` for a later set.
    */
-  #reconcile(): Promise<void>[] {
+  #reconcile(phase: 'join' | 'added'): Promise<void>[] {
     const dials: Promise<void>[] = [];
-    this.#set.handlers.forEach((h, index) => {
+    this.#set.handlers.forEach((h) => {
       if (this.#refs.has(h.ref)) return;
       const rec: RefRecord = {
         ref: h.ref,
         url: h.url,
-        index,
         state: 'connecting',
         transport: undefined,
         attempt: 0,
@@ -483,9 +475,10 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
         controlReader: undefined,
         datagram: undefined,
         lastReported: undefined,
+        telemetry: this.#telemetry.track(),
       };
       this.#refs.set(h.ref, rec);
-      dials.push(this.#dial(rec));
+      dials.push(this.#dial(rec, phase));
     });
     return dials;
   }
@@ -507,8 +500,9 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
    * when the request is built. A dial whose ref was removed meanwhile is closed
    * when it resolves and emits NOTHING (no metric, no report, no event).
    */
-  async #dial(rec: RefRecord): Promise<void> {
+  async #dial(rec: RefRecord, phase: MhDialPhase): Promise<void> {
     rec.state = 'connecting';
+    this.#telemetry.dialStarted(rec.telemetry, phase);
     let transport: IWebTransport;
     try {
       transport = this.#connectFn(rec.url);
@@ -617,7 +611,7 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
     rec.state = 'connected';
     rec.attemptBeforeConnect = rec.attempt;
     rec.attempt = 0;
-    this.#emitMetric('success', rec.index);
+    this.#telemetry.handshake(rec.telemetry);
     this.#startControlChannel(rec, transport, stream);
     this.#report(rec, 'connected');
     this.emit('connected', { ref: rec.ref, url: rec.url });
@@ -631,7 +625,10 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
   ): void {
     rec.transport = undefined;
     rec.state = 'lost';
-    this.#emitMetric('failure', rec.index);
+    this.#telemetry.dialFailed(
+      rec.telemetry,
+      code === MediaConnectionErrorCode.ConnectTimeout ? 'timeout' : 'transport_failure',
+    );
     this.#report(rec, 'failed', { failureCode: code, failureReason: reason });
     this.emit(
       'failed',
@@ -654,6 +651,14 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
     this.#releaseConnection(rec);
     rec.transport = undefined;
     rec.state = 'lost';
+    this.#telemetry.closed(rec.telemetry, closeCode);
+    // A client-OBSERVED handler loss (ADR-0039 §4 "Slot states"): the ONE
+    // lost-handler predicate over the close's cause token — no code, or
+    // HANDLER_RELEASED while the ref is still in the set (a removed ref has no
+    // record, so it never reaches here). Never inferred from silence.
+    if (isHandlerLoss(disconnectCauseOf(closeCode))) {
+      this.emit('handlerLost', rec.ref);
+    }
     const disposition = classifyClose(closeCode);
     switch (disposition) {
       case 'retry':
@@ -687,7 +692,7 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
         // it (which would stall until MC's next TTL/3 push).
         if (rec.tokenGen > rec.dialTokenGen) {
           rec.attempt = 0;
-          void this.#dial(rec);
+          void this.#dial(rec, 'redial');
         }
         return;
       case 'contract_fault':
@@ -727,14 +732,18 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
       rec.redialTimer = undefined;
       // Never dial outside the latest set: a removed ref has no live record.
       if (!this.#isCurrent(rec)) return;
-      void this.#dial(rec);
+      void this.#dial(rec, 'redial');
     }, delay);
   }
 
   /**
    * THE ONE REMOVAL CLEANUP for a ref that left the set — and, from
    * `disconnect()`, for every ref at session end. A DIRECTED removal: no fault,
-   * no loss report, no metric.
+   * no loss report. Telemetry: a set removal is `aborted_by_removal` /
+   * `directed_removal` / reconnect `removed`; a `teardown` records nothing
+   * but abandons an open disruption episode (`transportTelemetry.ts`).
+   * Per-slot reconnecting state keyed to this ref is dropped by the
+   * `handlerRemoved` consumers (`session/slotContinuity.ts`).
    *   - drop its token and its record (stale async work then sees it gone);
    *   - cancel its redial timer, HANDLER_RELEASED grace and park;
    *   - tell per-ref consumers FIRST (`handlerRemoved`, synchronous): egress
@@ -744,11 +753,21 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
    *     data-plane fence) and an in-flight dial (aborted; the dial path sees the
    *     record gone and closes whatever resolves).
    */
-  #removeRef(ref: HandlerRef): void {
+  #removeRef(ref: HandlerRef, why: 'set' | 'teardown' = 'set'): void {
     this.#dialTokens.delete(ref);
     const rec = this.#refs.get(ref);
     if (!rec) return;
     this.#refs.delete(ref);
+    if (why === 'teardown') {
+      this.#telemetry.teardown(rec.telemetry);
+    } else {
+      this.#telemetry.removed(rec.telemetry);
+      this.emit('handlerDropped', {
+        ref,
+        wasConnected: rec.state === 'connected',
+        otherConnected: [...this.#refs.values()].some((r) => r.state === 'connected'),
+      });
+    }
     this.#clearTimer(rec, 'redialTimer');
     this.#clearTimer(rec, 'graceTimer');
     const abort = rec.abortDial;
@@ -832,47 +851,6 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
     if (this.#emptySetTimer === undefined) return;
     this.#scheduler.clearTimeout(this.#emptySetTimer);
     this.#emptySetTimer = undefined;
-  }
-
-  /**
-   * ---------------------------------------------------------------------------
-   * THE `...this.#metricLabels` SPREAD BELOW IS LEGAL FOR THIS ONE METRIC ONLY.
-   * DO NOT COPY IT INTO A MEDIA EMISSION.
-   * ---------------------------------------------------------------------------
-   *
-   * `dt_client_mh_connection_total` is an ADR-0028 join-flow metric that carried
-   * the join label set — including `meeting_id_hash` — from birth. ADR-0036 §11
-   * grandfathers that set AS A SET: it is a closed, enumerated exception, it is
-   * not extended, and nothing joins it. The frozen roster is named in
-   * `docs/observability/metrics/client.md`.
-   *
-   * **The test is what a metric OBSERVES, not which directory it lives in.**
-   * Connect-lifecycle — once per connection, at handshake, before any frame
-   * exists — is grandfathered. Media-carrying — per frame, per stream, or on the
-   * media data path — is under the bar. "It is in `MediaTransport.ts`" is the
-   * wrong test in BOTH directions: it would wrongly bar this metric, and it
-   * would wrongly permit a media counter someone places outside the media tree.
-   * The second is the one that will actually happen.
-   *
-   * Substantively neither §11 argument reaches this counter. The trace argument
-   * is about the time-ordered sequence of sizes for a single stream, and a
-   * connect-outcome counter reconstructs nothing. The oracle argument is about
-   * `reason` faithfully mirroring which crypto layer rejected a frame; `status`
-   * and `mh_index_bucket` are not crypto-layer discriminators and reveal no
-   * receiver key state.
-   *
-   * EVERY NEW MEDIA EMISSION goes through `setup/mediaMetrics.ts`, which builds
-   * `{client_version, org_id, key_custody, media_kind}` (per-kind series) or
-   * `{client_version, org_id, key_custody}` (session series) by allow-list from
-   * two named strings and a closed media kind — so there is no set to inherit and
-   * nothing to prune. Nothing mechanical enforces this in TypeScript.
-   */
-  #emitMetric(status: 'success' | 'failure', index: number): void {
-    this.#metricsSink?.counter('dt_client_mh_connection_total', {
-      ...this.#metricLabels,
-      status,
-      mh_index_bucket: mhIndexBucket(index),
-    });
   }
 
   // ----------------------------------------------------------------------------

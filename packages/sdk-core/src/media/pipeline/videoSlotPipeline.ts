@@ -116,8 +116,11 @@ export interface VideoSlotPipelineOptions {
   readonly unfulfilled: UnfulfilledSink;
   readonly onRenderChanged: (slotId: number, state: VideoRenderState) => void;
   readonly onLoss: (event: SlotLossEvent) => void;
-  /** A frame DECODED (post-bounds) from verified `senderId` — decode activity. */
-  readonly onDecoded: (senderId: number) => void;
+  /**
+   * A frame DECODED (post-bounds) from verified `senderId`, received via the
+   * handler `ref` — decode activity and slot-continuity evidence (story 4 C2).
+   */
+  readonly onDecoded: (senderId: number, ref: HandlerRef) => void;
   /** A frame was DRAWN; `activeForMs` is time since this ACTIVE entry, first draw only. */
   readonly onDrawn: (activeForMs: number | undefined) => void;
   /** This slot's decoder faulted. Non-fatal; the owner dedupes. */
@@ -613,7 +616,7 @@ export class VideoSlotPipeline {
       return;
     }
     this.#framesDecoded += 1;
-    this.#o.onDecoded(meta.senderId);
+    this.#o.onDecoded(meta.senderId, meta.ref);
     this.#offer(frame, meta);
     this.#pump();
   }

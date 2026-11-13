@@ -16,13 +16,20 @@
 import { expect, test } from 'vitest';
 import {
   AWAITING_ASSIGNMENT,
+  CLIENT_LOCAL_STATE_TEXT,
+  RECONNECTING,
   WIRE_TOKENS,
+  displaySlotState,
+  renderedKind,
   slotIsActive,
   slotStateText,
   type SlotStateAttr,
 } from '../lib/slotState.js';
 
-const ALL_STATES: readonly SlotStateAttr[] = [...WIRE_TOKENS, AWAITING_ASSIGNMENT];
+const ALL_STATES: readonly SlotStateAttr[] = [
+  ...WIRE_TOKENS,
+  ...(Object.keys(CLIENT_LOCAL_STATE_TEXT) as SlotStateAttr[]),
+];
 
 test('the wire vocabulary is the ten flat states (story 3 wire freeze; MC slot_state_label)', () => {
   // A TRIPWIRE, not the coverage mechanism. `WIRE_TOKENS` is derived from
@@ -98,4 +105,27 @@ test('only the active state counts as active', () => {
   for (const state of ALL_STATES) {
     expect(slotIsActive(state), `"${state}" active?`).toBe(state === 'active');
   }
+});
+
+test('story 4 C2: the client-local table holds exactly awaiting-assignment and reconnecting — neither is a wire token', () => {
+  expect(Object.keys(CLIENT_LOCAL_STATE_TEXT).sort()).toEqual(
+    [AWAITING_ASSIGNMENT, RECONNECTING].sort(),
+  );
+  expect(WIRE_TOKENS).not.toContain(RECONNECTING as never);
+  expect(text(RECONNECTING)).toBe("reconnecting to Bea's video…");
+  expect(text(RECONNECTING, 'audio')).toBe("reconnecting to Bea's audio…");
+  expect(slotIsActive(RECONNECTING)).toBe(false);
+});
+
+test('displaySlotState: reconnecting OVERRIDES the wire state; otherwise the wire token or awaiting', () => {
+  expect(displaySlotState({ slotState: 'active' }, true)).toBe(RECONNECTING);
+  expect(displaySlotState(undefined, true)).toBe(RECONNECTING);
+  expect(displaySlotState({ slotState: 'active' }, false)).toBe('active');
+  expect(displaySlotState(undefined, false)).toBe(AWAITING_ASSIGNMENT);
+});
+
+test('renderedKind: a reconnecting slot shows an AVATAR, never live video (no frozen frame)', () => {
+  expect(renderedKind('active', true)).toBe('avatar');
+  expect(renderedKind('active')).toBe('video'); // positive arm
+  expect(renderedKind(undefined, true)).toBe('avatar');
 });

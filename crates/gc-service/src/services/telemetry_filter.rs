@@ -25,11 +25,12 @@
 //!
 //! It bounds neither the value domain nor the distinct-value COUNT of any other
 //! key. The bounded-cardinality property of
-//! `reason`/`outcome`/`action`/`source`/`mode`/`media_kind` comes from the SDK
-//! types in `packages/sdk-core/src/media/setup/mediaMetrics.ts` and holds for an
-//! HONEST client only at this hop. Downstream the collector bounds them
-//! differently: for the first five its charset regex bounds bytes and charset,
-//! not count, so a patched client can inflate their distinct-value count; for
+//! `reason`/`outcome`/`action`/`source`/`mode`/`phase`/`cause`/`media_kind`
+//! comes from the SDK types in
+//! `packages/sdk-core/src/media/setup/mediaMetrics.ts` and holds for an HONEST
+//! client only at this hop. Downstream the collector bounds them differently:
+//! for the first seven its charset regex bounds bytes and charset, not count, so
+//! a patched client can inflate their distinct-value count; for
 //! `media_kind` / `content_kind` its EXACT `^(audio|video)$` / `^(main|screen)$`
 //! rewrites to `invalid` do bound the distinct-value count (at most three
 //! values each reach a stored series). GC deliberately applies no value rule to
@@ -63,12 +64,12 @@ use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
 use opentelemetry_proto::tonic::metrics::v1::metric::Data;
 use opentelemetry_proto::tonic::resource::v1::Resource;
 
-/// The 12-key BASE attribute allowlist, applied at every nesting level of both
+/// The 11-key BASE attribute allowlist, applied at every nesting level of both
 /// signals. Any attribute key not in this set — and not in
 /// [`MEDIA_DATAPOINT_EXTRA`] at a metric datapoint — is dropped.
 /// Deny-by-default: adding a new business attribute requires a change here
 /// (intended friction).
-pub const ALLOWLIST: [&str; 12] = [
+pub const ALLOWLIST: [&str; 11] = [
     "client_version",
     "service.name",
     "service.version",
@@ -87,7 +88,6 @@ pub const ALLOWLIST: [&str; 12] = [
     "dt.duration_ms",
     "dt.failure_stage",
     "dt.close_reason",
-    "dt.mh_index_bucket",
     "http.status_code",
     "error.code",
 ];
@@ -97,7 +97,7 @@ pub const ALLOWLIST: [&str; 12] = [
 /// A DELTA, never a second full list: the union with [`ALLOWLIST`] is computed
 /// in [`key_allowed`] and is deliberately never written down. A merged array
 /// would be a straight copy of the base list and would silently diverge the first
-/// time someone adds a 13th base key to one array and not the other.
+/// time someone adds a 12th base key to one array and not the other.
 ///
 /// Without these, `MCMediaMissingKeyMaterial` cannot match: its numerator
 /// selects `reason=~"no_kek_for_generation|kek_generation_stale|no_roster_entry"`,
@@ -112,7 +112,11 @@ pub const ALLOWLIST: [&str; 12] = [
 /// capture-source type `MediaCaptureSourceMode` (`microphone` | `test_tone`),
 /// declared in `packages/sdk-core/src/media/setup/mediaMetrics.ts` and carried
 /// only by `dt_client_media_capture_source` — a build-time property, not a
-/// per-user one. None carries a participant, meeting or stream identity.
+/// per-user one. `phase` (`MH_DIAL_PHASES`: `join` | `added` | `redial`) and
+/// `cause` (`MH_DISCONNECT_CAUSES`) are the bounded MH-connection-lifecycle
+/// vocabularies (story 4 C2), declared in the same file and carried by the
+/// kind-free `dt_client_mh_*` series. None carries a participant, meeting,
+/// stream or handler identity.
 /// Deliberately NOT mirrored as a Rust enum here: that would be a fourth,
 /// unguarded copy of a TypeScript-owned vocabulary whose own SSoT is a Guarded
 /// Shared Area.
@@ -122,7 +126,7 @@ pub const ALLOWLIST: [&str; 12] = [
 /// {`audio`, `video`} and {`main`, `screen`}, always co-carried. Their single
 /// source of truth is the `media_kind` / `content_kind` rows and the projection
 /// table of `docs/observability/label-taxonomy.md`; the SDK's
-/// `projectMediaKind` is their client code home. Like the five discriminators
+/// `projectMediaKind` is their client code home. Like the seven discriminators
 /// above — NOT like `key_custody`, whose value GC checks in `custody_value_ok`
 /// — GC bounds only their KEYS and value SHAPE (scalar). The content bound is
 /// the collector's EXACT `^(audio|video)$` / `^(main|screen)$` rewrites to
@@ -142,12 +146,14 @@ pub const ALLOWLIST: [&str; 12] = [
 /// `"bogus"` cases prove GC never reads them — exempt as test code in every
 /// crate, not as a GC carve-out. Not mirrored as a Rust enum here either: GC
 /// does not import MC's projection.
-pub const MEDIA_DATAPOINT_EXTRA: [&str; 8] = [
+pub const MEDIA_DATAPOINT_EXTRA: [&str; 10] = [
     "reason",
     "outcome",
     "action",
     "source",
     "mode",
+    "phase",
+    "cause",
     KEY_CUSTODY_LABEL,
     MEDIA_KIND_LABEL,
     CONTENT_KIND_LABEL,
@@ -791,8 +797,8 @@ mod tests {
     }
 
     #[test]
-    fn allowlist_has_exactly_12_keys() {
-        assert_eq!(ALLOWLIST.len(), 12);
+    fn allowlist_has_exactly_11_keys() {
+        assert_eq!(ALLOWLIST.len(), 11);
     }
 
     #[test]
@@ -819,7 +825,7 @@ mod tests {
         let mut counts = DropCounts::default();
         filter_base_attrs(&mut attrs, AttrKind::Span, TEST_ORG, &mut counts);
 
-        assert_eq!(attrs.len(), 12);
+        assert_eq!(attrs.len(), ALLOWLIST.len());
         assert_eq!(counts.total(), 0);
     }
 
@@ -1251,14 +1257,14 @@ mod tests {
     // ---- Media datapoint tier (blocker 2) ----------------------------------
 
     #[test]
-    fn media_datapoint_extra_has_exactly_8_keys() {
+    fn media_datapoint_extra_has_exactly_10_keys() {
         // The one deliberate length literal: the tripwire that makes adding a
         // key a conscious edit. Everything else derives from the const.
-        assert_eq!(MEDIA_DATAPOINT_EXTRA.len(), 8);
+        assert_eq!(MEDIA_DATAPOINT_EXTRA.len(), 10);
     }
 
-    /// The media-key fixtures below must cover the const EXACTLY, so a seventh
-    /// key that no fixture carries fails here instead of going untested.
+    /// The media-key fixtures below must cover the const EXACTLY, so a key added
+    /// to the const that no fixture carries fails here instead of going untested.
     fn assert_fixture_covers_media_keys(fixture: &[KeyValue]) {
         let mut got: Vec<&str> = fixture.iter().map(|kv| kv.key.as_str()).collect();
         got.sort_unstable();
@@ -1275,6 +1281,8 @@ mod tests {
             string_attr("action", "unmute"),
             string_attr("source", "join_response"),
             string_attr("mode", "test_tone"),
+            string_attr("phase", "join"),
+            string_attr("cause", "transport_loss"),
             string_attr(KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
             string_attr(MEDIA_KIND_LABEL, "audio"),
             string_attr(CONTENT_KIND_LABEL, "main"),
@@ -1291,6 +1299,8 @@ mod tests {
             string_attr("action", "mute"),
             string_attr("source", "join_response"),
             string_attr("mode", "test_tone"),
+            string_attr("phase", "redial"),
+            string_attr("cause", "directed_removal"),
             string_attr(KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
             string_attr(MEDIA_KIND_LABEL, "video"),
             string_attr(CONTENT_KIND_LABEL, "screen"),
@@ -1310,6 +1320,8 @@ mod tests {
             ("action", "mute"),
             ("source", "join_response"),
             ("mode", "test_tone"),
+            ("phase", "redial"),
+            ("cause", "directed_removal"),
             (KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
             (MEDIA_KIND_LABEL, "video"),
             (CONTENT_KIND_LABEL, "screen"),
@@ -1443,6 +1455,48 @@ mod tests {
             "content_kind must survive with its value byte-identical; got {:?}",
             pairs(sum_dp_attrs(&req))
         );
+    }
+
+    #[test]
+    fn phase_and_cause_values_are_not_checked_here() {
+        // Twin of `media_kind_value_is_not_checked_here`: GC bounds only the
+        // KEYS of the MH-lifecycle vocabularies; the collector's charset rewrite
+        // is their value bound and must be able to see an out-of-vocabulary value.
+        let mut req = sum_req_with(vec![
+            string_attr("phase", "bogus"),
+            string_attr("cause", "bogus"),
+        ]);
+        let counts = filter_metrics(&mut req, TEST_ORG);
+
+        assert_eq!(counts.datapoint, 0, "nothing may be dropped");
+        let got = pairs(sum_dp_attrs(&req));
+        for key in ["phase", "cause"] {
+            assert!(
+                got.contains(&(key, "bogus".to_string())),
+                "{key} must survive with its value byte-identical; got {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mh_index_bucket_is_dropped_on_a_datapoint_in_both_spellings() {
+        // `dt.mh_index_bucket` left the base ALLOWLIST with story 4 C2 (its only
+        // emitter, the old `dt_client_mh_connection_total` bag, is gone); the
+        // bare spelling a stale browser tab still sends was never admitted.
+        let mut req = sum_req_with(vec![
+            string_attr("dt.mh_index_bucket", "0"),
+            string_attr("mh_index_bucket", "2+"),
+            string_attr("phase", "join"),
+        ]);
+        let counts = filter_metrics(&mut req, TEST_ORG);
+
+        assert_eq!(counts.datapoint, 2, "both spellings are dropped");
+        let got = pairs(sum_dp_attrs(&req));
+        assert!(
+            !got.iter().any(|(k, _)| k.contains("mh_index_bucket")),
+            "no mh_index_bucket spelling may survive; got {got:?}"
+        );
+        assert!(got.contains(&("phase", "join".to_string())));
     }
 
     #[test]

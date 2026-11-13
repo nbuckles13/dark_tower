@@ -592,6 +592,52 @@ describe('VideoEgress — edges', () => {
   });
 });
 
+describe('story 4 C2 / R-16 — video on a NEW handler resumes from a keyframe', () => {
+  it('after a swap the new target is awaiting_group: a delta frame never reaches it; the next keyframe opens its group', async () => {
+    const r = await makeRig({ urls: [A, B] });
+    r.egress.setTargets({ targets: [A], headerVersion: HEADER_VERSION });
+    await r.send(true);
+    await r.send(false);
+    await settle();
+    expect(r.egress.laneState(A)).toBe('in_group');
+    // The swap: A leaves the set, B is directed.
+    r.egress.forget(A);
+    r.egress.setTargets({ targets: [B], headerVersion: HEADER_VERSION });
+    expect(r.egress.laneState(B)).toBe('awaiting_group');
+    expect(r.egress.targetsAwaitingGroup()).toBe(1); // what the keyframe gate keys on
+    // Negative: a delta frame is NOT sent to the new target (it would be undecodable).
+    await r.send(false);
+    await settle();
+    expect(r.streamsOf(B)).toHaveLength(0);
+    // Positive: the keyframe opens B's group, and B's stream STARTS with it.
+    await r.send(true);
+    await settle();
+    const first = decodeFrame(r.streamsOf(B)[0]!.chunks[0]!);
+    expect(first.flags.independentlyDecodable).toBe(true);
+    expect(r.egress.laneState(B)).toBe('in_group');
+    expect(r.egress.targetsAwaitingGroup()).toBe(0);
+
+    // K2(c): B's first frame is keyed under a generation STRICTLY greater than
+    // A's last pre-swap frame (the new group rotated the key), and (K2(b)) no
+    // key id across both streams maps to two different wrapped-key blocks.
+    const framesA = r.streamsOf(A).flatMap((st) => st.chunks.map(decodeFrame));
+    const framesB = r.streamsOf(B).flatMap((st) => st.chunks.map(decodeFrame));
+    const genOf = (f: ReturnType<typeof decodeFrame>): bigint =>
+      unpackKeyId(parseSframe(f.payload).keyId).generation;
+    expect(genOf(framesB[0]!)).toBeGreaterThan(genOf(framesA.at(-1)!));
+    const wrapsByKeyId = new Map<string, Set<string>>();
+    for (const f of [...framesA, ...framesB]) {
+      if (f.wrappedTransmitKey === null) continue;
+      const id = Buffer.from(parseSframe(f.payload).keyId).toString('hex');
+      const wraps = wrapsByKeyId.get(id) ?? new Set<string>();
+      wraps.add(Buffer.from(f.wrappedTransmitKey.wrappedKeyWithTag).toString('hex'));
+      wrapsByKeyId.set(id, wraps);
+    }
+    expect(wrapsByKeyId.size).toBeGreaterThan(1); // positive control: both generations seen
+    expect([...wrapsByKeyId.values()].every((w) => w.size === 1)).toBe(true);
+  });
+});
+
 describe('VideoEgress — Gate-3 fixes', () => {
   it('a keyframe LARGER than the byte cap is still delivered (the cap measures backlog behind it)', async () => {
     const r = await makeRig({ urls: [A, B], maxBacklogBytes: 64 });

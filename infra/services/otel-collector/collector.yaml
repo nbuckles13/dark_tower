@@ -49,7 +49,9 @@ processors:
   # ANCHOR (DRY): `docs/observability/metrics/client.md`,
   # `crates/dt-guard/src/client_metrics_export.rs`.
   #
-  # THE FIVE JOIN-FLOW METRICS ARE EXCLUDED ON PURPOSE. ADR-0036 §11
+  # THE THREE REMAINING JOIN-FLOW METRICS ARE EXCLUDED ON PURPOSE. Which three
+  # is the frozen grandfathered roster in `client.md` — the one home for that
+  # list; it is not restated here. ADR-0036 §11
   # grandfathers `meeting_id_hash` on those metrics AS EMITTED (the SDK needs
   # it for logs<->metrics correlation in a browser console). It does NOT
   # grandfather exporting a per-meeting identifier into central Prometheus
@@ -57,12 +59,22 @@ processors:
   # `docs/observability/label-taxonomy.md` R1 bars. Stripping the hash and
   # exporting them anyway would be worse: a series whose shape does not match
   # what `client.md` documents is a silently different metric.
+  # The roster SHRANK from five (story 4 C2, R-42): `dt_client_mh_connection_total`
+  # and `dt_client_time_to_first_mh_connected_ms` were RESHAPED in the SDK onto
+  # the kind-free media label bag (no `meeting_id_hash`, `status` or
+  # `mh_index_bucket`) and only then listed here. Their catalog entries are
+  # the documented shape; a stale tab's old shape is handled by
+  # `filter/client_mh_connection_stale_tab` below.
   #
   # NOT A PREFIX RULE, DELIBERATELY. `dt_client_time_to_first_media_frame_ms`
-  # does not match `dt_client_media_*` and IS a media metric;
-  # `dt_client_mh_connection_total` lives in `media/MediaTransport.ts` and is
-  # NOT one. The test is what a metric observes, not which directory it lives
-  # in — `client.md` carries that paragraph.
+  # does not match `dt_client_media_*` and IS a media metric, and so is
+  # `dt_client_time_to_first_mh_connected_ms`. `dt_client_mh_*` IS now a
+  # media-path family (the label-taxonomy media-path-prefixes block lists
+  # `dt_client_mh_`), but a prefix is how R4 finds the family, never why a
+  # name is exported: every name below is listed individually and must carry
+  # `Exported: yes` in `client.md`. The test is what a metric observes and
+  # how it is labelled, not which directory or prefix it lives under —
+  # `client.md` carries that paragraph.
   filter/client_metric_names:
     error_mode: propagate
     metrics:
@@ -111,6 +123,13 @@ processors:
           - dt_client_media_time_to_first_render_ms
           - dt_client_media_slot_active_to_first_render_ms
           - dt_client_time_to_first_media_frame_ms
+          - dt_client_mh_connection_total
+          - dt_client_time_to_first_mh_connected_ms
+          - dt_client_mh_dial_duration_ms
+          - dt_client_mh_disconnects_total
+          - dt_client_mh_reconnect_duration_ms
+          - dt_client_mh_non_member_refs_total
+          - dt_client_media_resume_ms
 
   # ---------------------------------------------------------------------
   # TEMPORALITY GATE — a stale browser bundle must be ABSENT, not WRONG.
@@ -161,6 +180,57 @@ processors:
         - (type == METRIC_DATA_TYPE_SUM or type == METRIC_DATA_TYPE_HISTOGRAM) and aggregation_temporality != AGGREGATION_TEMPORALITY_DELTA
 
   # ---------------------------------------------------------------------
+  # STALE-TAB SHAPE GATE — a stale browser bundle must be ABSENT, not WRONG.
+  # ---------------------------------------------------------------------
+  #
+  # Same principle as the temporality gate above, applied to a SHAPE change.
+  # `dt_client_mh_connection_total` kept its NAME when story 4 C2 (R-42)
+  # reshaped it: the old bundle counted `{status=success|failure,
+  # mh_index_bucket, meeting_id_hash, ...}` at handshake; the new one counts
+  # `{phase, outcome}` once per dial, with `outcome="connected"` meaning
+  # "survived the admission window". A tab still running the old bundle keeps
+  # sending the old shape until it reloads. GC drops `status` and
+  # `mh_index_bucket` at the trust boundary (neither is forwarded) and
+  # `keep_keys` below drops `meeting_id_hash` (never kept), so WITHOUT this
+  # gate an old-tab datapoint would land in storage as a label-less
+  # `{client_version, org_id, key_custody}` row of the same name: a count of
+  # a DIFFERENT event (handshakes, failures folded in) that a careless
+  # `sum(rate(...))` adds to the new per-dial outcomes. Dropping it here makes
+  # the stale tab read as missing data instead of as plausible wrong data.
+  #
+  # THE KEY IS ABSENCE OF EITHER DISCRIMINATOR. Every new-bundle datapoint
+  # carries BOTH `phase` and `outcome` (zero-initialised 3 x 10 at join); an
+  # old-bundle one carries neither by the time it gets here. `or` rather than
+  # `and` also drops a half-shaped (patched) point, which is equally not the
+  # documented series. Nothing here checks VALUES — block (c)'s charset rule
+  # does that for both keys, and GC checks none.
+  #
+  # NO SUCH GATE IS NEEDED FOR `dt_client_time_to_first_mh_connected_ms`:
+  # once GC and `keep_keys` strip the old labels, an old-tab observation has
+  # the same shape as a new one. It READS LOW when the first dial was refused
+  # (a pre-C2 bundle timed the first HANDSHAKE, refused or not; the new one
+  # times the first dial that FINALISES connected) — transient until old tabs
+  # reload; documented in `client.md`, not filtered.
+  #
+  # Dashboards still group every panel on this name `by (phase, outcome)`,
+  # so even if this gate were removed a stale label-less row could not
+  # inflate a ratio; this gate is what keeps it out of STORAGE.
+  #
+  # Same accepted limit as the temporality gate: the drop is visible only in
+  # aggregate and cannot be attributed to this processor. It expires on its
+  # own once no old-bundle tab remains (tabs reload; there is no operator
+  # roll-forward), after which it matches nothing; remove it only together
+  # with its catalog note.
+  # ANCHOR: `docs/observability/metrics/client.md` (`dt_client_mh_connection_total`
+  # entry, stale-tab note); acceptance arm `stale_tab` in
+  # `scripts/otel-collector/acceptance_driver.py` and `sdk_writers.mjs`.
+  filter/client_mh_connection_stale_tab:
+    error_mode: propagate
+    metrics:
+      datapoint:
+        - metric.name == "dt_client_mh_connection_total" and (attributes["outcome"] == nil or attributes["phase"] == nil)
+
+  # ---------------------------------------------------------------------
   # (b) LABEL-KEY ALLOWLIST + (c) VALUE SHAPE — the metrics path only.
   # ---------------------------------------------------------------------
   transform/client_metric_labels:
@@ -178,8 +248,17 @@ processors:
           # GROUP 2 — the per-metric discriminators (global-controller's + security's),
           # the same widening applied to GC's datapoint tier
           # (`MEDIA_DATAPOINT_EXTRA`) minus key_custody (which is in group 1):
-          # reason, outcome, action, source, mode, media_kind, content_kind. So group 1 ∪
-          # group 2 ⊇ `MEDIA_DATAPOINT_EXTRA` (dt-guard rule 3).
+          # reason, outcome, action, source, mode, media_kind, content_kind, phase,
+          # cause. So group 1 ∪ group 2 ⊇ `MEDIA_DATAPOINT_EXTRA` (dt-guard rule 3).
+          # `phase` and `cause` (story 4 C2, R-42) are carried only by the
+          # kind-free `dt_client_mh_*` session series: `phase` (join | added |
+          # redial) on `dt_client_mh_connection_total` and
+          # `dt_client_mh_dial_duration_ms`, `cause` (eight close/loss causes)
+          # on `dt_client_mh_disconnects_total`. Both are client-local
+          # vocabularies (SSoT `MH_DIAL_PHASES` / `MH_DISCONNECT_CAUSES` in
+          # `mediaMetrics.ts`, rows in `label-taxonomy.md`) and get block (c)'s
+          # SHAPE rule like `outcome`, not an exact rule: they are open
+          # vocabularies that may grow with the MH close-code enum.
           # `mode` (story 2 task 13) is carried only by
           # `dt_client_media_capture_source` — `microphone` | `test_tone`, a
           # build-time property; its presence under `test_tone` outside dev IS
@@ -198,10 +277,14 @@ processors:
           # whichever they found first.
           #
           # `meeting_id_hash` IS ABSENT BY OMISSION, NOT BY A NAMED DELETE.
-          # That is the whole point: `MediaTransport.ts` (`#emitMetric`) spreads the
-          # join label bag carrying that hash INSIDE the media directory, so an
-          # already-name-allowlisted metric can ACQUIRE the identifier later. A
-          # denylist would pass it; an allow-list fails closed.
+          # That is the whole point: until story 4 C2, `MediaTransport.ts`
+          # (`#emitMetric`) spread the join label bag carrying that hash INSIDE
+          # the media directory, which is exactly how an already-name-allowlisted
+          # metric can ACQUIRE the identifier later. C2 removed that spread, but
+          # a stale tab still sends the hash on `dt_client_mh_connection_total`
+          # and `dt_client_time_to_first_mh_connected_ms` until it reloads, and
+          # it is never kept. A denylist would pass the next such spread; an
+          # allow-list fails closed.
           #
           # `le` IS NOT A KEY AND MUST NOT BE ADDED. Histogram bucket bounds are
           # structural in OTLP (explicit bounds on the datapoint); `le` is
@@ -228,7 +311,7 @@ processors:
           # go dark. NO MERGED LIST IS CORRECT FOR BOTH QUESTIONS.
           # `dt-guard client-metrics-export` (G4) asserts this list is a SUBSET
           # of GC's two, so the two encodings cannot drift apart silently.
-          - keep_keys(attributes, ["client_version", "org_id", "key_custody", "reason", "outcome", "action", "source", "mode", "media_kind", "content_kind"])
+          - keep_keys(attributes, ["client_version", "org_id", "key_custody", "reason", "outcome", "action", "source", "mode", "media_kind", "content_kind", "phase", "cause"])
 
           # --- key_custody: asserted here, not accepted from a browser ---
           #
@@ -270,7 +353,9 @@ processors:
           # legitimately carries today is the `RejectReason` token
           # `payload_length_exceeds_available` (32 chars), so 64 is 2x the
           # measured floor. The vocabularies are still growing (story 2 added
-          # `kek_generation_stale` and `sender_not_assigned`, both well under the
+          # `kek_generation_stale` and `sender_not_assigned`; story 4 C2 added
+          # `duplicate_cross_transport` (25) and the `phase`/`cause` vocabularies,
+          # longest `aborted_by_removal` (18) — all well under the
           # cap), and a cap that is TOO TIGHT sentinels a real
           # token and takes the alert quiet, while one that is too loose costs
           # only bytes. Raise it by re-measuring the longest token, not by
@@ -310,6 +395,8 @@ processors:
           - set(attributes["action"], "invalid") where attributes["action"] != nil and (not IsString(attributes["action"]) or not IsMatch(attributes["action"], "^[a-z_]{1,64}$"))
           - set(attributes["source"], "invalid") where attributes["source"] != nil and (not IsString(attributes["source"]) or not IsMatch(attributes["source"], "^[a-z_]{1,64}$"))
           - set(attributes["mode"], "invalid") where attributes["mode"] != nil and (not IsString(attributes["mode"]) or not IsMatch(attributes["mode"], "^[a-z_]{1,64}$"))
+          - set(attributes["phase"], "invalid") where attributes["phase"] != nil and (not IsString(attributes["phase"]) or not IsMatch(attributes["phase"], "^[a-z_]{1,64}$"))
+          - set(attributes["cause"], "invalid") where attributes["cause"] != nil and (not IsString(attributes["cause"]) or not IsMatch(attributes["cause"], "^[a-z_]{1,64}$"))
 
           # --- media_kind: an EXACT value allowlist, the deliberate exception ---
           #
@@ -628,10 +715,50 @@ processors:
   # today, 2 once screen emits; any per-kind name 6 adversarially. Recompute
   # the lines above when a name or a value set is added. TRIGGER: if the
   # honest-WITH-SCREEN headroom drops below 3 concurrent runs at the current
-  # cap, raise the cap in the task that crosses it (it is ~4.1 at 1000).
+  # cap, raise the cap in the task that crosses it (it was ~4.1 at 1000; ~3.3
+  # after story 4 C2, below).
+  # STORY 4 C2 (R-42) — seven names join the allowlist (49 names) and two
+  # kept keys (`phase`, `cause`). Histograms count as one stream each, every
+  # value assumed observed. Kind-free (session) additions:
+  #   - `dt_client_mh_connection_total` 3 `phase` x 10 `outcome` = 30
+  #     (zero-initialised at join, so honest from the first second);
+  #   - `dt_client_mh_dial_duration_ms` 3 `phase` x 2 `outcome` = 6;
+  #   - `dt_client_time_to_first_mh_connected_ms` (no extra label) = 1;
+  #   - `dt_client_mh_disconnects_total` x 8 `cause` = 8;
+  #   - `dt_client_mh_reconnect_duration_ms` x 3 `outcome` = 3;
+  #   - `dt_client_mh_non_member_refs_total` x 2 `source` = 2.
+  #   +50, so session-level 19 + 50 = 69.
+  # Per-kind additions (x the kind-tuple multiplier, like every per-kind name):
+  #   - `dt_client_media_resume_ms` x 3 `outcome` = +3;
+  #   - `dt_client_media_frames_dropped_total` gains the `drops_frame: true`
+  #     token `duplicate_cross_transport` = +1.
+  #   Per-kind 67 + 4 = 71. Video-only receive names unchanged at 12.
+  # Stale tabs add nothing: an old-shaped `dt_client_mh_connection_total`
+  # point is dropped by `filter/client_mh_connection_stale_tab`, and an old
+  # `dt_client_time_to_first_mh_connected_ms` point collapses into the new
+  # stream once its old labels are stripped.
+  # Per per-run `org_id`, at `max_streams: 1000`:
+  #   - honest TODAY (every series reads `main`): 71 x 2 + 69 + 12 = 223
+  #     -> ~4.5 runs (was ~6.1);
+  #   - honest WITH SCREEN: 71 x 3 + 69 + 12 x 2 = 306 -> ~3.3 runs (was ~4.1);
+  #   - adversarial, per-kind names (6 kind tuples): 71 x 6 + 69 + 12 x 6 =
+  #     567 -> ~1.8 runs (was ~2.0);
+  #   - adversarial, kind keys forged onto EVERY name: (71 + 69 + 12) x 6 =
+  #     912 -> ~1.1 runs (was ~1.7).
+  # `phase` and `cause` are bounded in CHARSET, not COUNT, like the keys
+  # named in the floor paragraph above, so the adversarial lines stay a floor.
+  # TRIGGER APPLIED: honest-with-screen is 3.3 >= 3, so NO cap change here.
+  # The margin is ~27 streams per org at the trigger (1000 / 3 = 333): the
+  # next task adding ~9 per-kind streams (or ~27 kind-free ones) crosses it
+  # and RAISES THE CAP in that task.
   # STALE TABS AT ROLLOUT: a browser still running a pre-2026-10-26 SDK sends
   # `media_kind` without `content_kind`, so the lone-key rule stores it as
   # invalid/invalid until that tab reloads. That is not a patched client.
+  # STALE TABS AT STORY 4 C2 ROLLOUT: an old tab's `dt_client_mh_connection_total`
+  # (`status`, `mh_index_bucket`, `meeting_id_hash`) is DROPPED by the stale-tab
+  # shape gate, never stored label-less; its `meeting_id_hash` is never kept on
+  # any name. Panels group by `(phase, outcome)` / `(cause)` / `(outcome)` so a
+  # label-less row could not inflate a ratio even if one got through.
   # Recompute this figure whenever a name or a label value set is added.
   delta_to_cumulative:
     max_stale: 15m
@@ -720,10 +847,10 @@ service:
   # THE COLLECTOR'S OWN TELEMETRY — because every control above fails QUIET.
   # -------------------------------------------------------------------
   #
-  # The metrics path drops in five places, and EVERY ONE of them fails by
-  # making something ABSENT: the name allowlist, the temporality gate,
-  # `keep_keys`, `delta_to_cumulative`'s `max_streams`, and `memory_limiter`.
-  # On a deployed cluster all five are indistinguishable from "no browser
+  # The metrics path drops in six places, and EVERY ONE of them fails by
+  # making something ABSENT: the name allowlist, the temporality gate, the
+  # stale-tab shape gate, `keep_keys`, `delta_to_cumulative`'s `max_streams`,
+  # and `memory_limiter`. On a deployed cluster all six are indistinguishable from "no browser
   # connected" — and because there is no per-browser `up` and structurally
   # cannot be one (§11), the presence of a client series is the ONLY liveness
   # signal the browser fleet has. So a stale-bundle fleet whose datapoints are
@@ -760,5 +887,5 @@ service:
       exporters: [debug]
     metrics:
       receivers: [otlp]
-      processors: [memory_limiter, filter/client_metric_names, filter/client_metric_temporality, transform/client_metric_labels, batch/client_metric_order, transform/client_metric_clock, delta_to_cumulative]
+      processors: [memory_limiter, filter/client_metric_names, filter/client_metric_temporality, filter/client_mh_connection_stale_tab, transform/client_metric_labels, batch/client_metric_order, transform/client_metric_clock, delta_to_cumulative]
       exporters: [debug, prometheus]

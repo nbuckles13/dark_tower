@@ -87,6 +87,8 @@ case future drift emerges from new services or metric additions.
 | `reason` | Why a **frame** was dropped on the media path | **ONE label space, TWO families, each with exactly one home.** (a) The *codec* family is bounded by `proto/test-vectors/frame-v3.vectors.json` → `reject_reasons`; (b) the *relay transport-and-routing* family is bounded by `mh_service::observability::metrics::MediaDropReason`. **Points, never restates** — restating either set here would give each token two homes and they would drift. Distinct from `error_type` / `error_category`, which classify why a **service operation** failed: `reason` is per-frame and lives entirely on the media path. See §Frame reject reason and §Media-path transport refusals below. |
 | `trigger` | Why a media handler was REMOVED from a meeting (ADR-0039 §2/§6, §8) | `heartbeat_timeout`, `apply_lag`, `planned_transfer` — **single source of truth: `crates/common/src/observability/labels.rs::RemovalTrigger`** (`ALL` + `label()`; key `TRIGGER_LABEL`), the label vocabulary every service projects from the wire `ReleaseCause` (telemetry contract: "No service keeps its own list"). MC uses the same enum as its domain type; GC's `ReplacementTrigger` and MH's release counter delegate their three shared values to it. Service-local values WRAP it, never extend it: GC's `invalid`, MH-3's MH-local `owner_silence`. `meeting_ended` is never a `trigger` on a removal series. **Scope:** this vocabulary binds on the handler-removal series (`mh_media_handler_releases_total`, `gc_mh_replacement_requests_total`, MC-B2's declaration/migration series); MC's `mc_meeting_kek_generated_total{trigger}` is a pre-existing, unrelated service-local KEK-rotation vocabulary (§Service-local labels) and is not covered by this row. |
 | `mode` | Capture source of the LOCAL send path — what feeds this client's encoder | `microphone` (also covers an embedder-injected capture factory), `test_tone` (only the define-gated built-in tone) — a closed enum declared as the type `MediaCaptureSourceMode` in `packages/sdk-core/src/media/setup/mediaMetrics.ts`, carried only by `dt_client_media_capture_source`. **Datapoint-only** (GC `MEDIA_DATAPOINT_EXTRA`, collector `keep_keys`; never on spans or exemplars). **Identity-free**: the value is a build-time property of the bundle (`__DT_TEST_TONE__`), not per user, participant or meeting. The token `test_tone` exists in a bundle only inside the define's gate. |
+| `phase` | Which **stage or sub-interval** of an operation a sample belongs to | Closed enum **per metric**, defined in that metric's catalog entry, and deliberately not enumerated here. Carriers: MH `mh_media_forward_latency_seconds` (`MediaLatencyPhase`), MC `mc_media_handler_migration_duration_seconds` (`MigrationPhase`), and the client's `dt_client_mh_connection_total` / `dt_client_mh_dial_duration_ms` (`MH_DIAL_PHASES`: `join`, `added`, `redial`; story 4 C2). Client `phase` is **datapoint-only** (GC `MEDIA_DATAPOINT_EXTRA`, collector `keep_keys`; never on spans or exemplars). **A per-metric vocabulary with no cross-metric aggregation contract** `[reviewer-only]`, exactly as `outcome`: `sum by(phase)` across two metric names is meaningless by design. |
+| `cause` | Why a **session, connection or meeting ended** | Closed enum **per metric**, defined in that metric's catalog entry, and deliberately not enumerated here. Carriers: MC `mc_participant_disconnects_total` and the meeting-end series (`MEETING_END_CAUSE_LABEL`), and the client's `dt_client_mh_disconnects_total` (`MH_DISCONNECT_CAUSES`; story 4 C2; client-local, catalogued only in `docs/observability/metrics/client.md`). Client `cause` is **datapoint-only** (GC `MEDIA_DATAPOINT_EXTRA`, collector `keep_keys`). **A per-metric vocabulary with no cross-metric aggregation contract** `[reviewer-only]`. `mc_participant_disconnects_total{cause}` (a participant's signaling session) and `dt_client_mh_disconnects_total{cause}` (one media-handler transport) have similar names, but they observe different sessions and use disjoint vocabularies. They are NOT a join key. Distinct from `reason`, which is per **frame**. |
 
 **`status` vs `outcome`.** Use `status` when the values are the coarse, shared
 set above and a responder compares them across services. Use `outcome` when the
@@ -647,11 +649,12 @@ Plus `key_custody=operator` (§Key custody). That is the whole set.
 > default at every non-media emission site; what changed is that the media path no longer has a
 > parameter through which it could arrive.
 >
-> **One metric deliberately still carries it.** `dt_client_mh_connection_total` keeps
-> `meeting_id_hash` as a grandfathered ADR-0028 join-flow metric, and
-> `media/__tests__/media-transport.test.ts` keeps the assertion pinning that — annotated at both
-> sites, because it and the R3 negative test assert opposite things and are both correct. See
-> §The grandfathered set below.
+> **No media-path metric carries it any more (story 4 C2).** `dt_client_mh_connection_total` used to
+> keep `meeting_id_hash` as a grandfathered ADR-0028 join-flow metric, through `MediaTransport`'s
+> join-label spread. It and `dt_client_time_to_first_mh_connected_ms` left the grandfathered set
+> (telemetry contract R-42). Both now take the kind-free media session bag (`client_version`,
+> `org_id`, `key_custody`) from `MediaSessionMetrics`, and no join-label spread remains in the media
+> tree. The grandfathered set shrank and was not extended (§The grandfathered set below).
 
 ### R4 — Every media-path series is identity-free and carries `key_custody=operator`
 
@@ -670,16 +673,23 @@ mc_meeting_kek_
 mc_meeting_sender_ids_
 dt_client_media_
 dt_client_time_to_first_media_frame_ms
+dt_client_mh_
+dt_client_time_to_first_mh_connected_ms
 ```
 
-The last entry is a single exported client media metric outside the `dt_client_media_` prefix. The
-hygiene kernel's `MEDIA_PATH_PREFIXES` is pinned to this block by a unit test.
+`dt_client_mh_` is the client's media-handler connection family (story 4 C2: dial outcomes and
+duration, disconnects, reconnect duration, non-member refs). Two entries are single exact metric
+names outside both client prefixes: `dt_client_time_to_first_media_frame_ms` and
+`dt_client_time_to_first_mh_connected_ms`. The hygiene kernel's `MEDIA_PATH_PREFIXES` is pinned to
+this block by a unit test.
 
 `mc_meeting_sender_ids_issued_max` is IN by decision: it is the ADR-0036 §2 sender-handle space. It
 observes no frame, but it is the dimension R2 exists to keep out of labels, so it stays under the
-same bar. `dt_client_mh_connection_total` and the other ADR-0028 join-flow metrics are OUT. They are
-the closed grandfathered set (§The grandfathered set), and the collector's name allowlist never
-exports them.
+same bar. The remaining ADR-0028 join-flow metrics are OUT. They are the closed grandfathered set
+(§The grandfathered set; the member list lives only in `docs/observability/metrics/client.md`'s
+frozen roster), and the collector's name allowlist never exports them. `dt_client_mh_connection_total` and `dt_client_time_to_first_mh_connected_ms` left that
+set in story 4 C2 (telemetry contract R-42): they dropped `meeting_id_hash`, moved to the media-path
+label set and are exported, so they are IN.
 
 **The identity vocabulary is ONE policy with two consumers, and this fenced block is its only home.**
 
@@ -703,7 +713,7 @@ matcher that drifts goes red in whichever crate drifted. Add a row here, never t
 
 ```identity-label-cases
 fire = participant_id, meeting_id_hash, stream_id, key_id, kek_id, meetingId, session.id, slot_index, slot_id, x_sender_idx, user, frame_hash, user-id, key-id, sender-id, frame-hash
-pass = key_custody, org_id, slot_state, media_kind, content_kind, client_version, reason, outcome, action, source, mode, trigger, payload_kind, instance, job, le, otel_scope_name, otel_scope_version, valid, monkey_business, direction, status
+pass = key_custody, org_id, slot_state, media_kind, content_kind, client_version, reason, outcome, action, source, mode, trigger, payload_kind, instance, job, le, otel_scope_name, otel_scope_version, valid, monkey_business, direction, status, phase, cause
 ```
 
 **Matcher semantics.**
@@ -806,9 +816,10 @@ connection, at setup, before any frame exists — is grandfathered. Media-carryi
 stream, or on the media data path — is under the bar.
 
 A directory-shaped rule fails in **both** directions, and only one of those failures is the one people
-picture. It would wrongly bar `dt_client_mh_connection_total`, which lives in `media/MediaTransport.ts`
-and is grandfathered anyway; and it would wrongly **permit** a media counter placed outside the media
-tree. The second is the failure that will actually happen, and a directory rule licenses it.
+picture. It would have wrongly barred `dt_client_mh_connection_total` while that metric was a
+connect-lifecycle member living in `media/MediaTransport.ts`. It left the set in story 4 C2, by an
+explicit roster change and not by its directory. It would also wrongly **permit** a media counter
+placed outside the media tree. The second is the failure that will actually happen, and a directory rule licenses it.
 
 The roster is frozen with a named member list in `docs/observability/metrics/client.md` — a closed
 exception with no roster opens by analogy, because the next author decides their metric is "join-flow

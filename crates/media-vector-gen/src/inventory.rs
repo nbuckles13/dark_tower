@@ -29,8 +29,38 @@ use media_protocol::frame::{
 /// Story-file path carrying the verbatim `wrap_key_id_mismatch` spelling.
 const STORY_ANCHOR: &str = "docs/user-stories/2026-08-27-hear-yourself-through-handler.md";
 
+/// MH-replacement telemetry contract: carries the verbatim
+/// `duplicate_cross_transport` spelling.
+const MH_CONTRACT: &str =
+    "docs/debates/2026-10-28-mh-replacement-and-migration/telemetry-contract.md";
+
 fn u32_of(v: usize) -> u32 {
     u32::try_from(v).unwrap_or(u32::MAX)
+}
+
+// Built through a helper taking `&str` rather than inline
+// `token: "...".to_string()` literals. Those literals are reject-REASON
+// vocabulary, not credentials, but `rust_secrets`'s
+// `secret_identifier_literal_assignment` rule cannot know that: it sees an
+// identifier named `token` assigned a string literal. Restructuring removes
+// the pattern; a `guard:ignore` would only suppress it, and a suppression on
+// a file that genuinely handles key material is a bad precedent to set.
+fn entry(
+    name: &str,
+    layer: &str,
+    drops_frame: bool,
+    has_vector: bool,
+    fleet: Option<&str>,
+    anchor: Option<&str>,
+) -> RejectReasonEntry {
+    RejectReasonEntry {
+        token: name.to_string(),
+        layer: layer.to_string(),
+        drops_frame,
+        has_vector,
+        fleet_spelling: fleet.map(ToString::to_string),
+        spec_anchor: anchor.map(ToString::to_string),
+    }
 }
 
 /// The complete reason vocabulary — the whole R-25 label space, not a subset.
@@ -42,31 +72,6 @@ fn u32_of(v: usize) -> u32 {
 /// `unwrap_failed` is byte-determined with a key-distribution remedy, and
 /// `no_transmit_key` is codec-layer while firing on key-store membership.
 fn reject_reasons() -> Vec<RejectReasonEntry> {
-    // Built through a helper taking `&str` rather than inline
-    // `token: "...".to_string()` literals. Those literals are reject-REASON
-    // vocabulary, not credentials, but `rust_secrets`'s
-    // `secret_identifier_literal_assignment` rule cannot know that: it sees an
-    // identifier named `token` assigned a string literal. Restructuring removes
-    // the pattern; a `guard:ignore` would only suppress it, and a suppression on
-    // a file that genuinely handles key material is a bad precedent to set.
-    fn entry(
-        name: &str,
-        layer: &str,
-        drops_frame: bool,
-        has_vector: bool,
-        fleet: Option<&str>,
-        anchor: Option<&str>,
-    ) -> RejectReasonEntry {
-        RejectReasonEntry {
-            token: name.to_string(),
-            layer: layer.to_string(),
-            drops_frame,
-            has_vector,
-            fleet_spelling: fleet.map(ToString::to_string),
-            spec_anchor: anchor.map(ToString::to_string),
-        }
-    }
-
     let mut out: Vec<RejectReasonEntry> = ALL_REJECT_REASONS
         .iter()
         .map(|r| entry(r.as_str(), "codec", true, true, None, None))
@@ -95,6 +100,16 @@ fn reject_reasons() -> Vec<RejectReasonEntry> {
     out.push(entry("decrypt_failed", "crypto", true, true, None, None));
     out.push(entry("unwrap_failed", "crypto", true, true, None, None));
     out.push(entry("replay_detected", "crypto", true, true, None, None));
+    // Cross-transport split of an exact in-window replay hit (make-before-break
+    // overlap); multi-frame, so has_vector:false like `stream_partial_reset`.
+    out.push(entry(
+        "duplicate_cross_transport",
+        "crypto",
+        true,
+        false,
+        None,
+        Some(MH_CONTRACT),
+    ));
     // The ONLY drops_frame:false. §4 says the receiver IGNORES a mis-bound wrap
     // rather than dropping the frame; keeping a played frame out of the drop
     // counter is what preserves R-25's `received = played + sum(drops)`.

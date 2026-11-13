@@ -322,6 +322,60 @@ def filtering():
     check("names verbatim (no doubled _total)", "_total_total" in t, False)
 
 
+MHC = "dt_client_mh_connection_total"
+
+
+def stale_tab():
+    """Story 4 C2: the stale-tab shape gate (`filter/client_mh_connection_stale_tab`).
+
+    One run, one org, two writers sharing the name: an OLD-bundle tab whose
+    `dt_client_mh_connection_total` arrives post-GC without `phase`/`outcome`
+    (GC strips its `status`/`mh_index_bucket`; it still carries
+    `meeting_id_hash`) must be ABSENT from storage, and a NEW-bundle tab's
+    `{phase, outcome}` point must be PRESENT with its exact value. Both arms in
+    the same run, so a gate that dropped the whole name fails the PRESENT arm
+    and a gate that dropped nothing fails the ABSENT arm. Half-shaped points
+    (only one discriminator) are dropped too.
+    """
+    print("== S8 stale-tab shape gate on dt_client_mh_connection_total (old ABSENT, new PRESENT, same run)")
+    org = "stale-tab"
+    t0 = now_ns() - int(CADENCE * 1e9)
+    t1 = now_ns()
+    post([
+        counter(MHC, dict(BASE, org_id=org, meeting_id_hash="deadbeef"), 5, t0, t1),                 # old shape, post-GC
+        counter(MHC, dict(BASE, org_id=org, outcome="connected"), 7, t0, t1),                          # half-shaped: no phase
+        counter(MHC, dict(BASE, org_id=org, phase="join"), 11, t0, t1),                                # half-shaped: no outcome
+        counter(MHC, dict(BASE, org_id=org, phase="redial", outcome="wrong_handler"), 3, t0, t1),      # new shape
+        counter(MHC, dict(BASE, org_id=org + "-shape", phase="Bad Phase", outcome="connected"), 1, t0, t1),
+        counter("dt_client_mh_disconnects_total", dict(BASE, org_id=org, cause="transport_loss"), 2, t0, t1),
+        counter("dt_client_mh_disconnects_total", dict(BASE, org_id=org + "-shape", cause="x@y.example"), 1, t0, t1),
+        # the gate is name-scoped: a phase-less, outcome-less point on another name survives
+        counter("dt_client_mh_non_member_refs_total", dict(BASE, org_id=org, source="stream_assignment"), 1, t0, t1),
+    ])
+    settle()
+    t = scrape()
+    rows = []
+    for line in t.splitlines():
+        if line.startswith(MHC + "{") and f'org_id="{org}"' in line:
+            rows.append(line)
+    check("(stale-tab) new-shaped point PRESENT with exact value and labels",
+          value(t, MHC, {"org_id": org, "phase": "redial", "outcome": "wrong_handler"})[0], 3.0)
+    check("(stale-tab) old-shaped / half-shaped points ABSENT (only the new row stored)", len(rows), 1)
+    check("(stale-tab) no row lacks phase or outcome",
+          [r for r in rows if "phase=" not in r or "outcome=" not in r], [])
+    check("(stale-tab) old tab's meeting_id_hash never stored", "deadbeef" in t, False)
+    _, labels = value(t, MHC, {"org_id": org + "-shape"})
+    check("(c) mis-shaped phase rewritten", ((labels or {}).get("phase"), (labels or {}).get("outcome")), ("invalid", "connected"))
+    v, labels = value(t, "dt_client_mh_disconnects_total", {"org_id": org})
+    check("(keep) cause survives", (v, (labels or {}).get("cause")), (2.0, "transport_loss"))
+    _, labels = value(t, "dt_client_mh_disconnects_total", {"org_id": org + "-shape"})
+    check("(c) mis-shaped cause rewritten", (labels or {}).get("cause"), "invalid")
+    v, labels = value(t, "dt_client_mh_non_member_refs_total", {"org_id": org})
+    check("(stale-tab) gate is name-scoped: other kind-free name unaffected", (v, (labels or {}).get("source")), (1.0, "stream_assignment"))
+    check("(nil-guard) phase/cause never stamped on a series that lacks them",
+          sorted(k for k in (labels or {}) if k in ("phase", "cause")), [])
+
+
 if __name__ == "__main__":
     only = sys.argv[4] if len(sys.argv) > 4 else "all"
     if only in ("all", "two"):
@@ -336,5 +390,7 @@ if __name__ == "__main__":
         stale(float(sys.argv[5]) if len(sys.argv) > 5 else 40.0)
     if only in ("all", "filter"):
         filtering()
+    if only in ("all", "stale_tab"):
+        stale_tab()
     print("RESULT:", "FAIL " + ", ".join(FAIL) if FAIL else "PASS")
     sys.exit(1 if FAIL else 0)

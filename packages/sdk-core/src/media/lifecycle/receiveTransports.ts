@@ -234,8 +234,15 @@ export interface ReceiveTransportsOptions {
   readonly readableFor: (handlerRef: HandlerRef) => ReadableStream<Uint8Array> | undefined;
   readonly declaredSlotIds: readonly number[];
   readonly hopRestartBackwardJumpFrames: number;
-  /** Process one datagram. Returns normally for every WIRE condition. */
-  readonly accept: (datagram: Uint8Array, hopMonitor: HopSequenceMonitor) => Promise<void>;
+  /**
+   * Process one datagram that arrived via the handler `ref`. Returns normally
+   * for every WIRE condition.
+   */
+  readonly accept: (
+    datagram: Uint8Array,
+    hopMonitor: HopSequenceMonitor,
+    ref: HandlerRef,
+  ) => Promise<void>;
   readonly isStopped: () => boolean;
   /** Register a disposer with the owner's teardown. */
   readonly register: (name: string, dispose: () => void) => void;
@@ -245,19 +252,32 @@ export interface ReceiveTransportsOptions {
   readonly frameFault: (message: string) => void;
 }
 
+/** One datagram read loop's context: its transport's hop monitor and ref. */
+interface DatagramLoopContext {
+  readonly monitor: HopSequenceMonitor;
+  readonly ref: HandlerRef;
+}
+
 /** The DATAGRAM (audio) read loops and their per-transport hop monitors. */
 export class ReceiveTransports {
-  readonly #loops: PerHandlerReadLoops<Uint8Array, HopSequenceMonitor>;
+  readonly #loops: PerHandlerReadLoops<Uint8Array, DatagramLoopContext>;
 
   constructor(options: ReceiveTransportsOptions) {
     this.#loops = new PerHandlerReadLoops({
       readableFor: options.readableFor,
       // A hop monitor PER TRANSPORT, never shared (module header).
-      contextFor: () =>
-        new HopSequenceMonitor(options.declaredSlotIds, options.hopRestartBackwardJumpFrames),
+      contextFor: (ref) => ({
+        monitor: new HopSequenceMonitor(
+          options.declaredSlotIds,
+          options.hopRestartBackwardJumpFrames,
+        ),
+        ref,
+      }),
       // The monitor for THIS transport travels with the datagram: each handler
-      // writes its own hop numbering (see `IngressPipeline.accept`).
-      onItem: (datagram, monitor) => options.accept(datagram, monitor),
+      // writes its own hop numbering (see `IngressPipeline.accept`). The ref
+      // travels too: it is the frame's arrival (replay classification, slot
+      // continuity evidence — story 4 C2).
+      onItem: (datagram, ctx) => options.accept(datagram, ctx.monitor, ctx.ref),
       isStopped: options.isStopped,
       register: options.register,
       transportFault: options.transportFault,
@@ -281,11 +301,11 @@ export class ReceiveTransports {
    * per-transport hop monitor (ADR-0039 §4 removal cleanup).
    */
   stop(ref: HandlerRef): void {
-    this.#loops.stop(ref)?.clear();
+    this.#loops.stop(ref)?.monitor.clear();
   }
 
   /** Drop every hop monitor's state. Called from the owner's teardown. */
   clear(): void {
-    for (const monitor of this.#loops.contexts()) monitor.clear();
+    for (const ctx of this.#loops.contexts()) ctx.monitor.clear();
   }
 }

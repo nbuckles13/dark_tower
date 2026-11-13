@@ -63,7 +63,11 @@ const KINDS: readonly LabelledMediaKind[] = Object.keys(MEDIA_KIND_LABEL_PROJECT
 );
 
 /** Every PER-KIND emitter, each with the one discriminator it may add (or none). */
-const PER_KIND_EMITTERS: [string, (m: MediaKindMetrics) => void, string | null][] = [
+const PER_KIND_EMITTERS: [
+  string,
+  (m: MediaKindMetrics) => void,
+  string | readonly string[] | null,
+][] = [
   ['dt_client_media_frames_sent_total', (m) => m.frameSent(), null],
   [
     'dt_client_media_send_dropped_total',
@@ -141,10 +145,16 @@ const PER_KIND_EMITTERS: [string, (m: MediaKindMetrics) => void, string | null][
   ['dt_client_media_active_source_intervals_total', (m) => m.activeSourceIntervals(3), null],
   ['dt_client_media_time_to_first_render_ms', (m) => m.timeToFirstRenderMs(500), null],
   ['dt_client_media_slot_active_to_first_render_ms', (m) => m.slotActiveToFirstRenderMs(250), null],
+  // Story 4 C2: the per-slot media-dark window.
+  ['dt_client_media_resume_ms', (m) => m.resumeMs('resumed', 4_000), 'outcome'],
 ];
 
 /** Every SESSION-LEVEL (kind-free) emitter. */
-const SESSION_EMITTERS: [string, (m: MediaSessionMetrics) => void, string | null][] = [
+const SESSION_EMITTERS: [
+  string,
+  (m: MediaSessionMetrics) => void,
+  string | readonly string[] | null,
+][] = [
   [
     'dt_client_media_kek_updates_total',
     (m) => m.kekUpdate(MEDIA_KEK_SOURCES.JoinResponse),
@@ -183,6 +193,25 @@ const SESSION_EMITTERS: [string, (m: MediaSessionMetrics) => void, string | null
     (m) => m.keyframeRequestUnattributed(MEDIA_KEYFRAME_REQUEST_OUTCOMES.Malformed),
     'outcome',
   ],
+  // Story 4 C2 (R-42): the MH connection family, kind-free.
+  [
+    'dt_client_mh_connection_total',
+    (m) => m.mhConnection('join', 'connected'),
+    ['phase', 'outcome'],
+  ],
+  [
+    'dt_client_mh_dial_duration_ms',
+    (m) => m.mhDialDurationMs('redial', 'failed', 120),
+    ['phase', 'outcome'],
+  ],
+  ['dt_client_time_to_first_mh_connected_ms', (m) => m.timeToFirstMhConnectedMs(800), null],
+  ['dt_client_mh_disconnects_total', (m) => m.mhDisconnect('transport_loss'), 'cause'],
+  [
+    'dt_client_mh_reconnect_duration_ms',
+    (m) => m.mhReconnectDurationMs('reconnected', 9_000),
+    'outcome',
+  ],
+  ['dt_client_mh_non_member_refs_total', (m) => m.mhNonMemberRef('stream_assignment'), 'source'],
 ];
 
 function emitEverything(metrics: MediaMetrics): void {
@@ -300,7 +329,9 @@ describe('every PER-KIND emission carries exactly the five-key set plus its disc
       const [record, ...rest] = sink.getRecordedMetrics();
       expect(rest).toEqual([]);
       expect(record?.name).toBe(name);
-      const expected = discriminator ? [...PER_KIND_KEYS, discriminator].sort() : PER_KIND_KEYS;
+      const expected = discriminator
+        ? [...PER_KIND_KEYS, ...[discriminator].flat()].sort()
+        : PER_KIND_KEYS;
       expect(Object.keys(record!.labels).sort()).toEqual(expected);
       // All or none: both kind labels, from the one projection entry.
       expect(record!.labels.media_kind).toBe(MEDIA_KIND_LABEL_PROJECTION[kind].media_kind);
@@ -335,7 +366,9 @@ describe('every SESSION-LEVEL emission is kind-free', () => {
     const [record, ...rest] = sink.getRecordedMetrics();
     expect(rest).toEqual([]);
     expect(record?.name).toBe(name);
-    const expected = discriminator ? [...SESSION_KEYS, discriminator].sort() : SESSION_KEYS;
+    const expected = discriminator
+      ? [...SESSION_KEYS, ...[discriminator].flat()].sort()
+      : SESSION_KEYS;
     expect(Object.keys(record!.labels).sort()).toEqual(expected);
     expect(Object.keys(record!.labels)).not.toContain('media_kind');
     expect(Object.keys(record!.labels)).not.toContain('content_kind');

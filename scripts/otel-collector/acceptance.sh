@@ -25,7 +25,12 @@
 #   scripts/otel-collector/acceptance.sh <image>            # candidate image
 #   scripts/otel-collector/acceptance.sh <image> <scenario> [idle-seconds]
 #
-# Scenarios: all (default) | two | idle | skew | concurrent | filter | sdk | stale
+# Scenarios: all (default) | two | idle | skew | concurrent | filter | stale_tab | sdk | stale
+#
+# `stale_tab` (also in `all`, and the SDK `stale_tab` mode under `sdk`): the
+# story 4 C2 stale-tab shape gate — an old-shaped `dt_client_mh_connection_total`
+# writer (no `phase`/`outcome`) is ABSENT from storage while a new-shaped writer
+# is PRESENT, in the same run.
 set -euo pipefail
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -106,7 +111,7 @@ if [[ "$SCEN" == sdk ]]; then
   # Real OTel JS MeterProviders built from sdk-core's OWN pinned packages, so the
   # wire shape is the SDK's rather than this harness's idea of it. Run from the
   # package dir so module resolution finds them.
-  for mode in two idle restart cumulative; do
+  for mode in two idle restart cumulative stale_tab; do
     (
       cd "$REPO_ROOT/packages/sdk-core"
       cp "$HERE/sdk_writers.mjs" ./.dt-sdk-writers.tmp.mjs

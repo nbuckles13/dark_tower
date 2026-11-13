@@ -636,6 +636,60 @@ test('a slot state change recomputes ONLY that tile; a mute change ONLY that par
   expect(counts.rowX).toBe(renderBase.rowX);
 });
 
+test('story 4 C2: a slot RECONNECTING change recomputes ONLY that tile, and clears', async () => {
+  const counts = { tile3: 0, tile4: 0, rowX: 0, rowY: 0 };
+  const session = new MockMeetingSession();
+  const screen = await render(CellGranularityHarness, { session, counts });
+  session.fire('streamAssignments', {
+    unreachableSenderIds: [],
+    assignments: [
+      slot({ slotId: 3, mediaKind: 'video', senderId: 7, slotState: 'active' }),
+      slot({ slotId: 4, mediaKind: 'video', senderId: 8, slotState: 'active' }),
+    ],
+  });
+  await expect.element(screen.getByTestId('tile-4')).toMatchTextContent('active');
+  const base = { ...counts };
+  session.fire('slotReconnectingChanged', { slotId: 3, reconnecting: true, previousSenderId: 7 });
+  await expect.element(screen.getByTestId('tile-3')).toMatchTextContent('reconnecting:7');
+  expect(counts.tile3).toBeGreaterThan(base.tile3); // positive control
+  expect(counts.tile4).toBe(base.tile4);
+  expect(counts.rowX).toBe(base.rowX);
+  // The same transition again re-writes nothing.
+  const same = { ...counts };
+  session.fire('slotReconnectingChanged', { slotId: 3, reconnecting: true, previousSenderId: 7 });
+  expect(counts.tile3).toBe(same.tile3);
+  session.fire('slotReconnectingChanged', {
+    slotId: 3,
+    reconnecting: false,
+    previousSenderId: undefined,
+  });
+  await expect.element(screen.getByTestId('tile-3')).not.toHaveTextContent('reconnecting');
+  expect(counts.tile4).toBe(base.tile4);
+});
+
+test('story 4 C2: the handler set is an explicit token-free projection; empty = connecting media; overdue latches', () => {
+  const store = new MeetingStore();
+  expect(store.media.handlerSet).toBeUndefined();
+  expect(store.media.mediaConnecting).toBe(false); // no set yet is NOT "connecting"
+  store.media.applyHandlerSet({ version: '1', handlers: [] });
+  expect(store.media.mediaConnecting).toBe(true);
+  expect(store.media.handlersOverdue).toBe(false);
+  store.media.applyHandlersOverdue();
+  expect(store.media.handlersOverdue).toBe(true);
+  // A field the SDK might add later never reaches a reader (allow-list projection).
+  store.media.applyHandlerSet({
+    version: '2',
+    handlers: [{ ref: 5, url: 'https://mh-5', extra: 'SENTINEL' } as never],
+  });
+  expect(store.media.mediaConnecting).toBe(false);
+  expect(store.media.handlersOverdue).toBe(false); // renders only while still empty
+  expect(store.media.handlerSet).toEqual({
+    version: '2',
+    handlers: [{ ref: 5, url: 'https://mh-5' }],
+  });
+  expect(JSON.stringify(store.media.handlerSet)).not.toContain('SENTINEL');
+});
+
 test('decoded frames NEVER touch the store: a paint recomputes nothing and is counted at the surface', async () => {
   const counts = { tile3: 0, tile4: 0, rowX: 0, rowY: 0 };
   const session = new MockMeetingSession();

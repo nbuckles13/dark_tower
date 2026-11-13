@@ -10,12 +10,14 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { context, trace } from '@opentelemetry/api';
-import { InMemoryMetricsSink, type MockWebTransport } from '@darktower/test-utils';
+import { FakeScheduler, InMemoryMetricsSink, type MockWebTransport } from '@darktower/test-utils';
 
 import { MediaTransport } from '../MediaTransport.js';
 import type { MediaTransportOptions } from '../events.js';
+import { MediaSessionMetrics } from '../setup/mediaMetrics.js';
 import { handlerRef } from '../handlerSet.js';
 import type { MhConnectionStatusReport } from '../../signaling/events.js';
+import { DEFAULT_CLIENT_CONFIG } from '../../config/clientConfig.js';
 import {
   MediaConnectionError,
   MediaConnectionErrorCode,
@@ -180,13 +182,20 @@ describe('MediaTransport.arm — the join-time dials (R-20/R-21)', () => {
     expect(mt.getState(REF_A)).toBeUndefined();
   });
 
-  it('buckets the 3rd handler index as "2+" in mh_connection_total', async () => {
+  it('counts every join-time dial under phase=join (no per-handler dimension)', async () => {
     const sink = new InMemoryMetricsSink();
-    const { mocks, armed } = joinTransport([URL_A, URL_B, URL_C], { metricsSink: sink });
+    const sched = new FakeScheduler();
+    const { mt, mocks, armed } = joinTransport([URL_A, URL_B, URL_C], {
+      connectionMetrics: new MediaSessionMetrics({ clientVersion: 'v', orgId: 'o' }, sink),
+      scheduler: sched,
+      clock: sched.clock,
+    });
     const p = armed();
     [URL_A, URL_B, URL_C].forEach((u) => mocks.get(u)!.simulateReady());
     await p;
-    sink.assertCounter('dt_client_mh_connection_total', { mh_index_bucket: '2+' }, 1);
+    sched.advance(DEFAULT_CLIENT_CONFIG.media.handlers.admissionWindowMs);
+    sink.assertCounter('dt_client_mh_connection_total', { phase: 'join', outcome: 'connected' }, 3);
+    mt.disconnect();
   });
 
   it('an EMPTY join set → resolves with nothing dialed ("media connecting")', async () => {
@@ -333,54 +342,47 @@ describe('MediaTransport — teardown + deadline (@operations)', () => {
 });
 
 describe('MediaTransport — metrics (R-25 M1)', () => {
-  it('emits dt_client_mh_connection_total per MH with status + mh_index_bucket + label set', async () => {
+  it('emits dt_client_mh_connection_total through the media SESSION bag only (story 4 C2)', async () => {
+    // The series LEFT the ADR-0036 §11 grandfathered join-flow roster: its
+    // labels are exactly the allow-listed session bag plus `phase`/`outcome` —
+    // no `meeting_id_hash`, `status` or `mh_index_bucket` (and no spread of any
+    // ambient label set reaches this class: it takes no label bag at all).
     const sink = new InMemoryMetricsSink();
-    // ---------------------------------------------------------------------
-    // `meeting_id_hash` HERE IS CORRECT. DO NOT "FIX" IT WHILE APPLYING R3.
-    // ---------------------------------------------------------------------
-    //
-    // `dt_client_mh_connection_total` is an ADR-0028 join-flow metric that
-    // carried the join label set from birth, and ADR-0036 §11 grandfathers that
-    // set AS A SET: a closed, enumerated exception that is not extended and that
-    // nothing joins. The frozen roster is named in
-    // `docs/observability/metrics/client.md`.
-    //
-    // THE TEST IS WHAT A METRIC OBSERVES, NOT WHICH DIRECTORY IT LIVES IN.
-    // Connect-lifecycle — once per MH, at handshake, before any frame exists —
-    // is grandfathered. Media-carrying is under the bar. Neither §11 argument
-    // reaches this counter: the trace argument concerns the time-ordered
-    // sequence of sizes for ONE stream, and the oracle argument concerns
-    // `reason` mirroring which crypto layer rejected a frame.
-    //
-    // This assertion and the negative one in
-    // `media/pipeline/__tests__/ingress.attribution.test.ts` — that NO
-    // `dt_client_media_*` series carries `meeting_id_hash` — assert opposite
-    // things and BOTH ARE RIGHT. Unannotated they read as a contradiction that
-    // someone resolves in whichever direction they meet first.
-    const labels = { client_version: '0.0.0-test', meeting_id_hash: 'abc123', org_id: 'demo' };
+    const sched = new FakeScheduler();
     const { mt, mocks, armed } = joinTransport([URL_A, URL_B], {
-      metricsSink: sink,
-      metricLabels: labels,
+      connectionMetrics: new MediaSessionMetrics(
+        { clientVersion: '0.0.0-test', orgId: 'demo' },
+        sink,
+      ),
+      scheduler: sched,
+      clock: sched.clock,
     });
     const p = armed();
     mocks.get(URL_A)!.simulateReady();
     mocks.get(URL_B)!.simulateError(new Error('b'));
     await p;
+    sched.advance(DEFAULT_CLIENT_CONFIG.media.handlers.admissionWindowMs);
 
+    const base = { client_version: '0.0.0-test', org_id: 'demo', key_custody: 'operator' };
     sink.assertCounter(
       'dt_client_mh_connection_total',
-      { status: 'success', mh_index_bucket: '0', ...labels },
+      { ...base, phase: 'join', outcome: 'connected' },
       1,
     );
     sink.assertCounter(
       'dt_client_mh_connection_total',
-      { status: 'failure', mh_index_bucket: '1', ...labels },
+      { ...base, phase: 'join', outcome: 'transport_failure' },
       1,
     );
-    // No PII labels.
-    const keys = new Set(sink.getRecordedMetrics().flatMap((m) => Object.keys(m.labels)));
-    expect(keys.has('email')).toBe(false);
-    expect(keys.has('user_id')).toBe(false);
+    for (const m of sink.getRecordedMetrics().filter((r) => r.name.startsWith('dt_client_mh_'))) {
+      expect(Object.keys(m.labels).sort()).toEqual(
+        // connection_total and dial_duration_ms both carry exactly phase + outcome.
+        [...Object.keys(base), 'outcome', 'phase'].sort(),
+      );
+      expect(m.labels).not.toHaveProperty('meeting_id_hash');
+      expect(m.labels).not.toHaveProperty('status');
+      expect(m.labels).not.toHaveProperty('mh_index_bucket');
+    }
     mt.disconnect();
   });
 });
@@ -469,14 +471,12 @@ describe('MediaTransport — datagram I/O (ADR-0036 §1, §11)', () => {
   });
 
   it('emits no dt_client_media_* series — media metrics belong to the pipeline', async () => {
-    // The boundary this file's grandfathering comment describes, made
-    // checkable: `MediaTransport` is connect-lifecycle, so its one metric keeps
-    // the join label set, and it must not grow a media counter that would then
-    // inherit it.
+    // `MediaTransport` is connect-lifecycle: its only series are the kind-free
+    // `dt_client_mh_*` connection family; a per-kind media counter here would
+    // be a layering error.
     const sink = new InMemoryMetricsSink();
     const { mt, mocks, armed } = joinTransport([URL_A], {
-      metricsSink: sink,
-      metricLabels: { client_version: 'v', meeting_id_hash: 'h', org_id: 'o' },
+      connectionMetrics: new MediaSessionMetrics({ clientVersion: 'v', orgId: 'o' }, sink),
     });
     const p = armed();
     mocks.get(URL_A)!.simulateReady();

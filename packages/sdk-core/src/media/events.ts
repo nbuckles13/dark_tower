@@ -9,12 +9,12 @@
 // in `signaling/events.ts` (it is the input to `SignalingClient.sendMediaConnectionUpdate`),
 // so the dependency edge runs media→signaling — see that file.
 
-import type { MetricLabels, MetricsSink } from '../telemetry/MetricsSink.js';
 import type { WebTransportConnectFn } from '../signaling/SignalingClient.js';
 import type { MhConnectionStatusReport } from '../signaling/events.js';
 import type { MediaConnectionError } from '../errors/MediaConnectionError.js';
 import type { HandlerSetConfig } from '../config/clientConfig.js';
 import type { HandlerRef, MediaHandlerView } from './handlerSet.js';
+import type { MhConnectionMetrics } from './transportTelemetry.js';
 
 /**
  * Observable per-ref lifecycle (ADR-0039 §4). `removed` is not a state: a
@@ -44,8 +44,31 @@ export interface MediaTransportEventMap {
    * transport is closed, so per-ref consumers stop quietly first.
    */
   handlerRemoved: HandlerRef;
+  /**
+   * A ref LEFT THE SET (a set-driven removal only — never session teardown),
+   * emitted just before `handlerRemoved`, with whether it was still CONNECTED
+   * and whether another member is connected now. Drives the slot overlay hold
+   * of a planned transfer (story 4 C2; `session/slotContinuity.ts`).
+   */
+  handlerDropped: HandlerDropped;
+  /**
+   * A CONNECTED in-set ref's session ended as a client-observed HANDLER LOSS
+   * (no clean close, or HANDLER_RELEASED while still in the set — the
+   * `isHandlerLoss` predicate). Emitted once per lost session, before the
+   * redial / grace logic. Drives the per-slot reconnecting state (story 4 C2).
+   */
+  handlerLost: HandlerRef;
   /** No set naming a handler arrived within `emptySetNoticeMs` (once per session). */
   handlersOverdue: undefined;
+}
+
+/** Payload of {@link MediaTransportEventMap.handlerDropped}. */
+export interface HandlerDropped {
+  readonly ref: HandlerRef;
+  /** The ref's session was connected (not observed lost, not mid-dial) at the removal. */
+  readonly wasConnected: boolean;
+  /** At least one OTHER member of the set is connected at the removal. */
+  readonly otherConnected: boolean;
 }
 
 /**
@@ -57,6 +80,12 @@ export interface TransportScheduler {
   setTimeout(callback: () => void, delayMs: number): unknown;
   clearTimeout(handle: unknown): void;
 }
+
+/** The production {@link TransportScheduler}: the global timers. The ONE default. */
+export const DEFAULT_TRANSPORT_SCHEDULER: TransportScheduler = {
+  setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
+  clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+};
 
 /**
  * Run a synchronous callback inside a specific OTel context (R-58). `MeetingSession`
@@ -73,20 +102,18 @@ export interface MediaTransportOptions {
   readonly clock?: () => number;
   /** Per-MH connect deadline in ms (default {@link DEFAULT_MH_CONNECT_TIMEOUT_MS}). */
   readonly connectTimeoutMs?: number;
-  /** Metrics sink (default `getMetricsSink()`; no-op when telemetry unconfigured). */
-  readonly metricsSink?: MetricsSink;
   /**
-   * Join label set threaded from `MeetingSession` (`client_version` /
-   * `meeting_id_hash` / `org_id`). Consumed by ONE grandfathered metric,
-   * `dt_client_mh_connection_total` — see `MediaTransport.#emitMetric`.
-   *
-   * **NOT the media-path label set.** Media metrics are built by allow-list in
-   * `setup/mediaMetrics.ts` from two named strings and carry no meeting
-   * dimension (ADR-0036 §11; `docs/observability/label-taxonomy.md` R3, which
-   * cites THIS FILE by path as the inertia source — an unqualified comment here
-   * is what makes the violation arrive by default).
+   * The R-42 connection series handle (`MediaSessionMetrics`, kind-free
+   * session bag — `setup/mediaMetrics.ts`). Omitted: nothing is recorded. The
+   * join label set (`meeting_id_hash`) never reaches this class.
    */
-  readonly metricLabels?: MetricLabels;
+  readonly connectionMetrics?: MhConnectionMetrics;
+  /**
+   * Called ONCE, when the first dial FINALISES connected (survives the
+   * admission window), with that dial's handshake time — the session's
+   * `dt_client_time_to_first_mh_connected_ms`.
+   */
+  readonly onFirstEstablished?: (handshakeAtMs: number) => void;
   /** Context runner for R-58 trace injection (default identity). */
   readonly runInContext?: RunInContext;
   /**

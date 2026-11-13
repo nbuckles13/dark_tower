@@ -14,6 +14,7 @@ export type {
   KindMediaView,
   PairView,
   ParticipantMediaView,
+  SlotReconnecting,
   SlotView,
 } from './stores/mediaCells.svelte.js';
 

@@ -120,6 +120,15 @@ export type RejectReason =
   | 'decrypt_failed'
   | 'unwrap_failed'
   | 'replay_detected'
+  /**
+   * An exact in-window duplicate of an already-ACCEPTED frame whose first copy
+   * arrived via a DIFFERENT media-handler transport that is current or just
+   * left the set: the make-before-break overlap (story 4 C2). STILL DROPPED —
+   * only the reason differs from `replay_detected`. Not prefixed `replay_` on
+   * purpose: replay alerts match `reason="replay_detected"` exactly and must
+   * exclude this token.
+   */
+  | 'duplicate_cross_transport'
   | 'wrap_key_id_mismatch'
   // --- key layer: receiver state is not ready -----------------------------
   | 'no_kek_for_generation'
@@ -181,6 +190,7 @@ export const ALL_REJECT_REASONS: readonly RejectReason[] = [
   'decrypt_failed',
   'unwrap_failed',
   'replay_detected',
+  'duplicate_cross_transport',
   'wrap_key_id_mismatch',
   'no_kek_for_generation',
   'no_roster_entry',

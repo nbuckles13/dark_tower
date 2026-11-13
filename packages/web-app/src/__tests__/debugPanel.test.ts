@@ -9,7 +9,7 @@
 
 import { expect, test } from 'vitest';
 import { render } from 'vitest-browser-svelte';
-import type { LocalMediaStats, LocalReceiveSlotStats } from '@darktower/sdk-core';
+import type { HandlerSetView, LocalMediaStats, LocalReceiveSlotStats } from '@darktower/sdk-core';
 import DebugPanel from '../views/DebugPanel.svelte';
 import { DEBUG_PANEL_STORAGE_KEY, type ToggleStorage } from '../lib/debugToggle.js';
 import { DEBUG_STATS_SAMPLE_INTERVAL_MS } from '../lib/debugStats.js';
@@ -268,4 +268,43 @@ test('before media starts the overlay says so; drops render by closed token', as
   await expect.element(drops).toMatchTextContent('replay_detected: 2');
   await expect.element(drops).toMatchTextContent('local: 4');
   screen.unmount();
+});
+
+test('R-20 (story 4 C2): the panel shows the set version and each handler ref + url — NEVER a token', async () => {
+  const storage = memoryStorage();
+  storage.data[DEBUG_PANEL_STORAGE_KEY] = '1';
+  const SENTINEL = 'media-dial-SENTINEL-token';
+  // The fixture CARRIES a token-shaped extra field (as a leaked SDK field would):
+  // the explicit projection must keep it off the screen.
+  const set = {
+    version: '7',
+    handlers: [
+      { ref: 3, url: 'https://mh-3.example:4433', mediaDialToken: SENTINEL },
+      { ref: 4, url: 'https://mh-4.example:4433', mediaDialToken: SENTINEL },
+    ],
+  } as unknown as HandlerSetView;
+  const screen = await render(DebugPanel, { storage, handlerSet: () => set });
+  // Positive control: version, refs and urls ARE shown.
+  await expect.element(screen.getByTestId('debug-handler-set-version')).toMatchTextContent('7');
+  await expect
+    .element(screen.getByTestId('debug-handler-3'))
+    .toHaveTextContent('ref 3: https://mh-3.example:4433');
+  await expect.element(screen.getByTestId('debug-handler-4')).toMatchTextContent('mh-4');
+  // ...and the token is nowhere in the rendered panel.
+  expect(screen.container.innerHTML).not.toContain(SENTINEL);
+  screen.unmount();
+});
+
+test('R-20: an EMPTY set reads as connecting media; no set yet reads as none', async () => {
+  const storage = memoryStorage();
+  storage.data[DEBUG_PANEL_STORAGE_KEY] = '1';
+  const screen = await render(DebugPanel, { storage, handlerSet: () => undefined });
+  await expect.element(screen.getByTestId('debug-handlers-none')).toBeInTheDocument();
+  screen.unmount();
+  const empty: HandlerSetView = { version: '1', handlers: [] };
+  const again = await render(DebugPanel, { storage, handlerSet: () => empty });
+  await expect
+    .element(again.getByTestId('debug-handlers-empty'))
+    .toMatchTextContent('connecting media');
+  again.unmount();
 });

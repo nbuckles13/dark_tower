@@ -32,6 +32,7 @@ import { VideoPublisher } from '../media/lifecycle/VideoPublisher.js';
 import type { MediaTransport } from '../media/MediaTransport.js';
 import type { HandlerRef } from '../media/handlerSet.js';
 import type { ReceiveVerificationRecorder } from '../media/pipeline/receiveVerification.js';
+import type { SlotPresentedListener } from '../media/pipeline/ingress.js';
 import type { MeetingIdentity } from '../media/setup/identity.js';
 import type { MediaMetrics } from '../media/setup/mediaMetrics.js';
 import type { RosterIdentityKeys } from '../media/setup/rosterKeys.js';
@@ -124,6 +125,8 @@ export interface SessionMediaDeps {
     readonly firstMediaFrame: (elapsedMs: number) => void;
     readonly mediaFault: (fault: MediaFault) => void;
     readonly videoSlotRenderChanged: (event: VideoSlotRenderChangedEvent) => void;
+    /** Slot-continuity evidence: a slot presented a frame via a handler (story 4 C2). */
+    readonly slotPresented?: SlotPresentedListener;
     readonly cameraHealthChanged: (event: CameraHealthChangedEvent) => void;
   };
   /** The signalling-derived media state the pipelines attach to (E3 replay). */
@@ -191,6 +194,7 @@ export function buildSessionMedia(deps: SessionMediaDeps): SessionMedia {
     decoderFactory: seams.decoderFactory,
     playbackFactory: seams.playbackFactory,
     ...(deps.verification ? { verification: deps.verification } : {}),
+    ...(deps.emit.slotPresented ? { onSlotPresented: deps.emit.slotPresented } : {}),
     clock: deps.clock,
     ...(seams.timers.setInterval ? { setInterval: seams.timers.setInterval } : {}),
     ...(seams.timers.clearInterval ? { clearInterval: seams.timers.clearInterval } : {}),
@@ -242,6 +246,7 @@ export function buildSessionMedia(deps: SessionMediaDeps): SessionMedia {
       metricExportIntervalMs: getMetricExportIntervalMs(),
       fault: deps.emit.mediaFault,
       onRenderChanged: (slotId, state) => deps.emit.videoSlotRenderChanged({ slotId, state }),
+      ...(deps.emit.slotPresented ? { onSlotPresented: deps.emit.slotPresented } : {}),
       ...(deps.verification ? { verification: deps.verification } : {}),
       clock: deps.clock,
       ...(seams.timers.setInterval ? { setInterval: seams.timers.setInterval } : {}),

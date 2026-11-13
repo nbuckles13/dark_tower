@@ -177,6 +177,8 @@ interface Rig {
   readonly transport: MockWebTransport;
   readonly intakes: HandlerSetIntake[];
   readonly joined: JoinedEvent;
+  /** Every `onNonMemberRef` call (story 4 C2's count), in order. */
+  readonly nonMembers: string[];
   deliver(bytes: Uint8Array): void;
 }
 
@@ -191,9 +193,11 @@ const SET: HandlerSetInit = {
 async function joinedRig(joinResponse: Uint8Array): Promise<Rig> {
   const transport = new MockWebTransport();
   const intakes: HandlerSetIntake[] = [];
+  const nonMembers: string[] = [];
   const client = new SignalingClient({
     connect: () => transport,
     handlerSetSink: (intake) => intakes.push(intake),
+    onNonMemberRef: (source) => nonMembers.push(source),
   });
   const joining = client.join({
     webtransportEndpoint: 'https://mc',
@@ -212,6 +216,7 @@ async function joinedRig(joinResponse: Uint8Array): Promise<Rig> {
     transport,
     intakes,
     joined,
+    nonMembers,
     deliver: (bytes) => transport.simulateServerMessage(0, bytes),
   };
 }
@@ -365,6 +370,45 @@ describe('membership — a non-member ref is ignored and surfaced ONCE, never di
     );
     await waitFor(() => seen.length === 2);
     expect(seen[1]!.assignments[0]!.handlerRef).toBe(5);
+    rig.client.close();
+  });
+});
+
+describe('story 4 C2 — the non-member COUNT (one per occurrence in a FRESH message)', () => {
+  it('send directive: a member counts 0, each non-member (0 included) counts 1, every time', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const rig = await joinedRig(framedJoinResponse({ handlerSet: SET }));
+    const seen: SendDirectiveEvent[] = [];
+    rig.client.on('sendDirective', (e) => seen.push(e));
+    rig.deliver(framedSendDirective({ targets: [1, 2] }));
+    await waitFor(() => seen.length === 1);
+    expect(rig.nonMembers).toEqual([]); // members only: 0
+    rig.deliver(framedSendDirective({ targets: [1, 9, 0] }));
+    rig.deliver(framedSendDirective({ targets: [9] }));
+    await waitFor(() => seen.length === 3);
+    // Repeats COUNT AGAIN (the WARN stays once; the count does not).
+    expect(rig.nonMembers).toEqual(['send_directive', 'send_directive', 'send_directive']);
+    rig.client.close();
+  });
+
+  it('stream assignment: 0 on a no-edge state and a stale re-check count 0; a FRESH non-member counts 1', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const rig = await joinedRig(framedJoinResponse({ handlerSet: SET }));
+    const seen: StreamAssignmentsEvent[] = [];
+    rig.client.on('streamAssignments', (e) => seen.push(e));
+    rig.deliver(
+      framedStreamAssignments({ slotId: 0, handlerRef: 0, slotState: SlotState.UNAVAILABLE }),
+    );
+    rig.deliver(framedStreamAssignments({ slotId: 0, senderId: 300, handlerRef: 2 }));
+    await waitFor(() => seen.length === 2);
+    // The set removes ref 2: the re-check resolves the held assignment STALE.
+    rig.deliver(framedMediaHandlerSet({ version: 5n, handlers: [SET.handlers[0]!] }));
+    await waitFor(() => seen.length === 3);
+    expect(rig.nonMembers).toEqual([]);
+    // Positive arm, same fixture: the same ref in a FRESH message counts 1.
+    rig.deliver(framedStreamAssignments({ slotId: 0, senderId: 300, handlerRef: 2 }));
+    await waitFor(() => seen.length === 4);
+    expect(rig.nonMembers).toEqual(['stream_assignment']);
     rig.client.close();
   });
 });

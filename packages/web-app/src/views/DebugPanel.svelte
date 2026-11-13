@@ -22,10 +22,11 @@
   // absent before join (the self-check then uses its own preview capture, and
   // there is no overlay). Every other prop is a test seam.
   import { onDestroy } from 'svelte';
-  import type { LocalCaptureTracks, LocalMediaStats } from '@darktower/sdk-core';
+  import type { HandlerSetView, LocalCaptureTracks, LocalMediaStats } from '@darktower/sdk-core';
   import {
     DEBUG_STATS_SAMPLE_INTERVAL_MS,
     formatRate,
+    handlerSetRows,
     statsView,
     type StatsSample,
     type StatsView,
@@ -50,6 +51,7 @@
     clearInterval: clearI = (h: ReturnType<typeof setInterval>) => clearInterval(h),
     storage = undefined,
     selfCheckDeps = {},
+    handlerSet = undefined,
   }: {
     /** The session's local statistics snapshot (`localStatsOf(session)`). In a meeting only. */
     stats?: (() => LocalMediaStats | undefined) | undefined;
@@ -61,7 +63,15 @@
     clearInterval?: (handle: ReturnType<typeof setInterval>) => void;
     storage?: ToggleStorage | undefined;
     selfCheckDeps?: Omit<SelfCheckDeps, 'tracks'>;
+    /**
+     * R-20 (story 4 C2): the current handler set — version, refs and urls,
+     * never a token (`store.media.handlerSet`). In a meeting only.
+     */
+    handlerSet?: (() => HandlerSetView | undefined) | undefined;
   } = $props();
+
+  /** The R-20 rows, by explicit projection (`debugStats.ts:handlerSetRows`). */
+  const handlerRows = $derived(handlerSetRows(handlerSet?.()));
 
   // svelte-ignore state_referenced_locally
   let open = $state(readDebugPanelOpen(storage));
@@ -217,6 +227,24 @@
           <p data-testid="self-check-meter-failed">microphone meter unavailable</p>
         {:else}
           <p data-testid="self-check-no-microphone">no local microphone track</p>
+        {/if}
+      {/if}
+
+      {#if handlerSet !== undefined}
+        <h3>Media handlers</h3>
+        {#if handlerRows === undefined}
+          <p data-testid="debug-handlers-none">no handler set yet</p>
+        {:else}
+          <p data-testid="debug-handler-set-version">set version {handlerRows.version}</p>
+          {#if handlerRows.handlers.length === 0}
+            <p data-testid="debug-handlers-empty">no media handler yet (connecting media)</p>
+          {:else}
+            <ul data-testid="debug-handlers">
+              {#each handlerRows.handlers as h (h.ref)}
+                <li data-testid={`debug-handler-${h.ref}`}>ref {h.ref}: {h.url}</li>
+              {/each}
+            </ul>
+          {/if}
         {/if}
       {/if}
 

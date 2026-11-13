@@ -11,7 +11,7 @@ import { beforeAll, describe, expect, it } from 'vitest';
 import { FakeVideoDecoders, FakeVideoFrameRegistry } from '@darktower/test-utils';
 
 import { DEFAULT_CLIENT_CONFIG } from '../../../config/clientConfig.js';
-import { ReplayWindow, TransmitKeyCache } from '../../frame/receivePath.js';
+import { ReplayWindow, TransmitKeyCache, type ReplayArrival } from '../../frame/receivePath.js';
 import { decodeFrame } from '../../frame/frameCodec.js';
 import { FrameRejectedError } from '../../frame/rejectReason.js';
 import { AES_256_KEY_BYTES } from '../../frame/sframe.js';
@@ -75,13 +75,18 @@ async function outcomeOf(
   bytes: Uint8Array,
   gate: ReceiveGate,
   ctx: ReceiveContext,
+  arrival?: ReplayArrival,
 ): Promise<ReceivePolicyOutcome> {
   const decoded = decodeFrame(bytes);
   const { parseSframe } = await import('../../frame/sframe.js');
   const { unpackKeyId } = await import('../../frame/keyId.js');
   const senderId = Number(unpackKeyId(parseSframe(decoded.payload).keyId).senderId);
   try {
-    await receiveByKind({ decoded, senderId }, gate, ctx);
+    await receiveByKind(
+      arrival ? { decoded, senderId, arrival } : { decoded, senderId },
+      gate,
+      ctx,
+    );
     return 'accepted';
   } catch (err) {
     if (err instanceof FrameRejectedError) return err.rejectReason as ReceivePolicyOutcome;
@@ -156,6 +161,26 @@ const frameOf = (
     ...extra,
   });
 
+/** An arrival via transport `id`, with `recent` deciding the membership bound. */
+const via = (id: number, recent: (t: number) => boolean = () => true): ReplayArrival => ({
+  transport: id,
+  isRecent: recent,
+});
+
+/**
+ * Feed `first` via transport 1 (must be accepted), then `second` via `arrival`:
+ * the second's outcome. The cross-transport classification arms (story 4 C2).
+ */
+async function duplicateOutcome(
+  first: Uint8Array,
+  second: Uint8Array,
+  arrival: ReplayArrival,
+): Promise<ReceivePolicyOutcome> {
+  const ctx = await context();
+  expect(await outcomeOf(first, VIDEO_GATE, ctx, via(1))).toBe('accepted');
+  return outcomeOf(second, VIDEO_GATE, ctx, arrival);
+}
+
 const ROWS: Row[] = [
   // --- AUDIO (unchanged from story 2) -------------------------------------
   {
@@ -220,6 +245,60 @@ const ROWS: Row[] = [
       const bytes = await frameOf(alice, A);
       expect(await outcomeOf(bytes, VIDEO_GATE, ctx)).toBe('accepted');
       return outcomeOf(bytes, VIDEO_GATE, ctx);
+    },
+  },
+  // --- story 4 C2: the replay verdict split by ARRIVAL (decision unchanged) ---
+  {
+    name: 'a duplicate via the SAME transport stays replay_detected',
+    expected: 'replay_detected',
+    run: async () => {
+      const bytes = await frameOf(alice, A);
+      return duplicateOutcome(bytes, bytes, via(1));
+    },
+  },
+  {
+    name: 'an in-window duplicate via ANOTHER current transport is duplicate_cross_transport',
+    expected: 'duplicate_cross_transport',
+    run: async () => {
+      const bytes = await frameOf(alice, A);
+      return duplicateOutcome(bytes, bytes, via(2));
+    },
+  },
+  {
+    name: 'a duplicate whose first copy came via a LONG-REMOVED transport stays replay_detected',
+    expected: 'replay_detected',
+    run: async () => {
+      const bytes = await frameOf(alice, A);
+      return duplicateOutcome(
+        bytes,
+        bytes,
+        via(2, (t) => t !== 1),
+      );
+    },
+  },
+  {
+    name: 'a BELOW-WINDOW sequence via another transport stays replay_detected',
+    expected: 'replay_detected',
+    run: async () => {
+      const ctx = await context();
+      const head = await frameOf(alice, A, { streamSequence: 200 });
+      expect(await outcomeOf(head, VIDEO_GATE, ctx, via(1))).toBe('accepted');
+      return outcomeOf(await frameOf(alice, A, { streamSequence: 10 }), VIDEO_GATE, ctx, via(2));
+    },
+  },
+  {
+    name: 'a BELOW-HIGH-WATER generation via another transport stays replay_detected',
+    expected: 'replay_detected',
+    run: async () => {
+      const ctx = await context();
+      const newer = await frameOf(alice, A, { generation: 3, streamSequence: 5 });
+      expect(await outcomeOf(newer, VIDEO_GATE, ctx, via(1))).toBe('accepted');
+      return outcomeOf(
+        await frameOf(alice, A, { generation: 2, streamSequence: 5 }),
+        VIDEO_GATE,
+        ctx,
+        via(2),
+      );
     },
   },
   {

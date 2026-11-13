@@ -58,11 +58,17 @@ const EXPORTED: &[&str] = &[
     "dt_client_media_kek_retention_violations_total",
     "dt_client_media_kek_install_refusals_total",
     "dt_client_media_roster_key_rebinds_total",
+    // Story 4 C2: kind-free session series through the session wrappers.
+    "dt_client_mh_connection_total",
+    "dt_client_mh_dial_duration_ms",
+    "dt_client_mh_disconnects_total",
 ];
 const NOT_EXPORTED: &[&str] = &[
     "dt_client_join_attempts_total",
     "dt_client_time_to_signaling_ready_ms",
-    "dt_client_mh_connection_total",
+    // Synthetic stand-in for the pre-story-4 `MediaTransport#emitMetric` shape
+    // (an unexported name behind an unresolvable `...this.#metricLabels`).
+    "dt_client_media_transport_probe_total",
 ];
 
 /// `(token, layer, drops_frame)` — the real vocabulary's shape.
@@ -81,6 +87,7 @@ const REJECT_TOKENS: &[(&str, &str, bool)] = &[
     ("decrypt_failed", "crypto", true),
     ("unwrap_failed", "crypto", true),
     ("replay_detected", "crypto", true),
+    ("duplicate_cross_transport", "crypto", true),
     ("wrap_key_id_mismatch", "crypto", false),
     ("no_kek_for_generation", "key", true),
     ("no_roster_entry", "key", true),
@@ -149,7 +156,7 @@ impl Tree {
         cfg.push_str(
             "  transform/client_metric_labels:\n    metric_statements:\n      - context: datapoint\n        \
              statements:\n          - keep_keys(attributes, [\"client_version\", \"org_id\", \
-             \"key_custody\", \"media_kind\", \"content_kind\", \"reason\", \"outcome\", \"action\", \"source\", \"mode\"])\n          \
+             \"key_custody\", \"media_kind\", \"content_kind\", \"reason\", \"outcome\", \"action\", \"source\", \"phase\", \"cause\", \"mode\"])\n          \
              - set(attributes[\"media_kind\"], \"invalid\") where attributes[\"media_kind\"] != nil and (not IsString(attributes[\"media_kind\"]) or not IsMatch(attributes[\"media_kind\"], \"^(audio|video)$\"))\n          \
              - set(attributes[\"content_kind\"], \"invalid\") where attributes[\"content_kind\"] != nil and (not IsString(attributes[\"content_kind\"]) or not IsMatch(attributes[\"content_kind\"], \"^(main|screen)$\"))\n  \
              deltatocumulative:\n    max_stale: 20m\nexporters:\n  prometheus:\n    \
@@ -171,12 +178,14 @@ pub const ALLOWLIST: [&str; 6] = [
     "error.code",
 ];
 
-pub const MEDIA_DATAPOINT_EXTRA: [&str; 8] = [
+pub const MEDIA_DATAPOINT_EXTRA: [&str; 10] = [
     "reason",
     "outcome",
     "action",
     "source",
     "mode",
+    "phase",
+    "cause",
     KEY_CUSTODY_LABEL,
     MEDIA_KIND_LABEL,
     CONTENT_KIND_LABEL,
@@ -254,7 +263,8 @@ export class MediaMetrics {
   }
 }
 
-// The kind-free session bag behind the two declared wrappers (story 3 OBS-A).
+// The kind-free session bag behind the three declared wrappers (story 3 OBS-A;
+// `#sessionHistogram` story 4 C2).
 export class MediaSessionMetrics {
   readonly #sink: MetricsSink | undefined;
   readonly #sessionLabels: MetricLabels;
@@ -268,8 +278,34 @@ export class MediaSessionMetrics {
     this.#sink = sink;
   }
 
-  #sessionCounter(name: string, labels: MetricLabels = {}): void {
-    this.#sink?.counter(name, { ...this.#sessionLabels, ...labels });
+  mhConnection(phase: string, outcome: string, count: 0 | 1 = 1): void {
+    this.#sessionCounter('dt_client_mh_connection_total', { phase, outcome }, count);
+  }
+
+  mhDialDurationMs(phase: string, outcome: string, ms: number): void {
+    this.#sessionHistogram(
+      'dt_client_mh_dial_duration_ms',
+      { phase, outcome },
+      ms,
+      MH_DIAL_DURATION_BUCKETS_MS,
+    );
+  }
+
+  mhDisconnect(cause: string, count: 0 | 1 = 1): void {
+    this.#sessionCounter('dt_client_mh_disconnects_total', { cause }, count);
+  }
+
+  #sessionCounter(name: string, labels: MetricLabels = {}, value?: number): void {
+    this.#sink?.counter(name, { ...this.#sessionLabels, ...labels }, value);
+  }
+
+  #sessionHistogram(
+    name: string,
+    labels: MetricLabels,
+    value: number,
+    boundaries: readonly number[],
+  ): void {
+    this.#sink?.histogram(name, { ...this.#sessionLabels, ...labels }, value, boundaries);
   }
 
   #sessionGauge(name: string, labels: MetricLabels, value: number): void {
@@ -323,7 +359,7 @@ export class MediaSessionMetrics {
             MEDIA_TRANSPORT,
             r#"export class MediaTransport {
   #emitMetric(status: 'success' | 'failure'): void {
-    this.#metricsSink?.counter('dt_client_mh_connection_total', {
+    this.#metricsSink?.counter('dt_client_media_transport_probe_total', {
       ...this.#metricLabels,
       status,
     });
@@ -791,8 +827,8 @@ fn kind_key_dropped_from_gc_extra_is_not_kept() {
     let f = Tree::valid()
         .edit(
             GC_FILTER,
-            "MEDIA_DATAPOINT_EXTRA: [&str; 8]",
-            "MEDIA_DATAPOINT_EXTRA: [&str; 7]",
+            "MEDIA_DATAPOINT_EXTRA: [&str; 10]",
+            "MEDIA_DATAPOINT_EXTRA: [&str; 9]",
         )
         .edit(GC_FILTER, "    CONTENT_KIND_LABEL,\n];", "];")
         .findings();
@@ -808,8 +844,8 @@ fn rule6_parsed_shorter_than_declared_is_empty_input() {
     let f = Tree::valid()
         .edit(
             GC_FILTER,
-            "MEDIA_DATAPOINT_EXTRA: [&str; 8]",
-            "MEDIA_DATAPOINT_EXTRA: [&str; 9]",
+            "MEDIA_DATAPOINT_EXTRA: [&str; 10]",
+            "MEDIA_DATAPOINT_EXTRA: [&str; 11]",
         )
         .findings();
     assert_empty_input_for(&f, GC_FILTER);
@@ -881,7 +917,11 @@ fn rule3_base_allowlist_trace_key_need_not_be_kept() {
 #[test]
 fn rule3_extra_positive_control_missing_is_empty_input() {
     let f = Tree::valid()
-        .edit(GC_FILTER, "[&str; 8] = [\n    \"reason\",", "[&str; 7] = [")
+        .edit(
+            GC_FILTER,
+            "[&str; 10] = [\n    \"reason\",",
+            "[&str; 9] = [",
+        )
         .findings();
     assert_empty_input_for(&f, GC_FILTER);
 }
@@ -945,8 +985,8 @@ fn identity_forwarded_extra_key_fires() {
     let f = Tree::valid()
         .edit(
             GC_FILTER,
-            "[&str; 8] = [\n    \"reason\",",
-            "[&str; 9] = [\n    \"reason\",\n    \"stream_id\",",
+            "[&str; 10] = [\n    \"reason\",",
+            "[&str; 11] = [\n    \"reason\",\n    \"stream_id\",",
         )
         .findings();
     assert_fires_with(&f, IDENTITY_KEY_FORWARDED_RULE_ID, "stream_id");
@@ -1111,12 +1151,13 @@ fn rule1_sink_implementation_files_are_exempt() {
 #[test]
 fn rule1_unexported_unresolvable_spread_is_out_of_scope_until_exported() {
     // Baseline: MediaTransport's `...this.#metricLabels` is unresolvable there,
-    // and dt_client_mh_connection_total is `Exported: no` — clean. Export it:
+    // and dt_client_media_transport_probe_total is `Exported: no` — clean.
+    // Export it:
     let f = Tree::valid()
         .edit(
             CATALOG,
-            "### `dt_client_mh_connection_total`\n\n- **Exported**: no",
-            "### `dt_client_mh_connection_total`\n\n- **Exported**: yes",
+            "### `dt_client_media_transport_probe_total`\n\n- **Exported**: no",
+            "### `dt_client_media_transport_probe_total`\n\n- **Exported**: yes",
         )
         .findings();
     assert_fires_with(&f, UNRESOLVED_LABEL_BAG_RULE_ID, "this.#metricLabels");
@@ -1258,6 +1299,86 @@ fn rule1_injected_bag_assignments_gone_is_empty_input() {
         .replace("this.#metricLabels = {", "this.#metricLabels = build({");
     let f = Tree::valid().set(MEETING_SESSION, &s).findings();
     assert_empty_input_for(&f, MEETING_SESSION);
+}
+
+// -----------------------------------------------------------------------------
+// Story 4 C2: `#sessionHistogram` (third session wrapper) and the `phase` /
+// `cause` keys. The baseline's exported `dt_client_mh_*` emissions resolving
+// clean through `this.#sessionLabels` is the positive arm
+// (`the_valid_tree_is_clean`); these prove the resolution is real, not a skip.
+// -----------------------------------------------------------------------------
+
+#[test]
+fn session_histogram_bag_is_resolved_so_an_unforwarded_key_fires() {
+    let f = Tree::valid()
+        .edit(
+            MEDIA_METRICS,
+            "      { phase, outcome },\n      ms,",
+            "      { phase, outcome, handler_ref: ref },\n      ms,",
+        )
+        .findings();
+    assert_fires_with(&f, LABEL_KEY_NOT_FORWARDED_RULE_ID, "\"handler_ref\"");
+}
+
+#[test]
+fn session_histogram_injected_bag_is_checked() {
+    // A key added to `this.#sessionLabels` reaches every wrapper's emissions,
+    // the histogram one included.
+    let f = Tree::valid()
+        .edit(
+            MEDIA_METRICS,
+            "      key_custody: KEY_CUSTODY,\n    };\n    this.#sink = sink;\n  }\n\n  mhConnection(",
+            "      key_custody: KEY_CUSTODY,\n      meeting_id_hash: h,\n    };\n    this.#sink = sink;\n  }\n\n  mhConnection(",
+        )
+        .findings();
+    assert_fires_with(&f, LABEL_KEY_NOT_FORWARDED_RULE_ID, "\"meeting_id_hash\"");
+    assert_fires_with(
+        &f,
+        LABEL_KEY_NOT_FORWARDED_RULE_ID,
+        "dt_client_mh_dial_duration_ms",
+    );
+}
+
+#[test]
+fn session_histogram_wrapper_gone_is_empty_input() {
+    let f = Tree::valid()
+        .edit(MEDIA_METRICS, "  #sessionHistogram(\n", "  #sessionHist(\n")
+        .findings();
+    assert_empty_input_for(&f, MEDIA_METRICS);
+}
+
+#[test]
+fn exported_name_through_an_undeclared_session_wrapper_is_unresolved() {
+    let f = Tree::valid()
+        .edit(
+            MEDIA_METRICS,
+            "    this.#sessionHistogram(\n      'dt_client_mh_dial_duration_ms',",
+            "    this.#sessionSummary(\n      'dt_client_mh_dial_duration_ms',",
+        )
+        .findings();
+    assert_fires_with(&f, UNRESOLVED_LABEL_BAG_RULE_ID, "#sessionSummary");
+}
+
+#[test]
+fn phase_not_forwarded_by_gc_fires() {
+    let f = Tree::valid()
+        .edit(
+            GC_FILTER,
+            "MEDIA_DATAPOINT_EXTRA: [&str; 10]",
+            "MEDIA_DATAPOINT_EXTRA: [&str; 9]",
+        )
+        .edit(GC_FILTER, "    \"phase\",\n", "")
+        .findings();
+    assert_fires_with(&f, LABEL_KEY_NOT_FORWARDED_RULE_ID, "\"phase\"");
+    assert_fires_with(&f, KEEP_KEY_NOT_FORWARDED_RULE_ID, "phase");
+}
+
+#[test]
+fn cause_forwarded_but_not_kept_fires() {
+    let f = Tree::valid()
+        .edit(COLLECTOR, ", \"cause\", \"mode\"]", ", \"mode\"]")
+        .findings();
+    assert_fires_with(&f, FORWARDED_KEY_NOT_KEPT_RULE_ID, "cause");
 }
 
 // -----------------------------------------------------------------------------

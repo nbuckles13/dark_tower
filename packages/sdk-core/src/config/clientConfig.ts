@@ -577,7 +577,69 @@ export interface HandlerSetConfig {
    * DISCONNECTED and redialling.
    */
   readonly releasedGraceMs: number;
+  /**
+   * ADMISSION WINDOW (story 4 C2, telemetry only). MH has no admission ack: a
+   * refusal (WRONG_HANDLER, DECLINED, ...) arrives as a close shortly after the
+   * handshake. A handshake is therefore PROVISIONAL for this long: a close
+   * inside it is the dial's outcome on `dt_client_mh_connection_total`; a dial
+   * that survives it is `connected` and its session ESTABLISHED (later closes
+   * count on `dt_client_mh_disconnects_total`). Changes no connection
+   * behaviour: the `connected` event and MC report keep handshake timing.
+   */
+  readonly admissionWindowMs: number;
+  /**
+   * RECONNECTING OVERLAY CAP (ADR-0039 §4 "Slot states"). A slot whose handler
+   * this client observed lost, or that left the set while the slot still named
+   * it, renders "reconnecting" until a StreamAssignments gives it a source on a
+   * CONNECTED handler, or this long elapses — then it renders what the latest
+   * assignment says. Must not exceed {@link resumeAbandonMs}.
+   *
+   * Default arithmetic (the ordinary crash timeline): client loss detection ≈
+   * MH QUIC idle ≈ MC's heartbeat timeout N (`MC_MH_HEARTBEAT_TIMEOUT_MS`,
+   * 6 s) + GC `AcquireMediaHandler` (≈1–3 s) + the set push + the dial to the
+   * replacement (bounded by the 10 s connect deadline; typically < 1 s) + one
+   * keyframe (≤ the keyframe interval) ≈ 10–20 s, worst ordinary ≈ 25 s. 30 s
+   * covers it, so the overlay rarely expires during an ordinary replacement.
+   */
+  readonly reconnectingCapMs: number;
+  /**
+   * PLANNED-TRANSFER OVERLAY HOLD (story 4 C2, lead ruling). MC sends the set
+   * WITHOUT a removed handler BEFORE the moved assignments
+   * (`crates/mc-service/src/actors/meeting/health.rs` `remove_handler_for`:
+   * `broadcast_handler_set` then `flush_views`; ADR-0039 §4). A DIRECTED
+   * removal of a ref that was still CONNECTED, while another member is
+   * connected, therefore holds its slots' reconnecting overlay this long: a
+   * StreamAssignments moving the slot to a connected handler within it shows
+   * nothing; expiry without one shows reconnecting. An observed loss never
+   * waits. Delays only the overlay — the resume episode starts at the removal.
+   * Must be less than {@link reconnectingCapMs}.
+   */
+  readonly removalGraceMs: number;
+  /**
+   * `dt_client_media_resume_ms` ABANDONMENT CAP: a per-slot media-dark episode
+   * still open this long is observed `abandoned`. 2× the overlay default, so
+   * `abandoned` means "replacement failed", not "replacement slow".
+   */
+  readonly resumeAbandonMs: number;
+  /**
+   * `dt_client_mh_reconnect_duration_ms` ABANDONMENT CAP: a lost in-set
+   * handler neither redialled nor removed this long after its loss is observed
+   * `abandoned`. Must be at least {@link MH_KEEPALIVE_FLOOR_MS} + `redialCapMs`
+   * (one full redial window), or a healthy backoff would read as abandonment.
+   */
+  readonly reconnectAbandonMs: number;
 }
+
+/**
+ * The ordinary-replacement time AFTER detection that the cap defaults are sized
+ * on (story 4 C2): GC `AcquireMediaHandler` + the set push + the dial to the
+ * replacement + one keyframe. Detection itself is MC's heartbeat timeout N
+ * (`MC_MH_HEARTBEAT_TIMEOUT_MS`, `infra/services/mc-service/config.env`), which
+ * the browser cannot read — so `packages/web-app/tests/replacementCapsSync.test.ts`
+ * pins `N + this <= reconnectingCapMs` (default) and `resumeAbandonMs >= 2 ×
+ * reconnectingCapMs`, and fails when an operator raises N past the caps.
+ */
+export const REPLACEMENT_AFTER_DETECTION_BUDGET_MS = 20_000;
 
 /** Inclusive ranges of {@link HandlerSetConfig}; the ONE home of the bounds. */
 export const HANDLER_SET_CONFIG_RANGES: Readonly<
@@ -587,6 +649,13 @@ export const HANDLER_SET_CONFIG_RANGES: Readonly<
   redialCapMs: [1_000, 300_000],
   emptySetNoticeMs: [1_000, 300_000],
   releasedGraceMs: [0, 30_000],
+  admissionWindowMs: [250, 10_000],
+  reconnectingCapMs: [5_000, 120_000],
+  removalGraceMs: [250, 10_000],
+  resumeAbandonMs: [10_000, 300_000],
+  // Max 600 s so the relation `reconnectAbandonMs >= MH_KEEPALIVE_FLOOR_MS +
+  // redialCapMs` stays satisfiable at every `redialCapMs` in its own range.
+  reconnectAbandonMs: [10_000, 600_000],
 };
 
 /**
@@ -925,6 +994,11 @@ export const DEFAULT_CLIENT_CONFIG: ClientConfig = {
       redialCapMs: 30_000,
       emptySetNoticeMs: 15_000,
       releasedGraceMs: 2_000,
+      admissionWindowMs: 2_000,
+      reconnectingCapMs: 30_000,
+      removalGraceMs: 2_000,
+      resumeAbandonMs: 60_000,
+      reconnectAbandonMs: 60_000,
     },
   },
   telemetry: {
@@ -958,8 +1032,12 @@ function positiveInteger(value: number, key: string): void {
 
 /**
  * Validate {@link HandlerSetConfig}: each key an integer inside its inclusive
- * {@link HANDLER_SET_CONFIG_RANGES} entry, and `redialBaseMs <= redialCapMs`.
- * THROWS a {@link ClientConfigError} naming the key; never clamps.
+ * {@link HANDLER_SET_CONFIG_RANGES} entry, and four relations:
+ * `removalGraceMs < reconnectingCapMs` (a hold never outlasts the overlay it
+ * holds); `redialBaseMs <= redialCapMs`; `reconnectingCapMs <= resumeAbandonMs` (an
+ * overlay never outlives the episode it shows); `reconnectAbandonMs >=
+ * MH_KEEPALIVE_FLOOR_MS + redialCapMs` (a healthy backoff never reads as
+ * abandonment). THROWS a {@link ClientConfigError} naming the key; never clamps.
  */
 export function validateHandlerSetConfig(handlers: HandlerSetConfig): void {
   for (const key of Object.keys(HANDLER_SET_CONFIG_RANGES) as (keyof HandlerSetConfig)[]) {
@@ -980,6 +1058,28 @@ export function validateHandlerSetConfig(handlers: HandlerSetConfig): void {
         `media.handlers.redialCapMs (${handlers.redialCapMs})`,
     );
   }
+  if (handlers.reconnectingCapMs > handlers.resumeAbandonMs) {
+    throw new ClientConfigError(
+      'media.handlers.reconnectingCapMs',
+      `media.handlers.reconnectingCapMs (${handlers.reconnectingCapMs}) must not exceed ` +
+        `media.handlers.resumeAbandonMs (${handlers.resumeAbandonMs})`,
+    );
+  }
+  if (handlers.removalGraceMs >= handlers.reconnectingCapMs) {
+    throw new ClientConfigError(
+      'media.handlers.removalGraceMs',
+      `media.handlers.removalGraceMs (${handlers.removalGraceMs}) must be less than ` +
+        `media.handlers.reconnectingCapMs (${handlers.reconnectingCapMs})`,
+    );
+  }
+  const redialWindowMs = MH_KEEPALIVE_FLOOR_MS + handlers.redialCapMs;
+  if (handlers.reconnectAbandonMs < redialWindowMs) {
+    throw new ClientConfigError(
+      'media.handlers.reconnectAbandonMs',
+      `media.handlers.reconnectAbandonMs (${handlers.reconnectAbandonMs}) must be at least ` +
+        `the first-redial floor plus media.handlers.redialCapMs (${redialWindowMs})`,
+    );
+  }
 }
 
 /**
@@ -996,6 +1096,11 @@ export function handlerSetConfigLogLine(media: MediaConfig, source: ConfigValueS
     `redialCapMs=${h.redialCapMs}; ` +
     `emptySetNoticeMs=${h.emptySetNoticeMs}; ` +
     `releasedGraceMs=${h.releasedGraceMs}; ` +
+    `admissionWindowMs=${h.admissionWindowMs}; ` +
+    `reconnectingCapMs=${h.reconnectingCapMs}; ` +
+    `removalGraceMs=${h.removalGraceMs}; ` +
+    `resumeAbandonMs=${h.resumeAbandonMs}; ` +
+    `reconnectAbandonMs=${h.reconnectAbandonMs}; ` +
     `firstRedialFloorMs=${MH_KEEPALIVE_FLOOR_MS} (compiled)`
   );
 }

@@ -54,6 +54,7 @@ import {
 import { handlerRef, type HandlerRef } from '../../handlerSet.js';
 
 const URL = handlerRef(1);
+const URL2 = handlerRef(2);
 const SELF = 5;
 const SENDERS = [601, 602, 603, 604];
 const VIDEO_SLOTS = [3, 4];
@@ -85,6 +86,9 @@ async function harness(opts: Options = {}) {
   const { metrics, sink } = videoMetrics();
   const clock = manualClock();
   const mock = new MockWebTransport();
+  /** A SECOND handler's transport (story 4 C2 swap tests): ref `URL2`. */
+  const mock2 = new MockWebTransport();
+  const presented: [number, HandlerRef, number][] = [];
   const decoders = new FakeVideoDecoders({ registry });
   const roster = new RosterIdentityKeys(16);
   for (let i = 0; i < SENDERS.length; i += 1) {
@@ -110,7 +114,13 @@ async function harness(opts: Options = {}) {
     selfSenderId: SELF,
     videoMuteState: (s) => (unmapped.has(s) ? 'unmapped' : muted.has(s) ? 'muted' : 'unmuted'),
     declaredSlotIds: opts.slots ?? VIDEO_SLOTS,
-    incomingStreamsFor: (url) => (url === URL ? mock.incomingUnidirectionalStreams : undefined),
+    incomingStreamsFor: (url) =>
+      url === URL
+        ? mock.incomingUnidirectionalStreams
+        : url === URL2
+          ? mock2.incomingUnidirectionalStreams
+          : undefined,
+    onSlotPresented: (slotId, ref, sender) => presented.push([slotId, ref, sender]),
     sendRecoveryRequest: async (url, request) => {
       if (opts.sendFails) throw new Error('control stream gone');
       recovery.push({ url, request });
@@ -134,18 +144,19 @@ async function harness(opts: Options = {}) {
   const assign = (
     states: Record<number, SlotStateToken>,
     participants: Record<number, number> = {},
+    via: HandlerRef = URL,
   ) =>
     receiver.setAssignments(
       Object.entries(states).map(([slot, slotState]) => ({
         slotId: Number(slot),
         slotState,
         senderId: participants[Number(slot)],
-        handlerRef: URL,
+        handlerRef: via,
       })),
     );
   /** Deliver frames on ONE new group stream (FIN), and wait until processed. */
-  const deliver = async (frames: readonly Uint8Array[]): Promise<void> => {
-    const handle = mock.simulateIncomingUniStream();
+  const deliver = async (frames: readonly Uint8Array[], via: HandlerRef = URL): Promise<void> => {
+    const handle = (via === URL2 ? mock2 : mock).simulateIncomingUniStream();
     for (const f of frames) handle.enqueue(f);
     handle.close();
     await flush();
@@ -160,6 +171,7 @@ async function harness(opts: Options = {}) {
   });
   return {
     receiver,
+    presented,
     roster,
     sink,
     clock,
@@ -858,6 +870,35 @@ describe('VideoReceiver — R-35 local statistics (sampled; never exported)', ()
     h.assign({ 3: 'active' });
     h.clock.advance(1_250);
     expect(h.receiver.localStats().find((r) => r.slotId === 3)?.unfulfilledMs).toBe(1_250);
+    await h.receiver.stop();
+  });
+});
+
+describe('story 4 C2 / R-16 — a slot survives a handler swap', () => {
+  it("decoder, jitter and REPLAY window are the slot's: an A-seen frame via B is duplicate_cross_transport; presentation carries the arriving ref", async () => {
+    const h = await harness();
+    h.receiver.start();
+    h.assign({ 3: 'active' });
+    const first = await key(A, 3, 1, 1);
+    await h.deliver([first]);
+    h.drain();
+    expect(h.presented).toEqual([[3, URL, A]]);
+    const built = h.decoders.constructions;
+
+    // The swap: A's handler leaves the set; the slot's edge moves to URL2.
+    h.receiver.forgetHandler(URL);
+    h.assign({ 3: 'active' }, {}, URL2);
+    // The same frame via the new handler: the slot's replay window survived,
+    // and forget kept URL "recent" — the overlap token, still dropped.
+    await h.deliver([first], URL2);
+    expect(dropsByReason(h.sink).get('duplicate_cross_transport')).toBe(1);
+    expect(dropsByReason(h.sink).get('replay_detected')).toBeUndefined();
+    // The next frame via URL2 decodes on the SAME decoder; presentation names URL2.
+    await h.deliver([await delta(A, 3, 1, 2)], URL2);
+    h.drain();
+    expect(h.presented.at(-1)).toEqual([3, URL2, A]);
+    expect(h.decoders.constructions).toBe(built); // none built
+    expect(h.decoders.decoders.every((d) => !d.closed)).toBe(true); // none closed
     await h.receiver.stop();
   });
 });

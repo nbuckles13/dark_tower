@@ -4,7 +4,7 @@
 // service.namespace / deployment.environment). Run from packages/sdk-core so
 // module resolution picks up sdk-core's own node_modules.
 //
-// usage: node sdk-writers.mjs <otlp-base> <prom-base> <mode: two|idle|cumulative>
+// usage: node sdk-writers.mjs <otlp-base> <prom-base> <mode: two|idle|restart|cumulative|stale_tab>
 import { MeterProvider, PeriodicExportingMetricReader } from '@opentelemetry/sdk-metrics';
 import { OTLPMetricExporter } from '@opentelemetry/exporter-metrics-otlp-proto';
 import { AggregationTemporality as AggregationTemporalityPreference } from '@opentelemetry/sdk-metrics';
@@ -31,6 +31,7 @@ function writer(temporality) {
     mp,
     ctr: meter.createCounter('dt_client_media_frames_received_total'),
     hist: meter.createHistogram('dt_client_time_to_first_media_frame_ms'),
+    mhc: meter.createCounter('dt_client_mh_connection_total'),
     flush: () => mp.forceFlush(),
   };
 }
@@ -147,6 +148,35 @@ if (MODE === 'two') {
   check('cumulative writer excluded; delta total intact', (await read(org)).c, 15);
   await D.mp.shutdown();
   await C.mp.shutdown();
+} else if (MODE === 'stale_tab') {
+  // Story 4 C2: `filter/client_mh_connection_stale_tab`. An OLD-bundle tab
+  // (post-GC shape: `status`/`mh_index_bucket` already stripped, the hash still
+  // riding) and a NEW-bundle tab write the same name into one org in the same
+  // run: the old point must be ABSENT from storage, the new one PRESENT.
+  console.log('== SDK-S7 stale-tab shape gate: old-shaped mh_connection ABSENT, new-shaped PRESENT');
+  const org = 'sdk-stale-tab';
+  const OLD = writer(AggregationTemporalityPreference.DELTA);
+  const NEW = writer(AggregationTemporalityPreference.DELTA);
+  OLD.mhc.add(5, { ...labels(org), meeting_id_hash: 'deadbeef' });
+  NEW.mhc.add(3, { ...labels(org), phase: 'join', outcome: 'connected' });
+  await sleep(700);
+  await OLD.flush();
+  await NEW.flush();
+  await sleep(800);
+  const t = await (await fetch(`${PROM}/metrics`)).text();
+  const rows = t
+    .split('\n')
+    .filter((l) => l.startsWith('dt_client_mh_connection_total{') && l.includes(`org_id="${org}"`));
+  console.log(`    stored rows: ${JSON.stringify(rows)}`);
+  check('only the new-shaped row is stored', rows.length, 1);
+  check(
+    'new-shaped row PRESENT with phase/outcome and exact value',
+    rows.map((l) => [l.includes('phase="join"') && l.includes('outcome="connected"'), Number(l.trim().split(/\s+/).pop())]),
+    [[true, 3]],
+  );
+  check('old tab meeting_id_hash never stored', t.includes('deadbeef'), false);
+  await OLD.mp.shutdown();
+  await NEW.mp.shutdown();
 }
 console.log('RESULT:', fails.length ? 'FAIL ' + fails.join(', ') : 'PASS');
 process.exit(fails.length ? 1 : 0);

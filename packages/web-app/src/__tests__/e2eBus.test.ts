@@ -181,6 +181,47 @@ test('media faults are NOT projected onto the bus', () => {
   install(session);
   session.fire('mediaFault', { stage: 'decoder', message: 'the decoder failed', fatal: true });
   expect(events().some((e) => e['type'] === 'mediaFault')).toBe(false);
+  expect(window.__darktower_test__?.transportFaults).toEqual([]);
+});
+
+test('story 4 C2: a TRANSPORT fault is recorded as a bare {stage} — never its message', () => {
+  const session = new MockMeetingSession();
+  install(session);
+  session.fire('mediaFault', { stage: 'decoder', message: 'the decoder failed', fatal: true });
+  expect(window.__darktower_test__?.transportFaults).toEqual([]); // negative: not transport
+  session.fire('mediaFault', {
+    stage: 'transport',
+    message: 'the inbound media datagram stream ended SECRET-PROSE',
+    fatal: false,
+  });
+  expect(window.__darktower_test__?.transportFaults).toEqual([{ stage: 'transport' }]);
+  const fault = events().find((e) => e['type'] === 'transportFault');
+  expect(fault).toEqual({ type: 'transportFault', stage: 'transport' });
+  expect(JSON.stringify(window.__darktower_test__)).not.toContain('SECRET-PROSE');
+});
+
+test('story 4 C2: reconnecting overlay set/clear per slot id, in order, scalars only', () => {
+  const session = new MockMeetingSession();
+  install(session);
+  expect(window.__darktower_test__?.reconnectingOverlays).toEqual([]);
+  session.fire('slotReconnectingChanged', { slotId: 4, reconnecting: true, previousSenderId: 258 });
+  session.fire('slotReconnectingChanged', { slotId: 0, reconnecting: true, previousSenderId: 258 });
+  session.fire('slotReconnectingChanged', {
+    slotId: 4,
+    reconnecting: false,
+    previousSenderId: undefined,
+  });
+  expect(window.__darktower_test__?.reconnectingOverlays).toEqual([
+    { slotId: 4, reconnecting: true },
+    { slotId: 0, reconnecting: true },
+    { slotId: 4, reconnecting: false },
+  ]);
+  // No sender id rides the overlay record (scalars: slot + state only).
+  expect(events().filter((e) => e['type'] === 'slotReconnecting')).toEqual([
+    { type: 'slotReconnecting', slotId: 4, reconnecting: true },
+    { type: 'slotReconnecting', slotId: 0, reconnecting: true },
+    { type: 'slotReconnecting', slotId: 4, reconnecting: false },
+  ]);
 });
 
 test('frame counts are SAMPLED from the pipeline getter, not emitted per frame', async () => {

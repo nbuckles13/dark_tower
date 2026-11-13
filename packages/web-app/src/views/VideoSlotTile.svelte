@@ -18,7 +18,8 @@
   import type { RosterParticipant, VideoReceiveView } from '@darktower/sdk-core';
   import { VideoTile, type MeetingStore, type TileSurface } from '@darktower/sdk-svelte';
   import {
-    AWAITING_ASSIGNMENT,
+    displaySender,
+    displaySlotState,
     renderedKind,
     slotStateText,
     type SlotStateAttr,
@@ -46,15 +47,21 @@
   } = $props();
 
   const cell = $derived(store.media.slot(slotId));
-  const state = $derived<SlotStateAttr>(cell.assignment?.slotState ?? AWAITING_ASSIGNMENT);
-  const rendered = $derived(renderedKind(cell.render?.kind));
-  /** The sender this tile shows: the verified live sender, else MC's named participant. */
+  // Story 4 C2: a RECONNECTING slot shows its PREVIOUS occupant as an avatar
+  // (the ONE derivation in `slotState.ts`), never a frozen live frame.
+  const state = $derived<SlotStateAttr>(
+    displaySlotState(cell.assignment, cell.reconnecting !== undefined),
+  );
+  const rendered = $derived(renderedKind(cell.render?.kind, cell.reconnecting !== undefined));
+  /** The sender this tile shows: the previous occupant while reconnecting, else the verified live sender, else MC's named participant. */
   const senderId = $derived(
-    cell.render?.kind === 'active'
-      ? cell.render.senderId
-      : cell.render?.kind === 'avatar'
-        ? cell.render.participantSenderId
-        : cell.assignment?.senderId,
+    displaySender(cell.reconnecting, () =>
+      cell.render?.kind === 'active'
+        ? cell.render.senderId
+        : cell.render?.kind === 'avatar'
+          ? cell.render.participantSenderId
+          : cell.assignment?.senderId,
+    ),
   );
   const ctx = $derived({ roster: store.participants, selfParticipantId });
   const name = $derived(nameForSenderId(senderId, ctx));
@@ -64,9 +71,13 @@
   const pairedAudioSlot = $derived(
     senderId === undefined ? undefined : store.media.pairOf(senderId).audioSlotId,
   );
-  const audioState = $derived(
-    pairedAudioSlot === undefined ? undefined : store.media.slot(pairedAudioSlot).assignment,
-  );
+  const audioState = $derived.by<SlotStateAttr | undefined>(() => {
+    if (pairedAudioSlot === undefined) return undefined;
+    const audio = store.media.slot(pairedAudioSlot);
+    return audio.assignment === undefined && audio.reconnecting === undefined
+      ? undefined
+      : displaySlotState(audio.assignment, audio.reconnecting !== undefined);
+  });
   const indicators = $derived(
     participant === undefined
       ? undefined
@@ -95,7 +106,7 @@
   {#if participant !== undefined}
     <p class="audio" data-testid={`video-slot-audio-${slotId}`}>
       {#if audioState !== undefined}
-        audio: {slotStateText(audioState.slotState, { name, kind: 'audio' })}
+        audio: {slotStateText(audioState, { name, kind: 'audio' })}
       {:else}
         audio: not in one of your audio slots
       {/if}

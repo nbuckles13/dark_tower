@@ -264,6 +264,35 @@ export const DEFAULT_REPLAY_WINDOW_BITS = 64;
 export const DEFAULT_TRANSMIT_KEYS_PER_SENDER = 32;
 
 /**
+ * Where a frame ARRIVED (story 4 C2): an opaque, process-local transport id
+ * (the receiving handler's ref as a plain number — never emitted, never a
+ * label) and the receiver's membership bound over ids. Used ONLY to CLASSIFY a
+ * duplicate; it never changes the drop decision.
+ */
+export interface ReplayArrival {
+  readonly transport: number;
+  /**
+   * Whether a RECORDED first-copy transport is a current member of the set, or
+   * left it (lost / removed) within the bounded reconnect window. A duplicate
+   * whose first copy came via a transport outside that bound stays
+   * `replay_detected`, so no handler can launder a genuine replay into the
+   * token replay alerts exclude.
+   */
+  readonly isRecent: (transport: number) => boolean;
+}
+
+/**
+ * What the replay window decided: admit, or drop as a replay — split by WHERE
+ * the first copy arrived. `duplicate_cross_transport` is an exact in-window
+ * hit whose recorded first copy arrived on a DIFFERENT, recent transport (the
+ * make-before-break overlap); everything else rejected is `replay`.
+ */
+export type ReplayVerdict = 'admitted' | 'replay' | 'duplicate_cross_transport';
+
+/** No transport recorded at a window position. */
+const NO_TRANSPORT = -1;
+
+/**
  * Bounded replay window plus a transmit-key-generation high-water mark, both
  * SCOPED by `(kek_generation, sender_id)`.
  *
@@ -379,6 +408,30 @@ export class ReplayWindow {
    * rotation into a fresh, empty bucket.
    */
   admit(scope: number, parts: KeyIdParts, streamSequence: number): boolean {
+    return this.admitVia(scope, parts, streamSequence) === 'admitted';
+  }
+
+  /**
+   * {@link admit}, classifying a rejection by arrival (story 4 C2). The DECISION
+   * is identical to `admit` for every input: `arrival` only selects between the
+   * two rejection verdicts. Only an exact IN-WINDOW bit hit whose recorded
+   * first-copy transport differs from `arrival.transport` AND is
+   * `arrival.isRecent` is `duplicate_cross_transport`; a below-window or
+   * below-high-water rejection is always `replay`.
+   *
+   * The per-position transport ids live in a fixed `windowBits` array per
+   * context (bounded like the bitmap). A position is read only when its bit is
+   * set, and a set bit for sequence `s` was written at `s`'s admission; no
+   * later admission can reuse the slot `s % windowBits` while `s` is still
+   * inside the window (that needs `s + windowBits`, which would have shifted
+   * `s` out). So a stale id is never read for a reused position.
+   */
+  admitVia(
+    scope: number,
+    parts: KeyIdParts,
+    streamSequence: number,
+    arrival?: ReplayArrival,
+  ): ReplayVerdict {
     const sender = parts.senderId.toString(16);
     const stream = parts.stream.toString(16);
 
@@ -389,6 +442,7 @@ export class ReplayWindow {
       state = { contexts: new Map(), highWater: new Map() };
       bySender.set(sender, state);
     }
+    const windowBits = this.#windowBits;
 
     const highestGeneration = state.highWater.get(stream);
     if (highestGeneration !== undefined && parts.generation < highestGeneration) {
@@ -396,7 +450,7 @@ export class ReplayWindow {
       // Monotonicity within a scope makes this impossible for an honest sender,
       // and this check survives context eviction — so it holds even when the
       // window below has been recycled.
-      return false;
+      return 'replay';
     }
     if (highestGeneration === undefined || parts.generation > highestGeneration) {
       state.highWater.set(stream, parts.generation);
@@ -405,7 +459,7 @@ export class ReplayWindow {
     const contextKey = `${stream}:${parts.generation.toString(16)}`;
     let ctx = state.contexts.get(contextKey);
     if (!ctx) {
-      ctx = { highest: -1, bits: 0n };
+      ctx = { highest: -1, bits: 0n, via: undefined };
       state.contexts.set(contextKey, ctx);
       // Per-(scope, sender) LRU eviction. Bounded so an attacker-influenced key
       // space cannot exhaust memory; per sender AND per scope so it can evict
@@ -423,14 +477,39 @@ export class ReplayWindow {
       ctx.highest = streamSequence;
       const mask = (1n << BigInt(this.#windowBits)) - 1n;
       ctx.bits &= mask;
-      return true;
+      this.#record(ctx, streamSequence, arrival);
+      return 'admitted';
     }
     const behind = ctx.highest - streamSequence;
-    if (behind >= this.#windowBits) return false;
+    if (behind >= this.#windowBits) return 'replay';
     const bit = 1n << BigInt(behind);
-    if ((ctx.bits & bit) !== 0n) return false;
+    if ((ctx.bits & bit) !== 0n) {
+      const first = ctx.via?.[streamSequence % windowBits] ?? NO_TRANSPORT;
+      if (
+        arrival &&
+        first !== NO_TRANSPORT &&
+        first !== arrival.transport &&
+        arrival.isRecent(first)
+      ) {
+        return 'duplicate_cross_transport';
+      }
+      return 'replay';
+    }
     ctx.bits |= bit;
-    return true;
+    this.#record(ctx, streamSequence, arrival);
+    return 'admitted';
+  }
+
+  /** Record where an ADMITTED sequence arrived (no-op without an arrival). */
+  #record(ctx: ReplayContext, streamSequence: number, arrival: ReplayArrival | undefined): void {
+    if (!arrival) {
+      // An admission WITHOUT an arrival still owns its position: clear any id a
+      // previous occupant (`s - k·W`) left there, so it is never read for `s`.
+      if (ctx.via) ctx.via[streamSequence % this.#windowBits] = NO_TRANSPORT;
+      return;
+    }
+    ctx.via ??= new Array<number>(this.#windowBits).fill(NO_TRANSPORT);
+    ctx.via[streamSequence % this.#windowBits] = arrival.transport;
   }
 
   /**
@@ -457,10 +536,22 @@ export class ReplayWindow {
   }
 }
 
+/** One `(stream, generation)` replay context. */
+interface ReplayContext {
+  highest: number;
+  bits: bigint;
+  /**
+   * The arrival transport id per window position (`sequence % windowBits`),
+   * allocated on the first admission that carries an arrival. Bounded by
+   * `windowBits`, like `bits`.
+   */
+  via: number[] | undefined;
+}
+
 /** One sender's replay state within one scope. */
 interface ScopedSenderReplay {
-  /** `(stream|generation) -> {highest, bitmap}`, insertion-ordered for LRU. */
-  readonly contexts: Map<string, { highest: number; bits: bigint }>;
+  /** `(stream|generation) -> {highest, bitmap, arrivals}`, insertion-ordered for LRU. */
+  readonly contexts: Map<string, ReplayContext>;
   /** `stream -> highest transmit-key generation seen`. Survives context eviction. */
   readonly highWater: Map<string, bigint>;
 }
@@ -754,6 +845,7 @@ export async function openVerifiedFrame(
   cache: TransmitKeyCache,
   keys: ReceiverKeys,
   replay?: ReplayWindow,
+  arrival?: ReplayArrival,
 ): Promise<OpenedFrame> {
   const { frame, sframe, keyId, keyIdParts } = verified;
 
@@ -908,11 +1000,19 @@ export async function openVerifiedFrame(
     throw kekDrop(keys, scope);
   }
 
-  if (replay && !replay.admit(scope, keyIdParts, frame.streamSequence)) {
+  const verdict = replay?.admitVia(scope, keyIdParts, frame.streamSequence, arrival) ?? 'admitted';
+  if (verdict !== 'admitted') {
     // A frame the window rejects changes NO key state: a freshly unwrapped key is
     // discarded rather than cached, so a replay cannot re-populate a cache a
-    // roster purge just emptied.
+    // roster purge just emptied. The two verdicts differ ONLY in the reason
+    // token: a cross-transport duplicate is still dropped.
     fresh?.key.fill(0);
+    if (verdict === 'duplicate_cross_transport') {
+      throw cryptoReject(
+        'duplicate_cross_transport',
+        'frame duplicates one already accepted via another media handler',
+      );
+    }
     throw cryptoReject('replay_detected', 'frame replays a stream sequence already accepted');
   }
 
@@ -985,6 +1085,7 @@ function kekDrop(keys: ReceiverKeys, generation: number) {
 export const RECEIVE_PATH_REASONS: readonly RejectReason[] = [
   'signature_invalid',
   'replay_detected',
+  'duplicate_cross_transport',
   'no_kek_for_generation',
   'kek_generation_stale',
   'no_transmit_key',

@@ -50,6 +50,19 @@ export interface SlotView {
    * before the SDK reported any. Audio slots never carry one.
    */
   readonly render: VideoRenderState | undefined;
+  /**
+   * The client-local RECONNECTING state (story 4 C2, ADR-0039 §4): set while
+   * this client has observed the loss of the handler carrying the slot (or was
+   * told to drop it), carrying the previous occupant to render as a
+   * reconnecting avatar; `undefined` otherwise. From the SDK's
+   * `slotReconnectingChanged` only — never inferred from silence.
+   */
+  readonly reconnecting: SlotReconnecting | undefined;
+}
+
+/** A reconnecting slot's previous occupant (verified live sender, else MC's assigned sender). */
+export interface SlotReconnecting {
+  readonly previousSenderId: number | undefined;
 }
 
 /**
@@ -122,6 +135,21 @@ function sameRender(a: VideoRenderState | undefined, b: VideoRenderState | undef
 export class SlotCell implements SlotView {
   #assignment = $state<StreamAssignmentEvent | undefined>(undefined);
   #render = $state<VideoRenderState | undefined>(undefined);
+  #reconnecting = $state<SlotReconnecting | undefined>(undefined);
+
+  get reconnecting(): SlotReconnecting | undefined {
+    return this.#reconnecting;
+  }
+
+  /** Change-only write (a transition event; equal state is not re-written). */
+  setReconnecting(next: SlotReconnecting | undefined): void {
+    const cur = this.#reconnecting;
+    if (cur === next) return;
+    if (cur !== undefined && next !== undefined && cur.previousSenderId === next.previousSenderId) {
+      return;
+    }
+    this.#reconnecting = next;
+  }
 
   get assignment(): StreamAssignmentEvent | undefined {
     return this.#assignment;
@@ -284,7 +312,11 @@ export class CellRegistry<K, C extends V, V> {
 }
 
 /** The view of a slot MC has never named and the SDK has never rendered. */
-export const EMPTY_SLOT: SlotView = Object.freeze({ assignment: undefined, render: undefined });
+export const EMPTY_SLOT: SlotView = Object.freeze({
+  assignment: undefined,
+  render: undefined,
+  reconnecting: undefined,
+});
 
 /** One kind of a participant MC has sent no state for. */
 const EMPTY_KIND: KindMediaView = Object.freeze({

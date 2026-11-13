@@ -1911,13 +1911,79 @@ reasons for `media_dial` tokens, `mh_jwt_validations_total{token_type="media_dia
 by `failure_reason` (ADR-0039 §8: a sustained `expired` means the refresh push is broken;
 `docs/runbooks/mh-incident-response.md` Scenario 24).
 
+### F31 — A slot stays "reconnecting" until the cap, or MH dials keep failing
+
+**Symptom.** One or more tiles show the reconnecting overlay (avatar, canvas hidden) and stay that
+way until `media.handlers.reconnectingCapMs` expires, after which the latest assignment renders.
+On the board (`infra/grafana/dashboards/client-media.json`, row *MH Connections and Continuity*)
+any of these rise:
+- `dt_client_mh_connection_total{outcome=~"wrong_handler|binding_conflict|mc_unavailable|timeout"}`;
+- `dt_client_mh_reconnect_duration_ms` with `outcome="abandoned"`;
+- `dt_client_media_resume_ms{outcome="abandoned"}`.
+
+**What it means.** The client lost a handler, or was moved off one, and the replacement did not
+become usable in time. `connected` means a dial survived the admission window
+(`media.handlers.admissionWindowMs`), so a refusal shows its own outcome. A **planned transfer
+never shows the overlay**: MC moves the slot edges first, and a planned transfer reads as
+`phase="added"` `connected` plus `dt_client_mh_disconnects_total{cause="directed_removal"}`. An
+overlay therefore always means an unplanned loss (`cause="transport_loss"` or
+`"handler_released"`), or a removal before the slots moved. Catalog:
+`docs/observability/metrics/client.md` §MH connection lifecycle.
+
+**First triage step: split by outcome / cause, then go server-side.** The close codes are what MH
+told the client ([`mh-incident-response.md` §Close codes](mh-incident-response.md#close-codes-what-mh-told-the-client)):
+
+| Rising | Check next |
+|---|---|
+| `outcome="wrong_handler"` | The client dialled with a token for another handler: a stale handler set, or an address reused by a new incarnation. Check MH `mh_jwt_validations_total{token_type="media_dial",failure_reason="aud_mismatch"}` ([MH Scenario 24](mh-incident-response.md#scenario-24-media-dial-credential-rejections)), then whether MC's set pushes reach clients. |
+| `outcome="binding_conflict"` | MH refused the sender ordinal MC returned ([MH Scenario 15](mh-incident-response.md#scenario-15-media-sessions-declining--no-sender-binding)). |
+| `outcome="mc_unavailable"` | MH could not reach MC for a binding: MH `mh_mc_notifications_total{status="error"}`, MC health ([`mc-incident-response.md`](mc-incident-response.md)). |
+| `outcome="timeout"` / `"transport_failure"` | The new handler is unreachable from the browser: F7 (certificate / handshake), MH reachability (`infra/kind/scripts/mh.sh list --json`). |
+| `outcome="declined"` | F30. |
+| `cause="handler_released"` | MH released the meeting: drain shed or owner-silence release ([`mh-deployment.md` §MH drains on SIGTERM](mh-deployment.md#mh-drains-on-sigterm)). Then check that MC replaced the handler: `mc_media_handler_migration_duration_seconds` by `phase`. |
+| `cause="transport_loss"` | The MH pod crashed or went idle (pod restarts, `mh_active_connections`). Same MC replacement check. |
+| `outcome="contract_fault"` / `cause="contract_fault"` | MH sent a zero or unknown close code: a version skew between MH and the web app (F28). |
+| `dt_client_mh_non_member_refs_total` > 0 | MC named a handler outside the set it pushed: an MC contract defect (F28). |
+| `dt_client_media_frames_dropped_total{reason="duplicate_cross_transport"}` | Expected as a short burst at a set change (make-before-break overlap). Sustained outside one: a handler is duplicating forwards. Not a replay attack, and not `replay_detected`. |
+
+**Confirm the caps the session ran with.** Grep the browser console for the
+`[dt-media-handlers-config]` line, which is logged once per session. It carries the admission
+window, the planned-transfer overlay hold (`removalGraceMs`) and the three caps
+(`reconnectingCapMs`, `resumeAbandonMs`, `reconnectAbandonMs`) alongside the redial knobs.
+
+**Tuning lever, after the server side is clean.**
+- `reconnectingCapMs` bounds how long the overlay can stay up. It must not exceed `resumeAbandonMs`.
+- `removalGraceMs` is how long a planned-transfer removal holds the overlay waiting for MC's moved
+  assignments (MC sends the set before the assignments). A planned transfer that shows a brief
+  "reconnecting" means the follow-up took longer than this. It must be less than `reconnectingCapMs`.
+- The caps are sized on MC's heartbeat timeout N: raising `MC_MH_HEARTBEAT_TIMEOUT_MS` fails
+  `packages/web-app/tests/replacementCapsSync.test.ts` until they are raised too.
+- `resumeAbandonMs` / `reconnectAbandonMs` bound when an episode is counted `abandoned`.
+
+Raising a cap does not make media come back sooner. It only moves where `abandoned` is drawn.
+Fix the server-side cause first. Defaults and ranges: the README table linked below.
+
 ### Media-handler set reconcile knobs
 
-The four `MediaConfig.handlers` keys (redial base and cap, the empty-set notice bound, the
-`HANDLER_RELEASED` grace) and the compiled first-redial floor are SDK code-config, logged once per
-session as `[dt-media-handlers-config]`. Their defaults and inclusive ranges live in ONE place,
-pinned to the SDK by a test:
+The `MediaConfig.handlers` keys and the compiled first-redial floor are SDK code-config, logged
+once per session as `[dt-media-handlers-config]`. The keys are: redial base and cap, the empty-set
+notice bound, the `HANDLER_RELEASED` grace, and (story 4 C2) `admissionWindowMs`,
+`reconnectingCapMs`, `removalGraceMs`, `resumeAbandonMs` and `reconnectAbandonMs`. Their defaults and inclusive
+ranges live in ONE place, pinned to the SDK by a test:
 [`packages/web-app/README.md` §Media-handler set reconcile](../../packages/web-app/README.md#media-handler-set-reconcile-sdk-mediaconfighandlers).
+
+**Symptom of a bad value.** `startMedia()` rejects with a
+`ClientConfigError` whose `configKey` starts with `media.handlers.`, before any handler is
+dialed. The message names the key and the values involved. Either a value is outside its
+inclusive range, or one of the cross-key relations fails:
+- `media.handlers.reconnectingCapMs (…) must not exceed media.handlers.resumeAbandonMs (…)`.
+  An overlay never outlives the episode it shows.
+- `media.handlers.removalGraceMs (…) must be less than media.handlers.reconnectingCapMs (…)`.
+- `media.handlers.reconnectAbandonMs (…) must be at least the first-redial floor plus media.handlers.redialCapMs (…)`. The cap
+  would abandon a reconnect before the first ordinary redial could land.
+
+**Fix.** Change the named value in `DEFAULT_CLIENT_CONFIG` (`packages/sdk-core/src/config/clientConfig.ts`)
+or the embedder's `mediaConfig`, then rebuild the web app. These keys are outside every ConfigMap.
 
 ---
 

@@ -165,7 +165,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Frames the receive path could not open, by frozen reject reason. THE SIGNAL THIS BOARD EXISTS FOR: the FOUR key-material reasons MCMediaMissingKeyMaterial selects - no_kek_for_generation (KEK generation newer than held - MC's push has not arrived), kek_generation_stale (generation older than this client retains), no_roster_entry (no usable identity key for the sender) and unwrap_failed (an authenticated frame whose KEK unwrap failed: a KEK-bytes split between sender and receiver under one generation, or a sender wrap bug; transit corruption lands on signature_invalid instead, because the signature covers the wrap block) - are, per ADR-0036 §11, the only signal for a join or rotation path that has silently stopped delivering keys. The first three are expected transiently at join and after a KEK rotation, and sustained is the fault; unwrap_failed has NO healthy transient. Split on reason FIRST; the four arms have different remedies (docs/runbooks/mc-incident-response.md Scenario 16) and are not equally instrumented - the conflicting-KEK tripwire panel below is the small-denominator witness for the unwrap_failed split. The alert's ratio, threshold and duration live in the rule (infra/docker/prometheus/rules/mc-alerts.yaml) and are not restated here. AN EMPTY PANEL HERE IS AMBIGUOUS. The export pipeline is LIVE, so empty can mean no drops occurred, no browser has reported within the collector's metric_expiration, or the pipeline broke - run the three-step discriminator in the READ FIRST panel before concluding anything from absence. THIS IS THE OPPOSITE OF THE MH MEDIA-PATH BOARD, where the drop panels read a flat ZERO when healthy (those counters are present-at-zero from startup; an ABSENT series there is a fault). Client series are created lazily on first emission, so here absence and zero are different states; do not carry the MH reading across. No client reject reason is video-gated - every token that can appear on this counter is reachable in this story. Stated explicitly because the equivalent MH drop panels DO name two reasons that cannot fire until video, and silence here would be indistinguishable from having forgotten to check. There is deliberately no 'or vector(0)' in this query: it would fabricate a series and flatten the by-reason breakdown that triage depends on. Split by media_kind and content_kind (story 3 R-29; 2026-10-26: content_kind co-carried - series identity, not traffic; every series reads main until screen share ships; per-kind series per docs/observability/metrics/client.md §media_kind). Story 3's video receive tokens are drawn separately on Video Receive Drops (story 3 tokens); sender_server_muted is alerted (ClientVideoServerMutedSenderFrames).",
+      "description": "Frames the receive path could not open, by frozen reject reason. THE SIGNAL THIS BOARD EXISTS FOR: the FOUR key-material reasons MCMediaMissingKeyMaterial selects - no_kek_for_generation (KEK generation newer than held - MC's push has not arrived), kek_generation_stale (generation older than this client retains), no_roster_entry (no usable identity key for the sender) and unwrap_failed (an authenticated frame whose KEK unwrap failed: a KEK-bytes split between sender and receiver under one generation, or a sender wrap bug; transit corruption lands on signature_invalid instead, because the signature covers the wrap block) - are, per ADR-0036 §11, the only signal for a join or rotation path that has silently stopped delivering keys. The first three are expected transiently at join and after a KEK rotation, and sustained is the fault; unwrap_failed has NO healthy transient. Split on reason FIRST; the four arms have different remedies (docs/runbooks/mc-incident-response.md Scenario 16) and are not equally instrumented - the conflicting-KEK tripwire panel below is the small-denominator witness for the unwrap_failed split. The alert's ratio, threshold and duration live in the rule (infra/docker/prometheus/rules/mc-alerts.yaml) and are not restated here. AN EMPTY PANEL HERE IS AMBIGUOUS. The export pipeline is LIVE, so empty can mean no drops occurred, no browser has reported within the collector's metric_expiration, or the pipeline broke - run the three-step discriminator in the READ FIRST panel before concluding anything from absence. THIS IS THE OPPOSITE OF THE MH MEDIA-PATH BOARD, where the drop panels read a flat ZERO when healthy (those counters are present-at-zero from startup; an ABSENT series there is a fault). Client series are created lazily on first emission, so here absence and zero are different states; do not carry the MH reading across. No client reject reason is video-gated - every token that can appear on this counter is reachable in this story. Stated explicitly because the equivalent MH drop panels DO name two reasons that cannot fire until video, and silence here would be indistinguishable from having forgotten to check. There is deliberately no 'or vector(0)' in this query: it would fabricate a series and flatten the by-reason breakdown that triage depends on. Split by media_kind and content_kind (story 3 R-29; 2026-10-26: content_kind co-carried - series identity, not traffic; every series reads main until screen share ships; per-kind series per docs/observability/metrics/client.md §media_kind). Story 3's video receive tokens are drawn separately on Video Receive Drops (story 3 tokens); sender_server_muted is alerted (ClientVideoServerMutedSenderFrames). Story 4 C2: duplicate_cross_transport is an exact in-window duplicate whose first copy arrived via a different handler during a make-before-break transfer overlap - still dropped, decoded/played once; a brief burst at a handler-set change is expected, sustained outside one is anomalous. It is NOT replay_detected and replay alerts match reason=\"replay_detected\" exactly.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -4123,6 +4123,860 @@
         }
       ],
       "title": "Video Slot ACTIVE To First Render (p95)",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 190
+      },
+      "id": 55,
+      "panels": [],
+      "title": "MH Connections and Continuity (story 4)",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "dt_client_mh_connection_total{phase, outcome}: one outcome per dial of a media handler, every dial. phase: join (initial arm), added (a handler that joined the set later), redial (after a loss, a park release or an in-flight refresh). outcome=connected means the dial SURVIVED the admission window (media.handlers.admissionWindowMs), not merely handshook: an MH close inside the window shows its close-code outcome instead. A refusal arriving after the window reads connected here plus a disconnect cause on MH Disconnects by Cause - misattributed between the two, never lost. Local teardown emits nothing. Rising wrong_handler / binding_conflict / mc_unavailable / timeout: docs/runbooks/client-dev-local.md F31. Zero-initialised at join for all 30 phase x outcome cells, so a reporting client shows present-at-zero failure cells. A planned transfer shows no reconnecting overlay (removalGraceMs hold) and is never a loss here: it reads as phase=added connected plus cause=directed_removal; its slot blip is on dt_client_media_resume_ms. Grouped by its own discriminators on purpose: a stale pre-C2 tab's label-less row can never inflate a ratio here (old-shaped dt_client_mh_connection_total datapoints are also dropped at the collector by filter/client_mh_connection_stale_tab). Kind-free BY DESIGN (a session-level series per docs/observability/metrics/client.md §media_kind): a handler transport carries every kind at once - not split by media_kind or content_kind, a decision, not an omission. Catalog: docs/observability/metrics/client.md §MH connection lifecycle.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Dials",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 191
+      },
+      "id": 60,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by(phase, outcome) (increase(dt_client_mh_connection_total[$__rate_interval]))",
+          "legendFormat": "{{phase}} {{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "MH Dial Outcomes by Phase and Outcome",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "dt_client_mh_dial_duration_ms{phase, outcome=connected|failed}: dial start to handshake (connected) or to failure / MH close (failed, including a provisional handshake closed inside the admission window). Buckets: MH_DIAL_DURATION_BUCKETS_MS (top finite bound past the connect timeout, so a timed-out dial is not folded into +Inf). Grouped by its own discriminators on purpose: a stale pre-C2 tab's label-less row can never inflate a ratio here (old-shaped dt_client_mh_connection_total datapoints are also dropped at the collector by filter/client_mh_connection_stale_tab). Kind-free BY DESIGN (a session-level series per docs/observability/metrics/client.md §media_kind): a handler transport carries every kind at once - not split by media_kind or content_kind, a decision, not an omission. Catalog: docs/observability/metrics/client.md §MH connection lifecycle.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "ms",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 191
+      },
+      "id": 61,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by(le, phase, outcome) (rate(dt_client_mh_dial_duration_ms_bucket[$__rate_interval])))",
+          "legendFormat": "p95 {{phase}} {{outcome}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by(le, phase, outcome) (rate(dt_client_mh_dial_duration_ms_bucket[$__rate_interval])))",
+          "legendFormat": "p50 {{phase}} {{outcome}}",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "MH Dial Duration by Phase and Outcome (p95 / p50)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "dt_client_mh_disconnects_total{cause}: one count per end of an ESTABLISHED handler session (a dial that survived the admission window). transport_loss = connection lost with no close code; directed_removal = the ref left the handler set and the client closed it; handler_released / wrong_handler / binding_conflict / mc_unavailable / declined = MH close codes; contract_fault = code 0 or unknown. Local teardown emits nothing. A planned transfer shows no reconnecting overlay (removalGraceMs hold) and is never a loss here: it reads as phase=added connected plus cause=directed_removal; its slot blip is on dt_client_media_resume_ms. Zero-initialised at join (8 causes). Grouped by its own discriminators on purpose: a stale pre-C2 tab's label-less row can never inflate a ratio here (old-shaped dt_client_mh_connection_total datapoints are also dropped at the collector by filter/client_mh_connection_stale_tab). Kind-free BY DESIGN (a session-level series per docs/observability/metrics/client.md §media_kind): a handler transport carries every kind at once - not split by media_kind or content_kind, a decision, not an omission. Catalog: docs/observability/metrics/client.md §MH connection lifecycle.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Disconnects",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 199
+      },
+      "id": 62,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by(cause) (increase(dt_client_mh_disconnects_total[$__rate_interval]))",
+          "legendFormat": "{{cause}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "MH Disconnects by Cause",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "The client-observed lost-handler count: dt_client_mh_disconnects_total{cause=~\"transport_loss|handler_released\"} - the ONE isHandlerLoss predicate (packages/sdk-core/src/media/setup/mediaMetrics.ts), which also starts the reconnect timer and the per-slot resume episode. A directed removal is NOT a loss (the client closed first; the server's later close is not a second event). A planned transfer shows no reconnecting overlay (removalGraceMs hold) and is never a loss here: it reads as phase=added connected plus cause=directed_removal; its slot blip is on dt_client_media_resume_ms. Compare with MC's view of the same replacement on the MC dashboards. Grouped by its own discriminators on purpose: a stale pre-C2 tab's label-less row can never inflate a ratio here (old-shaped dt_client_mh_connection_total datapoints are also dropped at the collector by filter/client_mh_connection_stale_tab). Kind-free BY DESIGN (a session-level series per docs/observability/metrics/client.md §media_kind): a handler transport carries every kind at once - not split by media_kind or content_kind, a decision, not an omission. Catalog: docs/observability/metrics/client.md §MH connection lifecycle.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Lost handlers",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 199
+      },
+      "id": 63,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by(cause) (increase(dt_client_mh_disconnects_total{cause=~\"transport_loss|handler_released\"}[$__rate_interval]))",
+          "legendFormat": "{{cause}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Lost Handlers (transport_loss | handler_released)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "dt_client_mh_reconnect_duration_ms{outcome}: per handler, from the loss of an in-set established handler to reconnected (the same ref's next dial finalised connected, valued to its handshake), removed (the ref left the set) or abandoned (session end, or the cap media.handlers.reconnectAbandonMs). Buckets: MH_DISRUPTION_BUCKETS_MS (top finite bound covers the cap range). Read the outcome split before the latency: a rising abandoned share is the signal, and its p95 sits at the cap by construction. A planned transfer shows no reconnecting overlay (removalGraceMs hold) and is never a loss here: it reads as phase=added connected plus cause=directed_removal; its slot blip is on dt_client_media_resume_ms. Grouped by its own discriminators on purpose: a stale pre-C2 tab's label-less row can never inflate a ratio here (old-shaped dt_client_mh_connection_total datapoints are also dropped at the collector by filter/client_mh_connection_stale_tab). Kind-free BY DESIGN (a session-level series per docs/observability/metrics/client.md §media_kind): a handler transport carries every kind at once - not split by media_kind or content_kind, a decision, not an omission. Catalog: docs/observability/metrics/client.md §MH connection lifecycle.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "ms",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ms"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "C"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "custom.axisLabel",
+                "value": "episodes"
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 207
+      },
+      "id": 64,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by(le, outcome) (rate(dt_client_mh_reconnect_duration_ms_bucket[$__rate_interval])))",
+          "legendFormat": "p95 {{outcome}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by(le, outcome) (rate(dt_client_mh_reconnect_duration_ms_bucket[$__rate_interval])))",
+          "legendFormat": "p50 {{outcome}}",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by(outcome) (increase(dt_client_mh_reconnect_duration_ms_count[$__rate_interval]))",
+          "legendFormat": "episodes {{outcome}}",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "MH Reconnect Duration by Outcome (p95 / p50)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "dt_client_media_resume_ms{media_kind, content_kind, outcome}: the client-observed media-dark window per slot across a handler disruption - the truth for 'how long did this slot go dark'. Only slots Active at episode start; solo and receive-only clients start none. resumed = first played audio / decoded video frame via any transport other than the lost one (another handler, or the same ref after it reconnects), same sender; reassigned_away = the next assignment is not Active or names another sender; abandoned = session end or the cap media.handlers.resumeAbandonMs. The UI reconnecting overlay is capped separately (media.handlers.reconnectingCapMs) and is not this metric. A planned transfer shows no reconnecting overlay but DOES start a resume episode (MC removes the old handler before moving the edges): it records the planned blip, mixed here with crash darkness; split them with mc_media_handler_migrations_total{trigger}. Buckets: MH_DISRUPTION_BUCKETS_MS. Grouped by outcome so a stale label-less row never inflates a ratio. Split by media_kind and content_kind (per-kind series per docs/observability/metrics/client.md §media_kind). Catalog: docs/observability/metrics/client.md §MH connection lifecycle.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "ms",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ms"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "custom.axisLabel",
+                "value": "episodes"
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 207
+      },
+      "id": 65,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by(le, outcome, media_kind, content_kind) (rate(dt_client_media_resume_ms_bucket[$__rate_interval])))",
+          "legendFormat": "p95 {{media_kind}}/{{content_kind}} {{outcome}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by(outcome, media_kind, content_kind) (increase(dt_client_media_resume_ms_count[$__rate_interval]))",
+          "legendFormat": "episodes {{media_kind}}/{{content_kind}} {{outcome}}",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Media Resume Time by Outcome and Kind (p95)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "dt_client_time_to_first_mh_connected_ms: join start to the handshake of the first dial that FINALISED connected (survived the admission window); once per session, includes join-retry time. A refused first dial is never observed. Handshake readiness, before any media frame exists - read Time to First Media Frame for the wire boundary. Left the grandfathered join-flow roster in story 4 C2: no meeting dimension. Buckets: MH_TIME_TO_FIRST_CONNECTED_BUCKETS_MS; until pre-C2 tabs reload their default-bucket rows mix in and the quantile is approximate. Kind-free BY DESIGN (a session-level series per docs/observability/metrics/client.md §media_kind): a handler transport carries every kind at once - not split by media_kind or content_kind, a decision, not an omission. Catalog: docs/observability/metrics/client.md §MH connection lifecycle.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "ms",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 215
+      },
+      "id": 66,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by(le) (rate(dt_client_time_to_first_mh_connected_ms_bucket[$__rate_interval])))",
+          "legendFormat": "p95",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by(le) (rate(dt_client_time_to_first_mh_connected_ms_bucket[$__rate_interval])))",
+          "legendFormat": "p50",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Time to First MH Connected (p95 / p50)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "dt_client_mh_non_member_refs_total{source=send_directive|stream_assignment}: one count per handler_ref in a freshly received MC message that is not in the client's current handler set (ADR-0039 §4: counted and ignored). Ref 0 on a no-edge slot and the re-check of a held assignment after a set change are not counted. ANY nonzero rate is an MC contract defect. Zero-initialised at join (2 sources). Grouped by its own discriminators on purpose: a stale pre-C2 tab's label-less row can never inflate a ratio here (old-shaped dt_client_mh_connection_total datapoints are also dropped at the collector by filter/client_mh_connection_stale_tab). Kind-free BY DESIGN (a session-level series per docs/observability/metrics/client.md §media_kind): a handler transport carries every kind at once - not split by media_kind or content_kind, a decision, not an omission. Catalog: docs/observability/metrics/client.md §MH connection lifecycle.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Refs",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 215
+      },
+      "id": 67,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by(source) (increase(dt_client_mh_non_member_refs_total[$__rate_interval]))",
+          "legendFormat": "{{source}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Non-Member Handler Refs by Source (MC contract defect)",
       "type": "timeseries"
     }
   ],

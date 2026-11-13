@@ -30,6 +30,7 @@
 // instance, logged, or placed on any error. Unknown ServerMessage variants log the
 // `message.case` discriminant only — never the decoded payload.
 
+import type { MhNonMemberSource } from '../media/setup/mediaMetrics.js';
 import { create, fromBinary } from '@bufbuild/protobuf';
 import { timestampFromDate } from '@bufbuild/protobuf/wkt';
 import { context, SpanStatusCode, trace } from '@opentelemetry/api';
@@ -189,6 +190,14 @@ export interface SignalingClientOptions {
    * payload. Events carry only the token-free {@link HandlerSetView}.
    */
   readonly handlerSetSink?: (intake: HandlerSetIntake) => void;
+  /**
+   * Called once per non-member `handler_ref` in a FRESHLY received message
+   * (ADR-0039 §4: counted and ignored; story 4 C2). Not called for a 0 ref on a
+   * no-edge slot state, nor for the stale re-check after a set change. The
+   * session counts it (`dt_client_mh_non_member_refs_total{source}`); the
+   * `[dt-signaling-contract]` WARN stays once per session.
+   */
+  readonly onNonMemberRef?: (source: MhNonMemberSource) => void;
 }
 
 /** The typed events SignalingClient emits. */
@@ -360,6 +369,7 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
   #bindingToken: string | undefined;
   readonly #kekSink: MeetingKekSink | undefined;
   readonly #handlerSetSink: ((intake: HandlerSetIntake) => void) | undefined;
+  readonly #onNonMemberRef: ((source: MhNonMemberSource) => void) | undefined;
   /**
    * The CURRENT handler set's members, ref -> url (no tokens): the membership
    * every `SendTarget`/`StreamAssignment` ref is checked against. Updated from
@@ -392,6 +402,7 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
     this.#joinTimeoutMs = options.joinTimeoutMs ?? DEFAULT_JOIN_TIMEOUT_MS;
     this.#kekSink = options.kekSink;
     this.#handlerSetSink = options.handlerSetSink;
+    this.#onNonMemberRef = options.onNonMemberRef;
     this.#rosterKeys = new RosterKeyFeed(options.rosterKeys);
   }
 
@@ -1049,7 +1060,10 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
     for (const wire of refs) {
       const ref = handlerRef(wire);
       if (this.#handlerUrls.has(ref)) members.push(ref);
-      else this.#contractNotice(NON_MEMBER_TARGET);
+      else {
+        this.#onNonMemberRef?.('send_directive');
+        this.#contractNotice(NON_MEMBER_TARGET);
+      }
     }
     return members;
   }
@@ -1064,7 +1078,10 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
     if (a.handlerRef === 0 && NO_EDGE_SLOT_STATES.has(a.slotState)) return undefined;
     const ref = handlerRef(a.handlerRef);
     if (this.#handlerUrls.has(ref)) return ref;
-    if (fresh) this.#contractNotice(NON_MEMBER_ASSIGNMENT);
+    if (fresh) {
+      this.#onNonMemberRef?.('stream_assignment');
+      this.#contractNotice(NON_MEMBER_ASSIGNMENT);
+    }
     return undefined;
   }
 
