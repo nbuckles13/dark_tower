@@ -152,9 +152,8 @@ fn code(r: Result<Response<AcquireMediaHandlerResponse>, Status>) -> Code {
 /// `expected` +1 (and one duration observation for its outcome); EVERY other
 /// emitted cell unobserved.
 ///
-/// Order is load-bearing: every snapshot read drains histogram observations,
-/// so the expected histogram count is asserted FIRST; `assert_unobserved`
-/// checks series presence, which a drain does not affect.
+/// Order is load-bearing: a histogram query drains its own name+labels, so
+/// the expected count is asserted before `assert_unobserved` on the same cell.
 fn assert_cell(
     snap: &MetricSnapshot,
     trigger: ReplacementTrigger,

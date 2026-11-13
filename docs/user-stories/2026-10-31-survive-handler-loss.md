@@ -366,7 +366,7 @@ Governing design: ADR-0039 §3–§7 and Consequences "Recorded residual risks".
 - `shareProcessNamespace` only in the Kind render (guard asserts absent elsewhere, present in Kind) (R-31).
 
 #### Recorded residuals (ADR-0039 Consequences)
-S1b extended (forged heartbeat suppresses failover; disagreement counter detects); S6 (periodic MH bearer; GC allowlist is not peer authentication — line lands in GC-2); stolen token usable TTL + skew ≈ 5.5 min, ciphertext or binding-conflict DoS only; re-registration replaces a meeting's dial key and binding endpoint (ownership residual, SEC-A); GC `controller_id` check is anti-misroute only.
+S1b extended (forged heartbeat suppresses failover; the disagreement counter detects only a forger echoing live connection_ids — see docs/TODO.md §Media Path Obligations); S6 (periodic MH bearer; GC allowlist is not peer authentication — line lands in GC-2); stolen token usable TTL + skew ≈ 5.5 min, ciphertext or binding-conflict DoS only; re-registration replaces a meeting's dial key and binding endpoint (ownership residual, SEC-A); GC `controller_id` check is anti-misroute only.
 
 ### Observability
 
@@ -2781,7 +2781,7 @@ tasks:
       - drain deadline (grace minus margin).
       AC is NOT on this path (MC signs media_dial).
     - 27 Several handlers declared dead by one MC: by instance, first_declarations{trigger="heartbeat_timeout"} ≥ 2 over handlers_in_use above a fraction. The same signature on SEVERAL MCs = real multi-MH loss (node/AZ): check `mh.sh list --json` and node state. Only THIS MC = its own network path: leave the handlers alone. gc_view at request time is NOT the discriminator (GC lags by design). Also the MH crash-rate warning on first_declarations (per handler).
-    - 28 Client loss disagreement: `mc_media_handler_client_loss_disagreements_total` > 0, i.e. most clients report loss while heartbeats look healthy. This is either a forged heartbeat (residual risk S1b: another MH pod forging for a dead one) or a client-side network path problem. Diagnosis and escalation to security for the forged case.
+    - 28 Client loss disagreement: `mc_media_handler_client_loss_disagreements_total` > 0, i.e. most clients report loss while heartbeats look healthy. This is either a forged heartbeat (residual risk S1b: another MH pod forging for a dead one) or a client-side network path problem. Diagnosis and escalation to security for the forged case. Zero disagreements is NOT evidence of no forgery: a forged heartbeat with an empty connection_ids list retires the believed-connected set through the reconcile and empties the counter's denominator (story 4 MC-E finding).
     - 29 Misroute / owner mismatch: `mc_media_handler_heartbeats_total{outcome=~"released_unassigned|owner_mismatch"}` > 0, a contract or routing defect. Explain that an owner mismatch after an MC rollout is EXPECTED from the MH side (link to mh-incident-response 25 and the mc-deployment.md MC-rollout note written in Part A item 5).
     - Update existing scenarios:
       - 12: replace the "No alert today" TODO with MCRegisterMeetingFailureRate; a RegisterMeeting failure against a fresh grant adds that handler to the meeting's exclude list and re-acquires.

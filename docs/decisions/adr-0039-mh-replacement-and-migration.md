@@ -442,8 +442,10 @@ Full contract: `docs/debates/2026-10-28-mh-replacement-and-migration/telemetry-c
   at MC receipt time, never client time. **It is interpretable only when client detection time
   (MH QUIC idle timeout) ≈ N; both are published as config gauges.** A companion
   `mc_media_handler_client_loss_disagreements_total` counts the opposite case (most clients report
-  loss while heartbeats look healthy) — the false-negative half of the evidence and the
-  forged-heartbeat detector.
+  loss while heartbeats look healthy) — the false-negative half of the evidence. It detects a
+  forged heartbeat only when the forger echoes the live `connection_ids`: an empty or wrong list
+  retires the believed-connected set through the remove-only reconcile, emptying its denominator
+  (story 4 MC-E finding). Zero disagreements is NOT evidence of no forgery.
 - One `trigger` label from `ReleaseCause`. No meeting, participant or `handler_id` labels on MC/GC
   series (per-incarnation ids churn; the `internal.proto` comment allowing `handler_id` as a label is
   narrowed).
@@ -579,7 +581,10 @@ history); ConfigMap generations referenced by a live MH pod are never pruned.
 ### Recorded residual risks (security)
 
 - **S1b extended**: another MH pod can forge heartbeats for a dead one and suppress failover;
-  detected by `mc_media_handler_client_loss_disagreements_total`.
+  detected by `mc_media_handler_client_loss_disagreements_total` only when the forger echoes live
+  `connection_ids`; an empty-list forgery also empties the disagreement denominator (story 4 MC-E
+  finding). A denominator the suspect MH cannot erase is a `docs/TODO.md` §Media Path Obligations
+  item.
 - **S6**: MH's bearer now crosses the plaintext MH→MC channel periodically (the TODO entry is
   updated in the allowlist commit). GC's per-zone endpoint allowlist is the registration-side bound
   on MC-bearer harvest via a rogue `grpc_endpoint`; it is not peer authentication and does not close

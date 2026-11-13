@@ -18,9 +18,9 @@ use crate::media_admission::SenderBindingOutcome;
 use crate::media_kind::KindLabels;
 use crate::media_routing::teardown::{EndMeetingOutcome, QuiesceOutcome};
 use crate::media_routing::{
-    FloorAdoption, HeartbeatAnomaly, HeartbeatOutcome, HeartbeatTiming, MigrationOutcome,
-    MigrationPhase, PlannedTransferTiming, PolicyPushOutcome, RemovalTrigger, ReplacementTiming,
-    SettleOutcome, SuspicionOutcome, Unapplied, APPLIED_SEQUENCE_LAG_BUCKETS,
+    DisagreementThreshold, FloorAdoption, HeartbeatAnomaly, HeartbeatOutcome, HeartbeatTiming,
+    MigrationOutcome, MigrationPhase, PlannedTransferTiming, PolicyPushOutcome, RemovalTrigger,
+    ReplacementTiming, SettleOutcome, SuspicionOutcome, Unapplied, APPLIED_SEQUENCE_LAG_BUCKETS,
 };
 use crate::media_signaling::{
     slot_state_label, CapabilityOutcome, ClientMuteFanoutOutcome, DirectiveOutcome, MuteOutcome,
@@ -96,6 +96,19 @@ fn configured_prometheus_builder(
             &heartbeat.detection_histogram_buckets(),
         )
         .map_err(|e| format!("Failed to set detection buckets: {e}"))?
+        // Required loss metric (story 4 MC-E): the contract's ratio buckets,
+        // and the client lead DERIVED from N (N/4 .. 5N: a client may notice
+        // a lag-held Impaired handler more than 2N before MC declares it).
+        .set_buckets_for_metric(
+            Matcher::Prefix("mc_media_handler_loss_prior_report_ratio".to_string()),
+            &LOSS_PRIOR_REPORT_RATIO_BUCKETS,
+        )
+        .map_err(|e| format!("Failed to set loss ratio buckets: {e}"))?
+        .set_buckets_for_metric(
+            Matcher::Prefix("mc_media_handler_loss_client_lead_seconds".to_string()),
+            &heartbeat.loss_lead_histogram_buckets(),
+        )
+        .map_err(|e| format!("Failed to set loss lead buckets: {e}"))?
         // Sent minus applied generation: integer counts, not seconds.
         .set_buckets_for_metric(
             Matcher::Prefix("mc_media_handler_applied_sequence_lag".to_string()),
@@ -1252,6 +1265,154 @@ pub fn record_handler_suspicion(outcome: SuspicionOutcome) {
         KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
     )
     .increment(1);
+}
+
+/// The required loss metric at ONE Dead/Impaired declaration (story 4 MC-E;
+/// ADR-0039 §8, R-33), from the ONE snapshot the declaring assessment judged.
+///
+/// Metrics:
+/// - `mc_media_handler_loss_clients_total` (counter), labels `reported`
+///   (`before_declaration` | `not_reported`) x `key_custody`: the believed-
+///   connected clients (MH-reported) split by whether their LATEST status for
+///   the handler's ref was a loss received while the ref was in the set;
+/// - `mc_media_handler_loss_prior_report_ratio` (histogram, buckets
+///   [`LOSS_PRIOR_REPORT_RATIO_BUCKETS`]), `key_custody`: reported/connected,
+///   observed once per (meeting, handler) declaration — NOT observed with
+///   nobody connected (no 0/0), so its `_count` may trail the declarations;
+/// - `mc_media_handler_loss_client_lead_seconds` (histogram, buckets derived
+///   from N), `key_custody`: first counted loss report (MC receipt) ->
+///   declaration, observed only when at least one client reported.
+///
+/// Triggers `heartbeat_timeout` / `apply_lag` only, never `planned_transfer`
+/// (the caller's match). Client-asserted: forgeable by colluding
+/// participants, evidence only. No identity labels.
+pub fn record_handler_loss(
+    reported: u32,
+    not_reported: u32,
+    ratio: Option<f64>,
+    lead: Option<Duration>,
+) {
+    for (value, count) in [
+        (LOSS_REPORTED_BEFORE_DECLARATION, reported),
+        (LOSS_NOT_REPORTED, not_reported),
+    ] {
+        counter!(
+            "mc_media_handler_loss_clients_total",
+            "reported" => value,
+            KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+        )
+        .increment(u64::from(count));
+    }
+    if let Some(ratio) = ratio {
+        histogram!(
+            "mc_media_handler_loss_prior_report_ratio",
+            KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+        )
+        .record(ratio);
+    }
+    if let Some(lead) = lead {
+        histogram!(
+            "mc_media_handler_loss_client_lead_seconds",
+            KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+        )
+        .record(lead.as_secs_f64());
+    }
+}
+
+/// `reported` label value: the client's latest status was a loss.
+pub const LOSS_REPORTED_BEFORE_DECLARATION: &str = "before_declaration";
+/// `reported` label value: it was not.
+pub const LOSS_NOT_REPORTED: &str = "not_reported";
+
+/// `mc_media_handler_loss_prior_report_ratio` buckets: the contract's
+/// (telemetry-contract.md §MC), in base units 0..1.
+pub const LOSS_PRIOR_REPORT_RATIO_BUCKETS: [f64; 7] = [0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0];
+
+/// Count ONE client-loss disagreement episode (story 4 MC-E; ADR-0039 §8).
+///
+/// Metric: `mc_media_handler_client_loss_disagreements_total`
+/// Labels: `key_custody` (1)
+///
+/// Unit: one (meeting, handler) episode — a quorum (configured fraction AND
+/// minimum count) of the handler's believed-connected clients reporting loss
+/// for LONGER than N while the pair stays Live (Lagging and Draining
+/// included). A forged-heartbeat MH serving k meetings yields k; re-entry
+/// after the quorum is lost counts again (at most one per N per pair). Never
+/// a removal. Client-asserted, forgeable by `min_clients` colluding
+/// participants: not a trust signal. Detects a forged heartbeat only when the
+/// forger echoes the live connection ids (an empty list empties the
+/// denominator through the reconcile): zero is not evidence of no forgery.
+pub fn record_client_loss_disagreement() {
+    counter!(
+        "mc_media_handler_client_loss_disagreements_total",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .increment(1);
+}
+
+/// Count a handler's FIRST declaration on this MC (story 4 MC-E;
+/// ADR-0039 §8 round 4).
+///
+/// Metric: `mc_media_handler_first_declarations_total`
+/// Labels: `trigger` (`RemovalTrigger::ALL`) x `key_custody`
+///
+/// Once per HANDLER per MC however many meetings declare it (`HandlerCensus`);
+/// counts again only after the handler left every meeting's set. Past
+/// `MAX_RECENTLY_DECLARED` remembered handlers it OVER-counts (WARN logged).
+/// Handler ids are never labels.
+pub fn record_first_handler_declaration(trigger: RemovalTrigger) {
+    counter!(
+        "mc_media_handler_first_declarations_total",
+        TRIGGER_LABEL => trigger.label(),
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .increment(1);
+}
+
+/// Publish the distinct handlers across this MC's meetings (story 4 MC-E).
+///
+/// Metric: `mc_media_handlers_in_use` (gauge)
+/// Labels: `key_custody` (1)
+///
+/// RECOMPUTE-AND-SET from `HandlerCensus` (never inc/dec): the controller's
+/// health walk prunes and re-sets it (load-bearing), each membership change
+/// re-sets it for freshness, and boot sets 0. Registering and Active members
+/// count; a declared member counts until its removal's set write in the same
+/// actor turn.
+pub fn set_handlers_in_use(count: u64) {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a handler count above 2^53 is unreachable"
+    )]
+    let value = count as f64;
+    gauge!(
+        "mc_media_handlers_in_use",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .set(value);
+}
+
+/// Publish the client-loss disagreement threshold (story 4 MC-E).
+///
+/// Metrics: `mc_media_handler_client_loss_disagreement_ratio`
+/// (`MC_CLIENT_LOSS_DISAGREEMENT_FRACTION`) and
+/// `mc_media_handler_client_loss_disagreement_min_clients`
+/// (`MC_CLIENT_LOSS_DISAGREEMENT_MIN_CLIENTS`), gauges
+/// Labels: `key_custody` (1)
+///
+/// CONFIG ECHO set once at boot from the SAME threshold every meeting's
+/// `assess` reads.
+pub fn set_client_loss_disagreement(threshold: DisagreementThreshold) {
+    gauge!(
+        "mc_media_handler_client_loss_disagreement_ratio",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .set(threshold.fraction().get());
+    gauge!(
+        "mc_media_handler_client_loss_disagreement_min_clients",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .set(f64::from(threshold.min_clients().get()));
 }
 
 /// Publish how many meetings have NO handler in their set ("awaiting
@@ -2750,6 +2911,19 @@ pub fn zero_initialize_counters() {
     }
     // Boot value of the recompute-and-set gauge (the health walk re-sets it).
     set_meetings_without_handlers(0);
+    // Story 4 MC-E: the loss metric, disagreements, first declarations (every
+    // trigger) and the handler census gauge, present at 0.
+    for reported in [LOSS_REPORTED_BEFORE_DECLARATION, LOSS_NOT_REPORTED] {
+        counter!("mc_media_handler_loss_clients_total", "reported" => reported, KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+    }
+    // Registering the handle makes the series present (count 0).
+    let _ = histogram!("mc_media_handler_loss_prior_report_ratio", KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR);
+    let _ = histogram!("mc_media_handler_loss_client_lead_seconds", KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR);
+    counter!("mc_media_handler_client_loss_disagreements_total", KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+    for t in RemovalTrigger::ALL {
+        counter!("mc_media_handler_first_declarations_total", TRIGGER_LABEL => t.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+    }
+    set_handlers_in_use(0);
     for r in crate::media_dial::HandlerSetPushReason::ALL {
         counter!("mc_media_handler_set_pushes_total", "reason" => r.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
     }
@@ -3022,6 +3196,28 @@ mod tests {
             ));
         }
         present_at_zero(r#"mc_media_meetings_without_handlers{key_custody="operator"}"#);
+        // Story 4 MC-E: every new series and label cell.
+        for reported in [LOSS_REPORTED_BEFORE_DECLARATION, LOSS_NOT_REPORTED] {
+            present_at_zero(&format!(
+                r#"mc_media_handler_loss_clients_total{{reported="{reported}",key_custody="operator"}}"#
+            ));
+        }
+        present_at_zero(
+            r#"mc_media_handler_loss_prior_report_ratio_count{key_custody="operator"}"#,
+        );
+        present_at_zero(
+            r#"mc_media_handler_loss_client_lead_seconds_count{key_custody="operator"}"#,
+        );
+        present_at_zero(
+            r#"mc_media_handler_client_loss_disagreements_total{key_custody="operator"}"#,
+        );
+        for t in RemovalTrigger::ALL {
+            present_at_zero(&format!(
+                r#"mc_media_handler_first_declarations_total{{trigger="{}",key_custody="operator"}}"#,
+                t.label()
+            ));
+        }
+        present_at_zero(r#"mc_media_handlers_in_use{key_custody="operator"}"#);
         for t in RemovalTrigger::ALL {
             for o in EndMeetingOutcome::REMOVAL {
                 present_at_zero(&format!(
@@ -4402,6 +4598,52 @@ mod tests {
         snap.gauge("mc_media_handler_planned_transfer_margin_seconds")
             .with_labels(&[(KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR)])
             .assert_value(2.5);
+    }
+
+    /// Story 4 MC-E: the disagreement threshold echo publishes the SAME
+    /// `DisagreementThreshold` every meeting's `assess` reads (NON-default
+    /// values: 0.6 and 2).
+    #[test]
+    fn client_loss_disagreement_gauges_echo_the_config() {
+        let snap = MetricAssertion::snapshot();
+        set_client_loss_disagreement(DisagreementThreshold::new(
+            crate::media_routing::DisagreementFraction::new(0.6).unwrap(),
+            std::num::NonZeroU32::new(2).unwrap(),
+        ));
+        snap.gauge("mc_media_handler_client_loss_disagreement_ratio")
+            .with_labels(&[(KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR)])
+            .assert_value(0.6);
+        snap.gauge("mc_media_handler_client_loss_disagreement_min_clients")
+            .with_labels(&[(KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR)])
+            .assert_value(2.0);
+    }
+
+    /// Story 4 MC-E: one loss observation moves both `reported` cells by
+    /// their counts and observes the ratio; nobody connected observes no
+    /// ratio (no 0/0); no reporter observes no lead.
+    #[test]
+    fn record_handler_loss_splits_the_counts_and_skips_absent_observations() {
+        let kc = (KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR);
+        let snap = MetricAssertion::snapshot();
+        record_handler_loss(2, 3, Some(0.4), None);
+        snap.histogram("mc_media_handler_loss_prior_report_ratio")
+            .with_labels(&[kc])
+            .assert_observation_count(1);
+        snap.histogram("mc_media_handler_loss_client_lead_seconds")
+            .with_labels(&[kc])
+            .assert_unobserved();
+        snap.counter("mc_media_handler_loss_clients_total")
+            .with_labels(&[("reported", LOSS_REPORTED_BEFORE_DECLARATION), kc])
+            .assert_delta(2);
+        snap.counter("mc_media_handler_loss_clients_total")
+            .with_labels(&[("reported", LOSS_NOT_REPORTED), kc])
+            .assert_delta(3);
+
+        let snap = MetricAssertion::snapshot();
+        record_handler_loss(0, 0, None, None);
+        snap.histogram("mc_media_handler_loss_prior_report_ratio")
+            .with_labels(&[kc])
+            .assert_unobserved();
     }
 
     /// Story 4 MC-C: each migration outcome moves only its own (trigger,

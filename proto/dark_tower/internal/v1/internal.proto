@@ -1774,8 +1774,9 @@ enum ApplyRefusal {
 // MH->MC channel (the S6 residual, docs/TODO.md §Media Path Obligations).
 // `handler_id` and `mc_id` are SELF-ASSERTED by the sending MH pod: another MH
 // pod can forge heartbeats for a dead handler and suppress failover (ADR-0039
-// S1b-extended residual, detected by
-// `mc_media_handler_client_loss_disagreements_total`). The owner check above
+// S1b-extended residual; `mc_media_handler_client_loss_disagreements_total`
+// detects it only when the forger echoes live `connection_ids` — an empty-list
+// forgery also empties that counter's denominator, see below). The owner check above
 // is anti-misroute, not authentication. The same forgery reaches the
 // reconcile: a forged heartbeat with an EMPTY `connection_ids` retires every
 // connectivity key and handed-out binding that (meeting, handler) pair

@@ -1110,6 +1110,10 @@ mod tests {
             mh_replacement_min_interval_ms: 1000,
             mh_replacement_backoff_max_ms: 30000,
             planned_transfer_margin_ms: 5000,
+            client_loss_disagreement: crate::media_routing::DisagreementThreshold::new(
+                crate::media_routing::DisagreementFraction::new(0.5).unwrap(),
+                std::num::NonZeroU32::new(3).unwrap(),
+            ),
             max_receive_capability_declarations: 64,
             audio_encoding: crate::media_signaling::AudioEncoding::new(
                 proto_gen::dark_tower::signaling::v1::Codec::Opus,
@@ -1182,6 +1186,10 @@ mod tests {
             mh_replacement_min_interval_ms: 1000,
             mh_replacement_backoff_max_ms: 30000,
             planned_transfer_margin_ms: 5000,
+            client_loss_disagreement: crate::media_routing::DisagreementThreshold::new(
+                crate::media_routing::DisagreementFraction::new(0.5).unwrap(),
+                std::num::NonZeroU32::new(3).unwrap(),
+            ),
             max_receive_capability_declarations: 64,
             audio_encoding: crate::media_signaling::AudioEncoding::new(
                 proto_gen::dark_tower::signaling::v1::Codec::Opus,

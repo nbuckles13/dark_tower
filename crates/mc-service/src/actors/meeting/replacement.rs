@@ -337,7 +337,7 @@ impl MeetingActor {
                             }
                         }
                         self.replacement.state.granted(id, owed, now, timing);
-                        self.publish_handlerless();
+                        self.publish_handler_censuses();
                         // Spawns its push worker: RegisterMeeting (with the
                         // heartbeat interval and the public dial key) goes out
                         // before any client set can name it.
@@ -508,13 +508,22 @@ impl MeetingActor {
         }
     }
 
-    /// Re-set the awaiting-handler census for this meeting from its set.
-    pub(super) fn publish_handlerless(&self) {
+    /// THE membership-change hook: re-set BOTH handler censuses for this
+    /// meeting from its set — the awaiting-handler census and the MC-wide
+    /// `HandlerCensus` (every member, Registering and Active). Called at actor
+    /// start, on a grant joining the set and after every removal (the planned
+    /// cutover included); freshness only, the controller's walk is the
+    /// load-bearing publish.
+    pub(super) fn publish_handler_censuses(&self) {
         if let Some(wiring) = &self.wiring {
+            let handlers = self.media.handlers();
             wiring
                 .handlerless_census
-                .set(&self.meeting_id, self.media.handlers().is_empty());
+                .set(&self.meeting_id, handlers.is_empty());
             wiring.handlerless_census.publish();
+            wiring
+                .handler_census
+                .set(&self.meeting_id, handlers.ids().cloned().collect());
         }
     }
 

@@ -8,8 +8,12 @@
 use super::replacement::StartReason;
 use super::MeetingActor;
 use crate::actors::meeting_media::{Affected, HealthStep};
-use crate::media_routing::{HandlerHealth, HandlerId, RemovalTrigger, SuspicionOutcome};
+use crate::media_routing::{
+    client_disagreement_began, ClientLoss, HandlerHealth, HandlerId, RemovalTrigger,
+    SuspicionOutcome,
+};
 use crate::observability::metrics;
+use std::time::Duration;
 use tokio::time::Instant;
 use tracing::info;
 
@@ -44,9 +48,37 @@ impl MeetingActor {
         if self.end_cause.is_some() || self.cancel_token.is_cancelled() {
             return;
         }
-        for step in self.media.assess_all(Instant::now()) {
-            self.act_on_health(step).await;
+        let now = Instant::now();
+        let members: Vec<HandlerId> = self.media.handlers().ids().cloned().collect();
+        for member in members {
+            if let Some(step) = self.assess_member(&member, now) {
+                self.act_on_health(step).await;
+            }
         }
+    }
+
+    /// THE one per-member assessment (heartbeat path AND deadline arm): build
+    /// a FRESH client-loss snapshot at `now` and assess. The snapshot is the
+    /// one `assess` judges and, on a declaration, the one the required loss
+    /// metric records — never one cached from an earlier assessment.
+    fn assess_member(&mut self, member: &HandlerId, now: Instant) -> Option<HealthStep> {
+        let client_loss = self.client_loss(member);
+        self.media.assess_handler(member, now, client_loss)
+    }
+
+    /// The client-loss snapshot for one member (story 4 MC-E; ADR-0039 §8):
+    /// over the participants MC BELIEVES connected to it (MH-reported
+    /// connectivity), whose LATEST status for its ref is a loss received
+    /// while the ref was in the set (MC-D's store: a later CONNECTED
+    /// supersedes, a report after removal never entered it, the version is
+    /// correlation-only), stamped at MC receipt. Attribution is by
+    /// `handler_ref`, never by URL. A Registering member has no client ref,
+    /// so nobody can have reported losing it.
+    fn client_loss(&self, member: &HandlerId) -> ClientLoss {
+        let handler_ref = self.media.handlers().client_handler(member);
+        ClientLoss::tally(self.media.believed_connected(member).map(|participant| {
+            handler_ref.and_then(|r| self.client_statuses.loss_since(participant, r))
+        }))
     }
 
     /// Assess one member after its heartbeat was observed, act on the
@@ -54,7 +86,7 @@ impl MeetingActor {
     /// re-publish its current snapshot (ADR-0039 §2: replaces the re-assert's
     /// self-correction on a live MH; at most once per heartbeat, bounded by L).
     pub(super) async fn assess_after_heartbeat(&mut self, member: &HandlerId, accepted: bool) {
-        let Some(step) = self.media.assess_handler(member, Instant::now()) else {
+        let Some(step) = self.assess_member(member, Instant::now()) else {
             return;
         };
         if accepted && step.next.is_lagging() {
@@ -84,19 +116,66 @@ impl MeetingActor {
         if let Some(outcome) = SuspicionOutcome::of(&step.previous, &step.next) {
             metrics::record_handler_suspicion(outcome);
         }
+        // The client second opinion: counted once per episode, never acted on.
+        if client_disagreement_began(&step.previous, &step.next) {
+            metrics::record_client_loss_disagreement();
+        }
         if let (None, Some(declaration)) = (step.previous.declaration(), step.next.declaration()) {
             let trigger = declaration.trigger();
-            let detection = declaration.detection(Instant::now());
-            // Counted only when the removal happened: a refused removal (an MC
-            // invariant violation, logged at ERROR by `remove_handler`)
-            // removed nothing an operator could act on.
+            let now = Instant::now();
+            let detection = declaration.detection(now);
             if self
-                .remove_handler_completely(step.handler_id.as_str(), trigger)
+                .declare_and_remove(&step.handler_id, trigger, StartReason::Declared, detection)
                 .await
             {
-                metrics::record_handler_declaration(trigger, detection);
+                record_loss_observation(step.observations.client_loss, trigger, now);
             }
         }
+    }
+
+    /// THE declaration recorder and removal (both declaring paths: this
+    /// module's Dead/Impaired and the planned cutover). In order:
+    ///
+    /// 1. claim the handler on the MC-wide census BEFORE the removal writes
+    ///    the set without it — the order `HandlerCensus` dedupes on (see its
+    ///    doc; reordering under-counts nothing but double-counts a handler
+    ///    several meetings declare);
+    /// 2. run the removal transaction;
+    /// 3. only if it removed the handler, count
+    ///    `mc_media_handler_declarations_total{trigger}` + detection and, for
+    ///    the first claim, `mc_media_handler_first_declarations_total{trigger}`.
+    ///    A refused removal (an MC invariant violation, logged at ERROR by
+    ///    `remove_handler`) removed nothing an operator could act on, and
+    ///    RELEASES its census claim so later declarations still count.
+    pub(super) async fn declare_and_remove(
+        &mut self,
+        member: &HandlerId,
+        trigger: RemovalTrigger,
+        reason: StartReason,
+        detection: Duration,
+    ) -> bool {
+        let first = self
+            .wiring
+            .as_ref()
+            .is_some_and(|w| w.handler_census.first_declaration(member));
+        if !self
+            .remove_handler_for(member.as_str(), trigger, reason)
+            .await
+        {
+            // Nothing is counted for a refused removal, so the claim must not
+            // outlive it (the handler stays in this set, so no prune would).
+            if first {
+                if let Some(w) = &self.wiring {
+                    w.handler_census.release_claim(member);
+                }
+            }
+            return false;
+        }
+        metrics::record_handler_declaration(trigger, detection);
+        if first {
+            metrics::record_first_handler_declaration(trigger);
+        }
+        true
     }
 
     /// One INFO per health transition (never per heartbeat): ids in the log
@@ -123,6 +202,9 @@ impl MeetingActor {
             cause,
             detection_ms,
             serving_state = if o.draining { "DRAINING" } else { "SERVING" },
+            client_disagreement = step.next.is_client_disagreement(),
+            clients_connected = o.client_loss.connected(),
+            clients_reporting_loss = o.client_loss.reported(),
             apply_refusal = o.refusal.label(),
             lagging = step.next.is_lagging(),
             draining = step.next.is_draining(),
@@ -199,7 +281,7 @@ impl MeetingActor {
         self.media
             .spawn_removal_release(removed.endpoint, trigger, removed.pusher);
         let survivors = self.media.handlers().len();
-        self.publish_handlerless();
+        self.publish_handler_censuses();
         info!(
             target: "mc.actor.meeting",
             meeting_id = %self.meeting_id,
@@ -213,6 +295,25 @@ impl MeetingActor {
         );
         self.after_handler_removed(&HandlerId::new(wire_handler_id), trigger, reason);
         true
+    }
+}
+
+/// The required loss metric (story 4 MC-E; ADR-0039 §8), from the ONE
+/// snapshot the declaring assessment judged. Only `heartbeat_timeout` and
+/// `apply_lag` observe: a planned transfer never reaches `act_on_health` (it
+/// removes through `cut_over`), and this match keeps the exclusion visible in
+/// one place should that ever change.
+fn record_loss_observation(loss: ClientLoss, trigger: RemovalTrigger, now: Instant) {
+    match trigger {
+        RemovalTrigger::HeartbeatTimeout | RemovalTrigger::ApplyLag => {
+            metrics::record_handler_loss(
+                loss.reported(),
+                loss.not_reported(),
+                loss.ratio(),
+                loss.lead(now),
+            );
+        }
+        RemovalTrigger::PlannedTransfer => {}
     }
 }
 

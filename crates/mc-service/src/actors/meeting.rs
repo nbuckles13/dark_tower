@@ -32,7 +32,8 @@ use crate::media_admission::{
 use super::client_mute_fanout::ClientMuteFanout;
 use super::join_park::{JoinPark, ParkedJoin, ReleaseReason};
 use super::meeting_media::{
-    Affected, HandlerlessCensus, JoinMedia, MeetingMedia, MutedSourceCensus, RosterEntry,
+    Affected, HandlerCensus, HandlerlessCensus, JoinMedia, MeetingMedia, MutedSourceCensus,
+    RosterEntry,
 };
 use super::meeting_timers::{MeetingTimers, LIFETIME_TICK};
 use super::messages::{
@@ -855,6 +856,9 @@ pub struct MeetingWiring {
     pub muted_census: Arc<MutedSourceCensus>,
     /// The pod's awaiting-handler census (`mc_media_meetings_without_handlers`).
     pub handlerless_census: Arc<HandlerlessCensus>,
+    /// The MC-wide handler census (`mc_media_handlers_in_use`,
+    /// `mc_media_handler_first_declarations_total`; story 4 MC-E).
+    pub handler_census: Arc<HandlerCensus>,
     /// The process's in-flight teardown count, which a graceful shutdown
     /// waits on so a handed-off release is not dropped with the runtime.
     pub teardowns: Arc<crate::media_routing::teardown::TeardownTracker>,
@@ -1200,6 +1204,9 @@ impl MeetingActor {
             meeting_id = %self.meeting_id,
             "MeetingActor started"
         );
+        // The initial handler set (installed at creation) is a membership
+        // change for the MC-wide handler census.
+        self.publish_handler_censuses();
 
         // The lifetime check (disconnect-grace expiry), every LIFETIME_TICK.
         let mut grace_check = tokio::time::interval(LIFETIME_TICK);
@@ -3358,7 +3365,7 @@ impl MeetingActor {
             participant_id,
             reports,
             |r| handlers.is_active_ref(r),
-            Instant::now().into_std(),
+            Instant::now(),
         );
         match intake.repush {
             Repush::Granted => self.dial_refresh.mark(
@@ -3872,6 +3879,9 @@ impl MeetingActor {
             wiring.muted_census.publish();
             wiring.handlerless_census.set(&self.meeting_id, false);
             wiring.handlerless_census.publish();
+            wiring
+                .handler_census
+                .set(&self.meeting_id, std::collections::BTreeSet::new());
             let _ = wiring.lifecycle.send(MeetingLifecycleEvent::Ended {
                 meeting_id: self.meeting_id.clone(),
                 cause,
@@ -6266,6 +6276,7 @@ mod tests {
             lifecycle,
             muted_census: Arc::new(MutedSourceCensus::default()),
             handlerless_census: Arc::new(HandlerlessCensus::default()),
+            handler_census: Arc::new(HandlerCensus::default()),
             teardowns: Arc::default(),
             timers,
         };

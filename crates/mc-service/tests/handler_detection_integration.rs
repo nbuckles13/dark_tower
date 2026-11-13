@@ -33,6 +33,7 @@ use proto_gen::dark_tower::signaling::v1::{server_message, MediaKind, ReceiveCap
 use test_common::coordination;
 use test_common::media_dial::Token;
 use test_common::media_session::slot;
+use test_common::replacement_rig::health;
 use test_common::run_ready;
 use test_common::{
     advance_live, client_media_config, handler_set, heartbeat_timing, join_media_on, mh_handler,
@@ -168,10 +169,6 @@ impl Rig {
     }
 }
 
-async fn health(meeting: &MeetingActorHandle, h: &str) -> Option<&'static str> {
-    meeting.probe_handler_for_test(h).await.unwrap().health
-}
-
 fn handler_set_urls(queue: &[server_message::Message]) -> Vec<Vec<String>> {
     queue
         .iter()
@@ -219,7 +216,8 @@ async fn a_silent_handler_is_declared_dead_by_the_deadline_arm_alone() {
     advance_live(MS * 2).await;
     run_ready().await;
     assert_eq!(health(&meeting, H_A).await, None, "removed from the set");
-    // Histograms drain on read: assert them before any other read.
+    // Each histogram is queried once per snapshot (a query drains its own
+    // name+labels).
     snap.histogram("mc_media_handler_detection_seconds")
         .with_labels(&[("trigger", "heartbeat_timeout"), KC])
         .assert_observation_count(1);
@@ -652,7 +650,8 @@ async fn lag_held_past_l_is_impaired_and_the_lagging_handler_is_republished() {
     advance_live(lag_limit()).await;
     run_ready().await;
     assert_eq!(health(&meeting, H_A).await, None, "Impaired: removed");
-    // Histograms drain on read: assert them before any other read.
+    // Each histogram is queried once per snapshot (a query drains its own
+    // name+labels).
     snap.histogram("mc_media_handler_detection_seconds")
         .with_labels(&[("trigger", "apply_lag"), KC])
         .assert_observation_count(1);
@@ -679,8 +678,8 @@ async fn a_catch_up_before_l_clears_the_suspicion_without_a_declaration() {
     assert_eq!(health(&meeting, H_A).await, Some("healthy"));
     advance_live(lag_limit() * 2).await;
     assert_eq!(health(&meeting, H_A).await, Some("healthy"));
-    // Histograms drain on read: the unobserved check comes FIRST, before any
-    // other read of this snapshot, or it could pass vacuously.
+    // A histogram query drains its own name+labels: the unobserved check is
+    // this histogram's only query in the snapshot, so it cannot pass vacuously.
     snap.histogram("mc_media_handler_detection_seconds")
         .with_labels(&[("trigger", "apply_lag"), KC])
         .assert_unobserved();
@@ -771,7 +770,7 @@ async fn draining_is_recorded_and_removes_nothing() {
         vec!["Ka"]
     );
     assert!(r.ends().is_empty());
-    // Histograms drain on read: every unobserved histogram check first.
+    // Each histogram name+labels is queried once (a query drains its own).
     for t in ["heartbeat_timeout", "apply_lag"] {
         snap.histogram("mc_media_handler_detection_seconds")
             .with_labels(&[("trigger", t), KC])

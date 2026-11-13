@@ -1318,6 +1318,92 @@ Retired rather than left as a permanent zero. It counted egress plans for a slot
 
 ---
 
+## Client-Loss Evidence and Handler Census Metrics (ADR-0039 §8; story 4 MC-E: R-33, R-34)
+
+The user-required metric: at every Dead/Impaired declaration, how many of the clients MC believed connected to that handler had already reported losing it. Plus its opposite case (clients say gone, heartbeats say fine) and the handler-level own-path census. Every series is identity-free (no meeting, participant, connection, `handler_id`, `handler_ref`, slot or revision label; no cause label) and carries `key_custody="operator"`.
+
+**Interpretability condition (ADR-0039 §8).** The loss metric means something only when client loss-detection time (MH's QUIC idle timeout, `mh_media_transport_idle_timeout_seconds`) is roughly MC's N (`mc_media_handler_heartbeat_deadline_seconds`). Both are published and shown side by side on the dashboard row. Otherwise a low share reads as "clients don't notice" when it means "clients were configured to notice later".
+
+**Client-asserted evidence.** Every client-loss input is client-ASSERTED and diagnostic only: forgeable by `MC_CLIENT_LOSS_DISAGREEMENT_MIN_CLIENTS` or more colluding participants (or one user joining that many times). It is not a trust signal; promoting it to a removal trigger requires security review (quorum or per-client weighting).
+
+**The ONE snapshot.** Taken by the declaring assessment itself (heartbeat path or deadline wake, built fresh at that instant, never cached):
+- **Denominator**: participants with at least one live MH-reported connection key on the handler (server-observed, heartbeat-reconciled). A client whose MH-reported connection dropped before the declaration is OUTSIDE it, and so is a client that reported loss but was never MH-connected.
+- **Numerator**: of those, participants whose LATEST `MhConnectionStatus` for the handler's `handler_ref` is DISCONNECTED or FAILED, received while the ref was in the set. A later CONNECTED (a redial) supersedes; a report naming a ref outside the current set (removed, or never issued) is ignored at intake; `handler_set_version` is correlation-only, never a discard criterion. Attribution is by `handler_ref`, never by URL (two incarnations at one URL stay apart).
+- **Time**: MC RECEIPT time only (the meeting actor's clock at intake); client `observed_at` is never read.
+- **Never for `planned_transfer`** (asserted unobserved; a planned removal does not pass the Dead/Impaired transition site).
+
+### `mc_media_handler_loss_clients_total`
+- **Type**: Counter
+- **Description**: **Required metric, count.** The believed-connected clients at each `heartbeat_timeout` / `apply_lag` declaration, split by whether they had reported losing the handler
+- **Labels**:
+  - `reported`: `before_declaration` (latest status for the ref was a loss), `not_reported`
+  - `key_custody`: single value `operator`
+- **Cardinality**: 2; zero-initialised
+- **Usage**: the fleet client-weighted share over a range is `sum(increase(mc_media_handler_loss_clients_total{reported="before_declaration"}[$__range])) / sum(increase(mc_media_handler_loss_clients_total[$__range]))` (summed over meetings; never an average of rates)
+- **Recorded in**: `actors/meeting/health.rs::record_loss_observation` via `observability/metrics.rs::record_handler_loss`
+- **Dashboard**: MC Media Handlers - Clients at Declaration by Prior Loss Report; Client-Weighted Prior-Report Share (Client-Loss Evidence row)
+
+### `mc_media_handler_loss_prior_report_ratio`
+- **Type**: Histogram, buckets 0, .1, .25, .5, .75, .9, 1 (`LOSS_PRIOR_REPORT_RATIO_BUCKETS`)
+- **Description**: **Required metric, percent** (base units 0..1): reported / connected, observed ONCE per (meeting, handler) declaration — meeting-weighted. The policy evidence for promoting client connectivity to a trigger
+- **Labels**: `key_custody` (1)
+- **NOT observed with nobody connected** (no 0/0; both `loss_clients_total` cells add 0). So its `_count` may trail `mc_media_handler_declarations_total{trigger!="planned_transfer"}`: the gap is "declared with nobody connected".
+- **Recorded in**: as `mc_media_handler_loss_clients_total` (same call)
+- **Dashboard**: MC Media Handlers - Prior-Report Share Distribution (Client-Loss Evidence row)
+
+### `mc_media_handler_loss_client_lead_seconds`
+- **Type**: Histogram, buckets derived from N: N/4, N/2, N, 1.5N, 2N, 3N, 5N (`HeartbeatTiming::loss_lead_histogram_buckets`)
+- **Description**: The earliest counted client loss report (MC receipt) → the declaration. Observed only when at least one client reported
+- **Labels**: `key_custody` (1)
+- **Semantics**: the receipt is the first report of that client's current loss run (DISCONNECTED → FAILED keeps it; CONNECTED clears it); never negative (saturating). Under the interpretability condition a crash lead is usually under N; an `apply_lag` (Impaired past L = 2N) lead can exceed 2N, hence the range.
+- **Recorded in**: as `mc_media_handler_loss_clients_total` (same call)
+- **Dashboard**: MC Media Handlers - Client Lead Before Declaration p50/p95 vs N (Client-Loss Evidence row)
+
+### `mc_media_handler_client_loss_disagreements_total`
+- **Type**: Counter
+- **Description**: The client second opinion disagreeing with the heartbeats: at least `MC_CLIENT_LOSS_DISAGREEMENT_FRACTION` AND at least `MC_CLIENT_LOSS_DISAGREEMENT_MIN_CLIENTS` of a handler's believed-connected clients report losing it, held for LONGER than N (the one `expired` boundary: N + 1 ms), while the pair stays Live (Lagging and Draining included — its heartbeats keep it from Dead). The false-negative half of the evidence and a PARTIAL forged-heartbeat (S1b) detector: it detects only a forger that keeps reporting the live connection ids: a forged heartbeat with empty or wrong connection_ids retires the believed-connected set through the remove-only reconcile, so the denominator empties and the counter stays 0. Zero is NOT evidence of no forgery (story 4 MC-E security finding; a non-erasable denominator is a `docs/TODO.md` §Media Path Obligations item). The declaration histogram cannot see a forgery at all, because a forged heartbeat suppresses the declaration
+- **Labels**: `key_custody` (1); zero-initialised
+- **Unit**: one (meeting, handler) EPISODE, counted on its start. A forged-heartbeat MH serving k meetings on this MC yields k. The episode ends when an assessment no longer sees the quorum (a CONNECTED supersedes, MH reports the clients Disconnected so they leave the denominator, participants leave) or the pair is declared/removed; the quorum returning is a new episode, counted again — at most one per N per pair. The quorum is noticed at assessment instants (every accepted heartbeat, ≈ N/3, and deadline wakes); a client report never triggers an assessment by itself.
+- **Never a removal** in this story: tuning the threshold changes only this counter. Client-asserted, forgeable by `min_clients` colluding participants: not a trust signal.
+- **Logs**: the episode's start and end are health transitions ("Media handler health changed", `client_disagreement`, `clients_connected`, `clients_reporting_loss`; ids in the log only)
+- **Recorded in**: `actors/meeting/health.rs::act_on_health` via `observability/metrics.rs::record_client_loss_disagreement`
+- **Dashboard**: MC Media Handlers - Client-Loss Disagreements (Client-Loss Evidence row)
+
+### `mc_media_handler_client_loss_disagreement_ratio`
+- **Type**: Gauge (config echo)
+- **Description**: `MC_CLIENT_LOSS_DISAGREEMENT_FRACTION`, in (0, 1] (shipped 0.5): the share of a handler's believed-connected clients that must report loss for a disagreement
+- **Labels**: `key_custody` (1)
+- **Recorded in**: `webtransport/server.rs::WebTransportServer::new` via `observability/metrics.rs::set_client_loss_disagreement` (the SAME `DisagreementThreshold` every meeting's `assess` reads)
+- **Dashboard**: MC Media Handlers - Disagreement Threshold (Client-Loss Evidence row)
+
+### `mc_media_handler_client_loss_disagreement_min_clients`
+- **Type**: Gauge (config echo)
+- **Description**: `MC_CLIENT_LOSS_DISAGREEMENT_MIN_CLIENTS`, in [1, 1000] (shipped 3): the minimum count of reporting clients for a disagreement
+- **Labels**: `key_custody` (1)
+- **Recorded in**: as `mc_media_handler_client_loss_disagreement_ratio` (same call)
+- **Dashboard**: MC Media Handlers - Disagreement Threshold (Client-Loss Evidence row)
+
+### `mc_media_handler_first_declarations_total`
+- **Type**: Counter
+- **Description**: A HANDLER's first declaration on this MC, however many meetings declare it — the only handler-level declaration count (every other detection series is per (meeting, handler)). Feeds the MC-own-path signature and the crash-rate warning (OBS-ALERTS)
+- **Labels**:
+  - `trigger`: `heartbeat_timeout`, `apply_lag`, `planned_transfer` (the shared `RemovalTrigger` vocabulary, as `mc_media_handler_declarations_total`)
+  - `key_custody`: single value `operator`
+- **Cardinality**: 3; zero-initialised
+- **Semantics**: `HandlerCensus` (`actors/meeting_media.rs`) remembers recently-declared handler ids while some meeting's set still holds them; a handler that left every meeting's set and is later re-added and declared counts again. Counted only when the removal happened. **Over-counts past the cap** (`MAX_RECENTLY_DECLARED` = 4096 remembered handlers, a WARN logged once per overflow with the cap and count only): a jump here beside a WARN is the cap, not an MC-own-path signal. Handler ids are never labels.
+- **Recorded in**: `actors/meeting/health.rs::declare_and_remove` via `observability/metrics.rs::record_first_handler_declaration`
+- **Dashboard**: MC Media Handlers - First Declarations by Trigger vs Handlers in Use (Client-Loss Evidence row)
+
+### `mc_media_handlers_in_use`
+- **Type**: Gauge (recompute-and-set)
+- **Description**: Distinct handlers across this MC's meetings (Registering and Active members) — the denominator of the MC-own-path signature
+- **Labels**: `key_custody` (1)
+- **Recompute-and-set, never inc/dec**: `HandlerCensus` (the `MeetingCensus` pattern), keyed by meeting id. The controller's `check_meeting_health` walk prunes dead meetings and re-sets it (LOAD-BEARING); every membership change (actor start, grant, removal incl. a planned cutover) re-sets it for freshness; teardown clears the meeting; boot sets 0. A declared member counts until its removal's set write in the same actor turn.
+- **Recorded in**: `observability/metrics.rs::set_handlers_in_use`
+- **Dashboard**: MC Media Handlers - First Declarations by Trigger vs Handlers in Use (Client-Loss Evidence row)
+
+---
+
 ## Handler Set & `media_dial` Credential Metrics (ADR-0039 §5; story 4 MC-D)
 
 MC signs a short-lived per-handler `media_dial` credential itself (per-meeting

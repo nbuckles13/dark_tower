@@ -11,14 +11,17 @@ use std::time::Duration;
 use super::media_dial::Token;
 use super::media_session::slot;
 use super::{
-    client_media_config, coordination, handler_set, heartbeat_timing, join_media_with_gc,
-    mh_handler, run_ready, MhEvent, MockMhRegistrationClient,
+    client_loss_disagreement, client_media_config, coordination, handler_set, heartbeat_timing,
+    join_media_configured, media_dial_timing, mh_handler, run_ready, MhEvent,
+    MockMhRegistrationClient,
 };
 use ::common::observability::testing::MetricSnapshot;
 use mc_service::actors::{JoinMedia, MeetingActorHandle, MeetingControllerActorHandle};
 use mc_service::grpc::gc_client::AcquireResult;
 use mc_service::grpc::McMediaCoordinationService;
-use mc_service::media_routing::{HandlerEndpoint, HandlerId, MigrationOutcome, RemovalTrigger};
+use mc_service::media_routing::{
+    DisagreementThreshold, HandlerEndpoint, HandlerId, MigrationOutcome, RemovalTrigger,
+};
 use mc_service::media_signaling::ReceiveCapabilityDeclaration;
 use mc_test_utils::ScriptedGc;
 use proto_gen::dark_tower::signaling::v1::{server_message, MediaKind, ReceiveCapability};
@@ -41,6 +44,9 @@ pub struct Rig {
     pub svc: McMediaCoordinationService,
     pub mh: Arc<MockMhRegistrationClient>,
     pub gc: Arc<ScriptedGc>,
+    /// The client-loss disagreement threshold joins install (story 4 MC-E):
+    /// the shipped one unless a test sets a NON-default one.
+    pub disagreement: DisagreementThreshold,
 }
 
 pub fn rig_with_cap(cap: u32) -> Rig {
@@ -53,6 +59,7 @@ pub fn rig_with_cap(cap: u32) -> Rig {
         svc,
         mh,
         gc: Arc::new(ScriptedGc::with_cap(cap)),
+        disagreement: client_loss_disagreement(),
     }
 }
 
@@ -111,7 +118,14 @@ impl Rig {
     }
 
     pub fn media(&self) -> JoinMedia {
-        let mut media = join_media_with_gc(Arc::clone(&self.mh), Arc::clone(&self.gc));
+        let mh: Arc<dyn mc_service::grpc::MhRegistrationClient> = Arc::clone(&self.mh) as _;
+        let mut media = join_media_configured(
+            mh,
+            heartbeat_timing(),
+            media_dial_timing(),
+            Arc::clone(&self.gc),
+            self.disagreement,
+        );
         media.demand = ReceiveCapabilityDeclaration::parse(
             &ReceiveCapability {
                 slots: vec![slot(0, MediaKind::Audio)],
@@ -124,6 +138,19 @@ impl Rig {
     }
 
     pub async fn join(&self, meeting: &str, p: &str) -> mpsc::Receiver<bytes::Bytes> {
+        self.join_with_set(meeting, p).await.0
+    }
+
+    /// [`Self::join`], also returning the `JoinResponse` handler set (the
+    /// joiner's first set; later sets arrive on the queue).
+    pub async fn join_with_set(
+        &self,
+        meeting: &str,
+        p: &str,
+    ) -> (
+        mpsc::Receiver<bytes::Bytes>,
+        proto_gen::dark_tower::signaling::v1::MediaHandlerSet,
+    ) {
         let (tx, rx) = mpsc::channel::<bytes::Bytes>(1024);
         let reply = self
             .c
@@ -140,9 +167,9 @@ impl Rig {
             )
             .await
             .unwrap();
-        reply.await.unwrap().unwrap();
+        let joined = reply.await.unwrap().unwrap();
         run_ready().await;
-        rx
+        (rx, joined.handler_set)
     }
 
     pub async fn connect(&self, meeting: &str, p: &str, h: &str, conn: &str) -> u32 {
@@ -158,6 +185,12 @@ impl Rig {
             .filter(|e| matches!(e, MhEvent::Register { mh_grpc_endpoint, .. } if *mh_grpc_endpoint == endpoint))
             .count()
     }
+}
+
+/// The handler's health label in the meeting (`None` once it left the set).
+/// THE one reader the actor-level handler suites share.
+pub async fn health(meeting: &MeetingActorHandle, h: &str) -> Option<&'static str> {
+    meeting.probe_handler_for_test(h).await.unwrap().health
 }
 
 /// Every `MediaHandlerSet` on the queue: (urls, token audiences).

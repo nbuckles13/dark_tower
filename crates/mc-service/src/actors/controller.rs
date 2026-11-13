@@ -20,7 +20,7 @@ use crate::errors::McError;
 use crate::media_routing::PolicyGenerations;
 
 use super::meeting::{MeetingActor, MeetingActorHandle, MeetingWiring};
-use super::meeting_media::{HandlerlessCensus, MutedSourceCensus};
+use super::meeting_media::{HandlerCensus, HandlerlessCensus, MutedSourceCensus};
 use super::meeting_timers::MeetingTimers;
 use super::messages::{
     ControllerMessage, ControllerStatus, JoinResult, MeetingEndCause, MeetingInfo,
@@ -424,6 +424,9 @@ pub struct MeetingControllerActor {
     muted_census: Arc<MutedSourceCensus>,
     /// The pod's awaiting-handler census, recomputed on every health walk.
     handlerless_census: Arc<HandlerlessCensus>,
+    /// The MC-wide handler census (story 4 MC-E), pruned and recomputed on
+    /// every health walk.
+    handler_census: Arc<HandlerCensus>,
     /// Told when a meeting has ended and its handlers are released.
     meeting_ended: Arc<dyn MeetingEndedNotifier>,
     /// The lifetime timers handed to every meeting actor's wiring
@@ -543,6 +546,7 @@ impl MeetingControllerActor {
             tearing_down: HashMap::new(),
             muted_census: Arc::new(MutedSourceCensus::default()),
             handlerless_census: Arc::new(HandlerlessCensus::default()),
+            handler_census: Arc::new(HandlerCensus::default()),
             meeting_ended: Arc::new(NoMeetingEndedNotifier),
             timers: MeetingTimers::default(),
             teardowns: Arc::default(),
@@ -815,6 +819,7 @@ impl MeetingControllerActor {
             lifecycle: self.lifecycle_tx.clone(),
             muted_census: Arc::clone(&self.muted_census),
             handlerless_census: Arc::clone(&self.handlerless_census),
+            handler_census: Arc::clone(&self.handler_census),
             teardowns: Arc::clone(&self.teardowns),
             timers: self.timers,
         };
@@ -1194,6 +1199,11 @@ impl MeetingControllerActor {
         self.handlerless_census
             .retain(|id| meetings.contains_key(id));
         self.handlerless_census.publish();
+        // The same LOAD-BEARING prune-and-publish for the MC-wide handler
+        // census (story 4 MC-E): a dead meeting's handlers leave
+        // `mc_media_handlers_in_use`, and the recently-declared set is pruned
+        // to the handlers still in some meeting's set.
+        self.handler_census.retain(|id| meetings.contains_key(id));
     }
 
     /// Park `create` behind `meeting_id`'s teardown fence (the caller has

@@ -686,9 +686,9 @@ mod tests {
             report(),
         )
         .await;
-        // Histogram FIRST: every snapshot read drains histogram observations
-        // (common::observability::testing, "drain-on-read"), so a counter
-        // query before this one would consume the observation and read 0.
+        // One query of this histogram per snapshot: a histogram query drains
+        // its own name+labels (common::observability::testing, "Histograms
+        // DRAIN on their OWN read"); other reads never drain it.
         snap.histogram("mc_meeting_kek_rotation_duration_seconds")
             .assert_observation_count(1);
         snap.counter("mc_meeting_kek_pushes_total")

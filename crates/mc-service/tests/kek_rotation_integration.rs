@@ -22,13 +22,13 @@
 //! spawned tasks. On `current_thread` they share the test thread; on a
 //! multi-thread runtime they would land on a worker and be silently missed.
 //!
-//! # At most ONE histogram query per snapshot, and it goes FIRST
+//! # Histogram queries drain their own name+labels
 //!
-//! Every snapshot read drains ALL histogram observations — any query, of any
-//! kind, empties every histogram. So a histogram query placed after any other
-//! query reads 0, and a second histogram query always does. The rotation
-//! duration histogram is therefore asserted in the collector's own unit test
-//! (`media_admission::rotation`), not here.
+//! A histogram query drains the observations matching ITS name and labels
+//! (`common::observability::testing`, "Histograms DRAIN on their OWN read"),
+//! so each histogram is asserted at most once per snapshot; reads of other
+//! metrics never drain it. The rotation duration histogram is asserted in the
+//! collector's own unit test (`media_admission::rotation`) and once below.
 //!
 //! Registration cost: none (actor-level, no AC).
 
@@ -237,8 +237,8 @@ async fn rotation_on_leave_reaches_exactly_the_post_removal_members() {
     handle.cancel();
 }
 
-/// A rotation records how long it took to reach every recipient. Its own
-/// snapshot: only one histogram query per snapshot can read correctly.
+/// A rotation records how long it took to reach every recipient (one query
+/// of the histogram per snapshot: a query drains its own name+labels).
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn a_rotation_records_its_duration() {
     let snap = MetricAssertion::snapshot();

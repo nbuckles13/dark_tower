@@ -362,6 +362,10 @@ fn test_config(gc_url: &str) -> Config {
         mh_replacement_min_interval_ms: 1000,
         mh_replacement_backoff_max_ms: 30000,
         planned_transfer_margin_ms: 5000,
+        client_loss_disagreement: mc_service::media_routing::DisagreementThreshold::new(
+            mc_service::media_routing::DisagreementFraction::new(0.5).unwrap(),
+            std::num::NonZeroU32::new(3).unwrap(),
+        ),
         max_receive_capability_declarations: media.max_receive_capability_declarations,
         audio_encoding: media.audio_encoding,
         video_encoding: media.video_encoding,

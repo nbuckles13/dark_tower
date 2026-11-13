@@ -153,6 +153,7 @@ impl AcceptLoopRig {
             Arc::new(mc_test_utils::ScriptedGc::with_cap(16)),
             super::replacement_timing(),
             super::planned_transfer_timing(),
+            super::client_loss_disagreement(),
             max_connections,
             std::time::Duration::from_secs(10),
             cancel_token.clone(),
