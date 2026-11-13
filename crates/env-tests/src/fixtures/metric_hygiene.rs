@@ -253,6 +253,57 @@ pub const STORY_3_EAGER_MC_SERIES: &[&str] = &[
     "mc_media_mute_requests_rejected_total",
 ];
 
+/// Story 4 (OBS-ALERTS) MC series present from MC boot, the one list 33's
+/// APPLY check gates the story-4 MC rules on. Each is zero-initialised over
+/// its FULL label domain by
+/// `crates/mc-service/src/observability/metrics.rs::zero_initialize_counters`
+/// (`mc_media_handler_migrations_total` over every `RemovalTrigger` x
+/// `MigrationOutcome`, `mc_register_meeting_total` over
+/// `REGISTER_MEETING_STATUSES`, ...), or is a gauge set at zero there
+/// (`mc_media_meetings_without_handlers`, `mc_media_handlers_in_use`). That
+/// module's `zero_init_renders_counters_present_at_zero` unit test pins every
+/// cell, so a selector here that matches nothing live is a typo or an unscraped
+/// pod, never "not emitted yet".
+pub const STORY_4_EAGER_MC_SERIES: &[&str] = &[
+    "mc_media_meetings_without_handlers",
+    "mc_media_handlers_in_use",
+    "mc_media_handler_migrations_total",
+    "mc_media_handler_first_declarations_total",
+    "mc_media_handler_client_loss_disagreements_total",
+    "mc_media_handler_connected_set_corrections_total",
+    "mc_media_handler_heartbeats_total",
+    "mc_media_handler_removal_releases_total",
+    "mc_media_handler_heartbeat_anomalies_total",
+    "mc_register_meeting_total",
+];
+
+/// Story 4 (OBS-ALERTS) GC series present on every serving GC replica. The
+/// counters are zero-initialised by
+/// `crates/gc-service/src/observability/metrics.rs::zero_initialize_counters`:
+/// `gc_mh_registrations_total` over every `MhRegistrationOutcome`,
+/// `gc_mh_load_reports_total` over `MH_LOAD_REPORT_OUTCOMES`, and
+/// `gc_mh_replacement_requests_total` over every EMITTED
+/// (trigger, outcome, gc_view) cell (`is_emitted_replacement_combination`).
+/// `gc_mh_available` is NOT boot-initialised. It is written on every
+/// health-checker recompute for every (`region` in {own, "other"}) x state
+/// cell, so it is present after GC's first tick. Layer 7 starts long after
+/// that, and 03 already depends on it.
+pub const STORY_4_EAGER_GC_SERIES: &[&str] = &[
+    "gc_mh_available",
+    "gc_mh_registrations_total",
+    "gc_mh_load_reports_total",
+    "gc_mh_replacement_requests_total",
+];
+
+/// kube-state-metrics series a rule selects (`MHPodRestartingFrequently`).
+/// This is neither a service boot series nor a client series: KSM
+/// (`infra/kubernetes/observability/kube-state-metrics.yaml`) publishes
+/// `kube_pod_container_status_restarts_total` for EVERY container of every live
+/// pod, at 0 before any restart. While an MH pod runs, the selector
+/// `{container="mh-service"}` must match, so it is GATED. If it is empty, KSM is
+/// not scraped or the container name drifted from the MH template.
+pub const KUBE_STATE_SERIES: &[&str] = &["kube_pod_container_status_restarts_total"];
+
 /// R4 identity vocabulary, CONTAINMENT half: nouns long enough to match as a
 /// substring of the lower-cased key (`senderIndex`, `x_stream_id`).
 ///

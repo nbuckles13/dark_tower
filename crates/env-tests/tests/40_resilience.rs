@@ -59,7 +59,7 @@ use env_tests::fixtures::metrics::{
     format_instance_map, heartbeat_interval_of, mc_heartbeat_deadline, mc_meetings_active_total,
     mc_planned_transfer_margin, mc_replacement_retry_budget, planned_cutover_ceiling,
     poll_until_any_instance_above, poll_until_pinned_instance, settled_baseline, sum_over_pods,
-    InstanceCounters, BASELINE_SETTLE_BOUND, PINNED_METRIC_BOUND,
+    InstanceCounters, BASELINE_SETTLE_BOUND, MH_OWNER_SILENCE_TIMEOUT_GAUGE, PINNED_METRIC_BOUND,
 };
 use env_tests::fixtures::mh_address::assert_addresses_unique;
 use env_tests::fixtures::mh_pool::{
@@ -200,7 +200,6 @@ const MH_RELEASES_OWNER_SILENCE: &str =
     r#"sum by (instance) (mh_media_handler_releases_total{trigger="owner_silence"})"#;
 const MH_RELEASED_VERDICTS: &str =
     r#"sum by (instance) (mh_mc_heartbeat_verdicts_total{outcome="released"})"#;
-const MH_OWNER_SILENCE_TIMEOUT: &str = "mh_media_meeting_owner_silence_timeout_seconds";
 const MH_REGISTERED_MEETINGS: &str = "sum by (instance) (mh_media_registered_meetings)";
 const MC_MIGRATIONS_COMPLETED_HT: &str = r#"sum by (instance) (mc_media_handler_migrations_total{trigger="heartbeat_timeout",outcome="completed"})"#;
 // Summed over gc_view (never pinned: GC's view of the killed MH is healthy or
@@ -662,7 +661,7 @@ async fn zombie_leg(pool: Arc<MhPool>, prom_url: &str) {
     let owner_silence = Duration::from_secs_f64(
         pinned(
             &prom,
-            MH_OWNER_SILENCE_TIMEOUT,
+            MH_OWNER_SILENCE_TIMEOUT_GAUGE,
             &pod_ip,
             "ZOMBIE PRECONDITION (owner-silence-gauge)",
         )

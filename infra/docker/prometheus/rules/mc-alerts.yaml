@@ -150,10 +150,17 @@ groups:
       # teaches the next reader that the guard is decorative.
       #
       # `for: 0m` WITH A 15m increase() WINDOW: the occurrence IS the signal.
-      # Since story 2 any structural change re-pushes, so a meeting WITH churn
-      # may clear by itself, while a QUIESCENT diverged meeting stays
-      # blackholed until something changes, and a `for:` delay would only add
-      # media-dark time for exactly the meetings nobody is touching. The one EXPECTED
+      # Since story 4 (ADR-0039 §2) the per-meeting heartbeat carries MH's
+      # applied generation: while a (meeting, handler) pair lags, MC
+      # re-publishes on every heartbeat, and a lag held past L (= 2N) declares
+      # the pair Impaired (trigger="apply_lag") and migrates the meeting off
+      # it, quiescent or not. So generation_mismatch / no_applied_generation
+      # now self-repair within about L + one migration; a contract-fault apply
+      # refusal (apply_refused_*) suppresses the lag clock instead and is
+      # MCMediaHandlerHeartbeatAnomalies'. transport_mode_mismatch is NOT
+      # visible to the heartbeat's generation and can still stay dark until a
+      # structural change re-pushes. A `for:` delay would only add media-dark
+      # time to the arm that does not self-repair. The one EXPECTED
       # non-match, an MC restart under a live meeting (the handler still holds
       # the pre-restart MC's generation), never reaches this counter: it is
       # recorded on mc_media_policy_generation_adoptions_total INSTEAD, at one
@@ -172,8 +179,8 @@ groups:
           component: media-control-plane
         annotations:
           summary: "MC and MH disagree about the applied media policy generation ({{ $value }} in 15m)"
-          description: "MC could not confirm its forwarding policy is live on MH. ADR-0036 §8 calls this shape a partial blackhole reporting healthy: MH forwards under stale or absent policy while up, readiness, the gRPC result and the channel all read green. SPLIT ON THE OUTCOME LABEL FIRST - the values have different first moves. generation_mismatch = MH applied an older generation (its apply path failed); no_applied_generation = MH echoed nothing (an MH build predating the echo, i.e. a rollout skew, or the apply never ran - confirm the image before treating it as an apply failure); transport_mode_mismatch = the separate two-ends-must-agree echo failing, a different remedy, routed from the same runbook; since story 3 it is PER STREAM: a stream MC sent is absent from MH's applied_source_streams, echoed with no transport mode, or echoed with a different mode. The arm and the FIRST mismatching stream are on MC's ERROR line \"MH did not confirm the forwarding policy\" (target mc.grpc.mh_client) as fields echo_arm (absent_from_echo, echoed_unspecified, mode_differs) and echo_stream_number; echo_arm=none with echo_stream_number=-1 are the no-echo-mismatch sentinels, never a stream. Its usual cause is a cutover applied out of the required order (config -> MH -> MC -> SDK) or an MH build that predates per-stream echo; check which component rolled last. SINCE STORY 2, ANY STRUCTURAL CHANGE RE-PUSHES: a join, leave, capability declaration or mute re-publishes to every handler and an unconfirmed push is re-sent, so a meeting with churn often clears on the next roster event - check whether the counter stopped moving before acting, and force a structural change only if the meeting is quiescent. A sustained per-(meeting, handler) lag shows on mc_media_handler_applied_sequence_lag. An MC restart against a live handler is NOT counted here: MC adopts MH's generation as a floor and re-pushes above it, and records that on mc_media_policy_generation_adoptions_total instead - deliberately under no outcome label, so read that counter (and the adoption WARN at mc.register_meeting.trigger) alongside the split. A generation_mismatch with applied > sent that DOES reach this alert is a FAILED adoption or a higher echo after a confirm (e.g. the u64::MAX ratchet wedge) - not rollout noise. The selector is negated, so an outcome added later fires here rather than falling silently outside the alert."
-          impact: "Participants in the affected meeting get no audio and/or video while the client stays connected and the UI reads healthy. Blast radius is per (meeting, handler), not fleet-wide. DO NOT RESTART MH as a remedy: it sheds every media session on the pod, recovers none of the already-dark ones, and destroys the evidence."
+          description: "MC could not confirm its forwarding policy is live on MH. ADR-0036 §8 calls this shape a partial blackhole reporting healthy: MH forwards under stale or absent policy while up, readiness, the gRPC result and the channel all read green. SPLIT ON THE OUTCOME LABEL FIRST - the values have different first moves. generation_mismatch = MH applied an older generation (its apply path failed); no_applied_generation = MH echoed nothing (an MH build predating the echo, i.e. a rollout skew, or the apply never ran - confirm the image before treating it as an apply failure); transport_mode_mismatch = the separate two-ends-must-agree echo failing, a different remedy, routed from the same runbook; since story 3 it is PER STREAM: a stream MC sent is absent from MH's applied_source_streams, echoed with no transport mode, or echoed with a different mode. The arm and the FIRST mismatching stream are on MC's ERROR line \"MH did not confirm the forwarding policy\" (target mc.grpc.mh_client) as fields echo_arm (absent_from_echo, echoed_unspecified, mode_differs) and echo_stream_number; echo_arm=none with echo_stream_number=-1 are the no-echo-mismatch sentinels, never a stream. Its usual cause is a cutover applied out of the required order (config -> MH -> MC -> SDK) or an MH build that predates per-stream echo; check which component rolled last. SINCE STORY 4 THE GENERATION ARMS SELF-REPAIR: the per-meeting heartbeat carries MH's applied generation, MC re-publishes to a lagging handler on every heartbeat, and a lag held past L (= 2N) declares it Impaired (trigger=apply_lag, mc_media_handler_declarations_total) and migrates the meeting off it - check whether the counter stopped moving and whether an apply_lag declaration followed before acting. transport_mode_mismatch is NOT seen by the heartbeat's generation and can stay dark until a structural change (join, leave, capability declaration, mute) re-pushes. A sustained per-(meeting, handler) lag shows on mc_media_handler_applied_sequence_lag. An MC restart against a live handler is NOT counted here: MC adopts MH's generation as a floor and re-pushes above it, and records that on mc_media_policy_generation_adoptions_total instead - deliberately under no outcome label, so read that counter (and the adoption WARN at mc.register_meeting.trigger) alongside the split. A generation_mismatch with applied > sent that DOES reach this alert is a FAILED adoption or a higher echo after a confirm (e.g. the u64::MAX ratchet wedge) - not rollout noise. The selector is negated, so an outcome added later fires here rather than falling silently outside the alert."
+          impact: "Participants in the affected meeting get no audio and/or video while the client stays connected and the UI reads healthy. Blast radius is per (meeting, handler), not fleet-wide. DO NOT RESTART MH as a remedy: it ends every media session on the pod (its meetings then migrate) and destroys the evidence; the generation arms self-repair through apply_lag migration anyway."
           runbook_url: "docs/runbooks/mc-incident-response.md#scenario-15-media-generation-divergence"
 
       # ====================================================================
@@ -344,6 +351,77 @@ groups:
           description: "The oldest un-rotated departure in some meeting on {{ $labels.instance }} is older than twice the rotation window. Fork FIRST on mc_meeting_kek_rotation_failures_total{reason}: rng (overwhelmingly the likelier arm; CSPRNG failure, retried after W, confirm it clears) versus generation_exhausted (the meeting's u16 KEK generation is at its ceiling; permanent, this page will not clear until that meeting ends; effectively unreachable, ~22.7 days of uninterrupted rotation at the W floor). If NEITHER is moving, the rotation is not being attempted: suspect a wedged meeting actor and read mc_actor_mailbox_depth. Then confirm mc_meeting_kek_rotation_window_seconds matches the ConfigMap's MC_KEK_ROTATION_DEBOUNCE_SECONDS on this pod."
           impact: "CONFIDENTIALITY, not media quality: at least one departed participant still holds a KEK that opens every current participant's media in that meeting. When this fires the exposure bound W has ALREADY been exceeded by roughly 2x, for at least 2 minutes; it is not a leading indicator."
           runbook_url: "docs/runbooks/mc-incident-response.md#scenario-19-kek-rotation-stalled"
+
+      # ------------------------------------------------------------------
+      # ADR-0031 block — MCMediaMeetingsAwaitingHandler (story 4 OBS-ALERTS,
+      # R-35; ADR-0039 §3, §8; telemetry contract §Alerts PAGE)
+      #
+      # WHAT IT MEANS: some meeting on this MC has had ZERO live handlers for
+      # longer than MC's replacement retry budget. Its media is dark. MC keeps
+      # retrying at backoff_max until the meeting's per-meeting attempt bound
+      # (rate_limited, MCMediaHandlerReplacementRateLimited); this page is the
+      # point at which "MC will fix it" stopped being a safe assumption.
+      #
+      # R-35: THE ONLY PAGE A SINGLE MH DEATH CAN REACH. One MH death declares
+      # its meetings and they migrate within the budget; a meeting that kept a
+      # survivor never enters this gauge at all. It pages only when replacement
+      # fails past the budget, i.e. real user impact.
+      #
+      # THE GAUGE IS A PER-MC COUNT, recompute-and-set (HandlerlessCensus): a
+      # meeting whose only members are still Registering does not count. `for:`
+      # therefore means "SOME meeting has been awaiting continuously", not
+      # "one meeting has been dark for the whole window": overlapping churn of
+      # short awaiting episodes can hold it above zero. The description says so.
+      #
+      # THE REGISTERING-DIP BRIDGE, max_over_time(...[1m]) (meeting-controller,
+      # Gate 3). The gauge is written from `handlers.is_empty()`, so a grant
+      # still Registering takes a DARK meeting out of it (clients only ever get
+      # Active handlers) for up to the initial-registration bound (48 s
+      # shipped, a component of the retry budget), and an admission_refused
+      # grant puts it back after the backoff. Each dip would reset `for:`, so a
+      # meeting cycling grant -> failed registration could not page until its
+      # attempt bound (rate_limited), ~14 cycles later. The 1m window is at
+      # least that registration bound plus a scrape, so a meeting cycling
+      # grant -> failed registration stays paged across its Registering dips.
+      # PRECONDITION CHECK: w >= initial_registration_bound() + the mc-service
+      # scrape interval is asserted beside the formula
+      # (crates/mc-service/src/media_routing/pusher.rs,
+      # awaiting_handler_bridge_window_covers_the_registration_bound; token
+      # BRIDGE-WINDOW-OUT-OF-RANGE), so a registration-bound change that
+      # outgrows w goes red at Layer 4.
+      #
+      # `max`, no `by`: identity-free; any MC above zero is the signal.
+      #
+      # THE `for:` (one convention for config-derived `for:` literals, story 4
+      # OBS-ALERTS): for = ceil_to_whole_minute(sum of these terms):
+      #   - retry budget: mc_media_handler_replacement_retry_budget_seconds
+      #     (live gauge, every MC must agree; 139 s at the shipped
+      #     MC_MH_REPLACEMENT_* config)
+      #   - the bridge window w: this expr's max_over_time range (1m); a single
+      #     episode of length E holds the expr true for E + w
+      #   - service-job scrape_interval (the max over the service jobs, infra/kubernetes/observability/prometheus.yml; read live)
+      #   - this group's evaluation `interval:` (mc-service-page)
+      # Scrape and eval are in the sum because quantization extends how long
+      # the expr stays true for an episode that clears within the budget;
+      # without them the boundary case pages. env-test 33
+      # (for_literals_match_their_config_derivation) asserts
+      # derived <= for < derived + 60 s with every term read from its source;
+      # the current value is the `for:` below, never restated elsewhere.
+      # ------------------------------------------------------------------
+      - alert: MCMediaMeetingsAwaitingHandler
+        expr: |
+          max(max_over_time(mc_media_meetings_without_handlers[1m])) > 0
+        # ANCHOR (DRY): mc_media_handler_replacement_retry_budget_seconds + bridge window + service-job scrape_interval + mc-service-page interval, rounded up to the minute (derivation above; env-test 33 checks it against the live gauge)
+        for: 4m
+        labels:
+          severity: page
+          service: mc-service
+          component: media-handler-replacement
+        annotations:
+          summary: "Meetings have had no media handler past the replacement retry budget ({{ $value }} on the worst MC)"
+          description: "mc_media_meetings_without_handlers has been above zero on some MC for longer than the replacement retry budget (mc_media_handler_replacement_retry_budget_seconds). The gauge counts meetings with zero live handlers (a granted handler still Registering takes the meeting out of it), so this reads 'some meeting has been awaiting continuously', and overlapping short episodes can also hold it up. A 1m max_over_time bridges the Registering dips, so a meeting cycling grant -> failed registration (dark the whole time) stays paged - check sum by (instance) (mc_media_meetings_without_handlers) and mc_media_handler_migrations_total by outcome. MC keeps retrying at backoff_max until each meeting's attempt bound (rate_limited). Causes in order: GC unavailable (outcome=gc_unavailable), GC without capacity (gc_mh_replacement_requests_total{outcome=\"no_capacity\"}, gc_mh_available), MH admission refusals (admission_refused), FAILED_PRECONDITION from GC (abandoned; never retried, escalate), the attempt bound spent (rate_limited)."
+          impact: "Participants in the affected meetings have no audio or video while signalling, roster and joins keep working. A meeting that still has a surviving handler is degraded, not dark, and does not count here."
+          runbook_url: "docs/runbooks/mc-incident-response.md#scenario-25-meetings-awaiting-a-media-handler"
 
   - name: mc-service-warning
     interval: 60s
@@ -1184,6 +1262,381 @@ groups:
           description: "mc_gc_meeting_ended_notifications_dropped_total rose: MC's notify queue was full, so a meeting's end was never reported to GC. Expected-empty (the queue is sized far above any burst): this is MC losing events, not GC being down."
           impact: "GC keeps each affected meeting's assignment live; joins to those meeting ids fail until MC restarts."
           runbook_url: "docs/runbooks/mc-incident-response.md#scenario-20-meeting-teardown-failing--mh-budget-ratchet"
+
+      # ====================================================================
+      # STORY 4 — MEDIA HANDLER REPLACEMENT WARNINGS (OBS-ALERTS, R-35;
+      # ADR-0039 §1-§8, telemetry contract §Alerts WARNING)
+      # ====================================================================
+      #
+      # Shared ADR-0031 block for this section.
+      #
+      # R-35: A SINGLE MH DEATH NEVER PAGES BY ITSELF. One death yields one
+      # declaration PER MEETING (never alerted: it counts meetings) and ONE
+      # mc_media_handler_first_declarations_total increment per MC (the only
+      # handler-level count). Nothing below pages; real user impact pages via
+      # MCMediaMeetingsAwaitingHandler, and the rest of the mechanism warns.
+      #
+      # IDENTITY-FREE. No expr groups by meeting, participant, handler or
+      # connection; the only `by` labels are the bounded trigger / outcome /
+      # reason vocabularies, plus `instance` (a target label) on the MC-own-path
+      # signature, which the contract defines per instance.
+      #
+      # ZERO-INITIALISED. Every series selected here is zero-initialised over
+      # its full label domain at MC boot (observability/metrics.rs
+      # zero_initialize_counters), so `increase(...) > 0` is never silently
+      # inert; env-test 33 checks each selector (and each alternative of a
+      # literal alternation) against a real pod.
+      #
+      # WINDOWS. `increase(...[15m]) > 0` with `for: 0m` where the OCCURRENCE is
+      # the signal (expected-zero counters); `for: 15m` on the same window where
+      # the contract says "sustained" (it must rise in every trailing 15m
+      # window for 15m: at least two increments over about 30 minutes, so one
+      # isolated burst never fires; not a continuous rate).
+
+      # ------------------------------------------------------------------
+      # MCMediaHandlerMigrationFailures — replacement attempts failing
+      #
+      # Contract outcome set `no_capacity|gc_unavailable|admission_refused|
+      # timed_out`, MINUS the drain-shed cell (trigger="planned_transfer",
+      # outcome="timed_out"), which has ONE home: MCMediaHandlerDrainShed.
+      # Today MC emits timed_out ONLY for planned_transfer (media_routing/
+      # replacement.rs), so the timed_out arm here reads zero; it is kept so a
+      # future crash-path timed_out alerts instead of falling silently outside
+      # every rule (fail-closed; observability + code-reviewer, Gate 1). The
+      # `unless on (trigger, outcome)` drops the carved cell by series
+      # presence, whatever its value.
+      #
+      # "WHILE A HANDLER SURVIVES" (contract wording) IS NOT EXPRESSIBLE from MC
+      # series: no MC series joins a migration attempt to its meeting's
+      # survivor count. The no-survivor (dark) case pages through
+      # MCMediaMeetingsAwaitingHandler; this rule warns on every failing
+      # attempt either way. Counts are per ACQUISITION ATTEMPT: a retrying
+      # migration contributes one failure per failed attempt.
+      #
+      # RUNBOOK: mc Scenario 25, where these outcomes' triage lives (items 1,
+      # 3, 5). Operations-directed deviation from the task text's "Scenario 24"
+      # (Gate 1): the task assigned anchors before OPS wrote the prose.
+      # ------------------------------------------------------------------
+      - alert: MCMediaHandlerMigrationFailures
+        expr: |
+          sum by (trigger, outcome) (increase(mc_media_handler_migrations_total{outcome=~"no_capacity|gc_unavailable|admission_refused|timed_out"}[15m])) > 0
+          unless on (trigger, outcome)
+          sum by (trigger, outcome) (increase(mc_media_handler_migrations_total{trigger="planned_transfer", outcome="timed_out"}[15m]))
+        for: 0m
+        labels:
+          severity: warning
+          service: mc-service
+          component: media-handler-replacement
+        annotations:
+          summary: "MC media-handler replacement attempts failing ({{ $labels.trigger }}, {{ $labels.outcome }})"
+          description: "mc_media_handler_migrations_total{trigger=\"{{ $labels.trigger }}\", outcome=\"{{ $labels.outcome }}\"} rose: replacement attempts are failing. Counted per acquisition attempt, so a retrying migration adds one per failure. gc_unavailable = GC did not answer (fix GC first); no_capacity = GC had no eligible handler (gc_mh_available, gc_mh_replacement_requests_total{outcome=\"no_capacity\"}); admission_refused = the grant's RegisterMeeting failed or it was declared before its first ack, and the handler joins the meeting's exclude list. A meeting with a surviving handler stays on it (degraded, not dark); a meeting with none is dark and pages through MCMediaMeetingsAwaitingHandler. timed_out on a non-planned trigger is not emitted by MC today - if it appears, treat it as a new MC behaviour and escalate to meeting-controller."
+          impact: "Meetings that lost a handler stay on fewer handlers (degraded) until a grant succeeds; a meeting with no survivor is media-dark."
+          runbook_url: "docs/runbooks/mc-incident-response.md#scenario-25-meetings-awaiting-a-media-handler"
+
+      # ------------------------------------------------------------------
+      # MCMediaHandlerDrainShed — planned transfers that did not complete
+      #
+      # Reads MC's terminal planned-transfer outcome, NEVER MH's
+      # mh_drain_meetings_shed_total: a draining MH exits within about one
+      # scrape interval of its last increment, so its exit-time counters are
+      # best-effort (telemetry contract, round-3 provisioning requirements).
+      # Each planned transfer records exactly one terminal (completed +
+      # timed_out == declarations_total{trigger="planned_transfer"}), so this
+      # counts transfers, not attempts. Warning, never a page: the contract
+      # superseded the earlier timed_out page (runbook-alert-changes.md §E).
+      # ------------------------------------------------------------------
+      - alert: MCMediaHandlerDrainShed
+        expr: |
+          sum(increase(mc_media_handler_migrations_total{trigger="planned_transfer", outcome="timed_out"}[15m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+          service: mc-service
+          component: media-handler-replacement
+        annotations:
+          summary: "Planned handler transfers timed out during an MH drain ({{ $value }} in 15m)"
+          description: "mc_media_handler_migrations_total{trigger=\"planned_transfer\", outcome=\"timed_out\"} rose: a draining MH's meeting did not finish its make-before-break move by drain_remaining - MC_PLANNED_TRANSFER_MARGIN_MS, so MC cut over with stragglers or shed it (no grant and no survivor). MC's 'Planned handler transfer ended' line carries target=grant|survivor|none (none = shed) and stragglers; the old MH's final mh.drain 'Drain finished' line carries meetings_shed. Check client dial outcomes, media_dial rejections by failure_reason, GC reachability, and the drain deadline (terminationGracePeriodSeconds) against the meeting count."
+          impact: "Stragglers see a longer media gap than the planned blip; a shed meeting is dark until replacement succeeds (and pages via MCMediaMeetingsAwaitingHandler past the budget)."
+          runbook_url: "docs/runbooks/mc-incident-response.md#scenario-26-media-handler-migration-timed-out"
+
+      # ------------------------------------------------------------------
+      # MCMediaHandlerOwnPathSignature — several handlers declared dead by
+      # one MC
+      #
+      # Per instance: the handler-level declaration count over the window is
+      # >= 2 AND is at least half of the handlers that MC used in the window.
+      #   - `>= 2` is the R-35 argument: one MH death adds EXACTLY 1 to
+      #     first_declarations per MC (once per handler, however many meetings
+      #     declared it; HandlerCensus), so a single death can never fire this.
+      #   - Denominator max_over_time(mc_media_handlers_in_use[w]), the PRE-loss
+      #     census: in_use drops a declared handler in the same actor turn as
+      #     its removal, so the instant gauge would inflate the ratio (and read
+      #     0 when everything is gone).
+      #   - w = 15m: wide enough that a node / zone loss (several handlers
+      #     declared within ~N of each other) and a degrading MC network path
+      #     land in one window; matches mc Scenario 27's diagnosis window.
+      #   - fraction 0.5: "a large share of the handlers this MC uses" - at
+      #     that share, either most of this MC's fleet is gone or its own path
+      #     is. Rule-owned; re-derive only from observed own-path incidents.
+      # Declaration VOLUME counts meetings and gc_view at request time lags MC
+      # by design, so neither can drive this. The discriminator is how many
+      # MCs show it (runbook): several = real multi-MH loss; only this one =
+      # its own network path, leave the handlers alone. Over-counts past the
+      # census bound MAX_RECENTLY_DECLARED (4096 handlers): irrelevant here.
+      # ------------------------------------------------------------------
+      - alert: MCMediaHandlerOwnPathSignature
+        expr: |
+          sum by (instance) (increase(mc_media_handler_first_declarations_total{trigger="heartbeat_timeout"}[15m])) >= 2
+          and
+          (
+            sum by (instance) (increase(mc_media_handler_first_declarations_total{trigger="heartbeat_timeout"}[15m]))
+            /
+            sum by (instance) (max_over_time(mc_media_handlers_in_use[15m]))
+          ) >= 0.5
+        for: 0m
+        labels:
+          severity: warning
+          service: mc-service
+          component: media-handler-replacement
+        annotations:
+          summary: "One MC declared several of its media handlers dead ({{ $labels.instance }})"
+          description: "MC {{ $labels.instance }} declared at least two distinct handlers dead (trigger=heartbeat_timeout) in 15 minutes, at least half of the handlers it used in that window. One MH death cannot fire this (it adds one per MC). Compare the same query across MCs: the signature on SEVERAL MCs = real multi-MH loss (node or zone; check mh.sh list --json and node state); on ONLY this MC = its own network path to the MHs - leave the handlers alone, they serve other MCs. mh_media_handler_releases_total{trigger=\"heartbeat_timeout\",clients=\"present\"} rising confirms the handlers were alive. gc_view at request time is not the discriminator (it lags MC by design)."
+          impact: "Every meeting on the declared handlers migrates (one media blip each). If it is this MC's own path, the migrations are unnecessary but safe; if it is real loss, capacity is reduced until the MHs return."
+          runbook_url: "docs/runbooks/mc-incident-response.md#scenario-27-several-media-handlers-declared-dead-by-one-mc"
+
+      # ------------------------------------------------------------------
+      # MCMediaHandlerCrashRate — handler deaths that replacement hides
+      #
+      # PER (HANDLER, MC), NEVER PER MEETING: first_declarations counts each
+      # handler once per MC. `max` across MCs (not `sum`) keeps that unit and
+      # makes the rule fleet-size independent - a `sum` would count one death
+      # once per MC that had meetings on it. Only handlers THIS MC had meetings
+      # on are visible to it: a crashlooping MH that GC never re-grants to any
+      # MC is MHPodRestartingFrequently's (kubelet view), not this rule's.
+      # Threshold 3 per hour (rule-owned): one death plus its in-place restart
+      # re-granted and dying again is 2; a kubelet CrashLoopBackOff caps a
+      # looping pod near 12 per hour after the first burst, so 3 is EXCEEDED
+      # (the 4th death in the hour fires: `> 3 / 3600`) early in a crashloop
+      # and never by one or two unrelated deaths. Planned drains are
+      # trigger=planned_transfer and never count.
+      # ------------------------------------------------------------------
+      - alert: MCMediaHandlerCrashRate
+        expr: |
+          max(rate(mc_media_handler_first_declarations_total{trigger="heartbeat_timeout"}[1h])) > 3 / 3600
+        for: 0m
+        labels:
+          severity: warning
+          service: mc-service
+          component: media-handler-replacement
+        annotations:
+          summary: "Media handlers are being declared dead repeatedly (more than 3 per hour on one MC)"
+          description: "rate(mc_media_handler_first_declarations_total{trigger=\"heartbeat_timeout\"}[1h]) on the worst MC exceeds 3 handlers per hour. Counted per (handler, MC), never per meeting. Replacement heals each death, so this is the signal for an MH incarnation that keeps dying behind migration (a crashloop), or for repeated real losses. It only sees handlers this MC had meetings on; MHPodRestartingFrequently is the kubelet view. Find the slot by restart_count in mh.sh list --json and read its --previous logs."
+          impact: "Each death is one media blip per meeting on that handler; repeated deaths erode capacity and keep meetings migrating."
+          runbook_url: "docs/runbooks/mc-incident-response.md#scenario-24-media-handler-declared-dead-or-impaired"
+
+      # ------------------------------------------------------------------
+      # MCMediaHandlerClientLossDisagreement — clients say the handler is
+      # gone, heartbeats say it is live (contract: "forged heartbeat vs client
+      # network path")
+      #
+      # Both hypotheses stay in the text: a forged heartbeat (S1b-extended:
+      # any holder of the MC-scope service token can heartbeat for a handler
+      # that is dead to its clients, suppressing failover) or a client-side
+      # path fault. The counter never removes a handler (client connectivity
+      # is a second opinion only, ADR-0039 §2). A forged EMPTY connection list
+      # empties this counter's denominator, so zero here is not evidence of no
+      # forgery (story 4 MC-E; Scenario 28 routes that shape).
+      # ------------------------------------------------------------------
+      - alert: MCMediaHandlerClientLossDisagreement
+        expr: |
+          sum(increase(mc_media_handler_client_loss_disagreements_total[15m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+          service: mc-service
+          component: media-handler-replacement
+        annotations:
+          summary: "Clients report losing a media handler whose heartbeats look healthy"
+          description: "mc_media_handler_client_loss_disagreements_total rose: at least the published fraction and minimum count (mc_media_handler_client_loss_disagreement_ratio / _min_clients) of a handler's believed-connected clients reported losing it for longer than N while its heartbeats kept it Live. Two hypotheses: a FORGED heartbeat (another process holding the heartbeat-capable service token keeping a dead handler Live) or a client-side network path problem. Capture evidence before draining anything; if the MH is dead or not serving while heartbeats still arrive, escalate to security at once."
+          impact: "Affected clients have no media from that handler while MC believes it healthy and does not fail over."
+          runbook_url: "docs/runbooks/mc-incident-response.md#scenario-28-clients-report-handler-loss-while-heartbeats-look-healthy"
+
+      # ------------------------------------------------------------------
+      # MCMediaHandlerReplacementRateLimited — the per-meeting attempt bound
+      # is being hit (contract: "flap OR forged loop")
+      #
+      # rate_limited = one owed replacement refused at the per-meeting attempt
+      # bound (there is no per-MC limiter; a min-interval deferral is NOT
+      # counted). The bound is GC's exclusion cap, GC_MH_MAX_EXCLUDE_HANDLER_IDS
+      # (about 14 lifetime replacements per meeting at the shipped default).
+      # GC does not rate-limit, so this is the only place a flapping detector
+      # or a forged declaration loop shows. Sustained (`for: 15m`): one meeting
+      # reaching its bound once is not the signal; the bound being hit
+      # repeatedly is.
+      #
+      # RUNBOOK: mc Scenario 25 item 5 (operations-directed deviation from the
+      # task text's "Scenario 24", Gate 1).
+      # ------------------------------------------------------------------
+      - alert: MCMediaHandlerReplacementRateLimited
+        expr: |
+          sum(increase(mc_media_handler_migrations_total{outcome="rate_limited"}[15m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+          service: mc-service
+          component: media-handler-replacement
+        annotations:
+          summary: "Meetings keep hitting their media-handler replacement bound"
+          description: "mc_media_handler_migrations_total{outcome=\"rate_limited\"} has risen in every trailing 15-minute window for 15 minutes (at least two increments spread over about 30 minutes, not a continuous rate): owed replacements are being refused at the per-meeting attempt bound (GC_MH_MAX_EXCLUDE_HANDLER_IDS, about 14 lifetime replacements per meeting at the shipped default). Something keeps declaring handlers: a FLAPPING detector (check mc_media_handler_suspicions_total and the detection histogram against N) or a FORGED declaration loop (Scenario 28). A rate-limited meeting stays on its survivors, if any."
+          impact: "Affected meetings stop acquiring handlers: they stay degraded on survivors, or dark (and page via MCMediaMeetingsAwaitingHandler) if they have none."
+          runbook_url: "docs/runbooks/mc-incident-response.md#scenario-25-meetings-awaiting-a-media-handler"
+
+      # ------------------------------------------------------------------
+      # MCMediaHandlerConnectedSetCorrections — the heartbeat keeps healing
+      # lost Disconnecteds
+      #
+      # One increment per distinct (handler, connection) the remove-only
+      # reconcile retired (a lost Disconnected, or a departed participant's
+      # leaked binding). Isolated corrections are the mechanism working;
+      # SUSTAINED corrections mean the MH->MC notification path is lossy
+      # (benign arm, cross-check MHMCNotificationFailures) or a forged empty
+      # connection list is stripping a live handler (Scenario 28).
+      # ------------------------------------------------------------------
+      - alert: MCMediaHandlerConnectedSetCorrections
+        expr: |
+          sum(increase(mc_media_handler_connected_set_corrections_total[15m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+          service: mc-service
+          component: media-handler-replacement
+        annotations:
+          summary: "MC keeps correcting media-handler connected sets from heartbeats"
+          description: "mc_media_handler_connected_set_corrections_total has risen in every trailing 15-minute window for 15 minutes (at least two increments spread over about 30 minutes, not a continuous rate): MH heartbeats keep retiring connections MC still believed connected, each a Disconnected notification that never arrived. Benign arm: a lossy MH->MC notification path (cross-check MHMCNotificationFailures and mh_mc_notifications_total). Adversarial arm: a burst about equal to one handler's whole connected set is the forged-empty-list shape (Scenario 28) - treat it as forged."
+          impact: "Each correction is a participant whose media binding lingered until the next heartbeat; a forged strip silences live participants until they redial."
+          runbook_url: "docs/runbooks/mc-incident-response.md#scenario-24-media-handler-declared-dead-or-impaired"
+
+      # ------------------------------------------------------------------
+      # MCMediaHandlerHeartbeatMisroute — misrouted or foreign-owner heartbeats
+      #
+      # Both outcomes are expected zero in steady state. owner_mismatch is
+      # EXPECTED only within about one owner-silence timeout
+      # (mh_media_meeting_owner_silence_timeout_seconds, 900 s shipped) after
+      # an MC crash restart - judged by the COUNTER, not the alert, which on
+      # its 15m window clears about 15 min after the counter stops: MC ids are per process (MC_ID unset), so the
+      # restarted MC answers its predecessor's leftover meetings' heartbeats
+      # with FAILED_PRECONDITION until MH's owner-silence release ends them.
+      # Persistence beyond that, or with no MC restart, is a routing or
+      # contract defect - and mc_id is self-asserted, so do not read it as
+      # always benign.
+      # ------------------------------------------------------------------
+      - alert: MCMediaHandlerHeartbeatMisroute
+        expr: |
+          sum by (outcome) (increase(mc_media_handler_heartbeats_total{outcome=~"released_unassigned|owner_mismatch"}[15m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+          service: mc-service
+          component: media-handler-replacement
+        annotations:
+          summary: "MC answered media-handler heartbeats as misrouted or foreign-owned ({{ $labels.outcome }})"
+          description: "mc_media_handler_heartbeats_total{outcome=\"{{ $labels.outcome }}\"} rose. released_unassigned = a heartbeat for a live meeting whose handler set never held that handler (MC answered RELEASED; MH ends the meeting on itself) - a contract defect, always. owner_mismatch = the heartbeat named an mc_id that is not this MC. Judge by the COUNTER, not the alert: after this MC crash-restarted (kube_pod_container_status_restarts_total) the counter stops rising within one owner-silence timeout (mh_media_meeting_owner_silence_timeout_seconds, 15 min shipped), and this alert, on a 15m window, clears about 15 min after that. A counter still rising past one timeout, or with no MC restart, is a defect: an MH heartbeating to the wrong MC endpoint (routing). mc_id is self-asserted on this path, so persistence is never benign."
+          impact: "released_unassigned ends a meeting on that MH; owner_mismatch keeps a meeting's capacity held on MH until owner-silence release."
+          runbook_url: "docs/runbooks/mc-incident-response.md#scenario-29-heartbeat-misroute-or-owner-mismatch"
+
+      # ------------------------------------------------------------------
+      # MCMediaHandlerRemovalReleaseRejected — MH refused a REMOVAL's
+      # EndMeeting owner or cause (added at MC-B2 review, observability +
+      # media-handler)
+      #
+      # The removal path is deliberately off mc_media_end_meeting_total, so
+      # MCEndMeetingOwnershipRejected does not see it. Selects only the two
+      # MC-defect outcomes; unavailable_exhausted, error and unimplemented are
+      # EXPECTED after a crash (the released handler is dead) and are never
+      # selected.
+      # ------------------------------------------------------------------
+      - alert: MCMediaHandlerRemovalReleaseRejected
+        expr: |
+          sum by (outcome) (increase(mc_media_handler_removal_releases_total{outcome=~"rejected_ownership|invalid_argument"}[15m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+          service: mc-service
+          component: media-handler-replacement
+        annotations:
+          summary: "MH refused the EndMeeting MC sends on handler removal ({{ $labels.outcome }})"
+          description: "mc_media_handler_removal_releases_total{outcome=\"{{ $labels.outcome }}\"} rose: a handler refused the EndMeeting MC sends when it removes the handler from a meeting. rejected_ownership = the mc_id MC sent is not the meeting's recorded owner; invalid_argument = MH rejected the removal cause. Both are MC defects. Not selected, by design: unavailable_exhausted, error and unimplemented, which are expected after a crash."
+          impact: "The removed handler keeps the meeting's registration until its next heartbeat is answered RELEASED, or until owner-silence release."
+          runbook_url: "docs/runbooks/mc-incident-response.md#scenario-29-heartbeat-misroute-or-owner-mismatch"
+
+      # ------------------------------------------------------------------
+      # MCMediaHandlerHeartbeatAnomalies — heartbeat contract faults
+      #
+      # Every reason is expected zero IN PRODUCTION. Counted on EVERY heartbeat
+      # carrying the anomaly (about every N/3 per pair), so the magnitude is
+      # heartbeats, not incidents. apply_refused_invalid and
+      # apply_refused_transport_inconsistent are MC CONTRACT faults (MH refused
+      # MC's policy as malformed; liveness.rs ApplyRefusedInvalid; counted
+      # only while MC's policy is pending): the pair is held in contract_fault,
+      # never replaced, because moving the meeting would repeat it.
+      # connection_ids_over_cap, connection_id_malformed and
+      # applied_ahead_of_sent are MH contract or version-skew faults.
+      # KNOWN BENIGN WRITER, DEV CLUSTER ONLY: the env-test policy `Injection`
+      # fixture (story 4 MC-B2, Layer 7) produces applied_ahead_of_sent by
+      # design.
+      # ------------------------------------------------------------------
+      - alert: MCMediaHandlerHeartbeatAnomalies
+        expr: |
+          sum by (reason) (increase(mc_media_handler_heartbeat_anomalies_total[15m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+          service: mc-service
+          component: media-handler-replacement
+        annotations:
+          summary: "MC saw media-handler heartbeat contract faults ({{ $labels.reason }})"
+          description: "mc_media_handler_heartbeat_anomalies_total{reason=\"{{ $labels.reason }}\"} rose. In production every reason is a fault. Counted per heartbeat carrying it, so the value is heartbeats, not incidents. apply_refused_invalid / apply_refused_transport_inconsistent = MC contract faults (MH refused MC's policy as malformed) - the pair is held in contract_fault and deliberately NOT replaced (escalate meeting-controller + media-handler; read MC's confirm-failure line). connection_ids_over_cap / connection_id_malformed / applied_ahead_of_sent = MH contract or version-skew faults (check which component rolled last). Dev cluster only: the env-test policy Injection fixture produces applied_ahead_of_sent by design."
+          impact: "A contract-faulted pair keeps its meeting on a handler MC cannot verify; other reasons mean MC is reading heartbeats it cannot fully trust."
+          runbook_url: "docs/runbooks/mc-incident-response.md#scenario-29-heartbeat-misroute-or-owner-mismatch"
+
+      # ------------------------------------------------------------------
+      # MCRegisterMeetingFailureRate — RegisterMeeting coordination failures
+      # (closes docs/TODO.md "Missing alert: MC RegisterMeeting Coordination
+      # Failures"; telemetry contract §Alerts WARNING)
+      #
+      # Error-ratio shape of MCHighJoinFailureRate, not burn-rate, so it is
+      # unblocked by the open MH SLO target. Non-zero-denominator guard per
+      # alert-conventions.md. status="error" covers RPC transport failures AND
+      # non-Programmed confirm dispositions. handler_replaced (an in-place MH
+      # restart answering for the dialed handler, story 4 MC-B1) is in NEITHER
+      # side: it is a later incarnation answering, not a coordination failure,
+      # and in the denominator an MH restart storm would dilute real errors
+      # (mc Scenario 12, operations). Positive enumeration `success|error` on
+      # both the denominator and the guard, so a status added later is
+      # classified deliberately rather than silently diluting. A dead
+      # MH errors only until it is declared (about N), so one death does not
+      # hold 10% for 5 minutes. A failure against a fresh grant adds that
+      # handler to the meeting's exclude list and re-acquires.
+      # ------------------------------------------------------------------
+      - alert: MCRegisterMeetingFailureRate
+        expr: |
+          (
+            sum(rate(mc_register_meeting_total{status="error"}[5m]))
+            /
+            sum(rate(mc_register_meeting_total{status=~"success|error"}[5m]))
+          ) > 0.10
+          and
+          sum(rate(mc_register_meeting_total{status=~"success|error"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: mc-service
+          component: media-coordination
+        annotations:
+          summary: "MC RegisterMeeting failure ratio high ({{ $value | humanizePercentage }})"
+          description: "More than 10% of MC's RegisterMeeting calls to media handlers have failed for 5 minutes (mc_register_meeting_total{status=\"error\"} over success + error; handler_replaced, a later MH incarnation answering, is in neither). Error covers RPC transport failures and policies MH did not confirm as programmed. Check mc_register_meeting_duration_seconds, MH's mh_media_policy_applies_total{outcome}, and whether one handler dominates (MC's mc.register_meeting ERROR lines). A failure against a fresh grant excludes that handler and re-acquires (mc_media_handler_migrations_total{outcome=\"admission_refused\"})."
+          impact: "Meetings on the failing handlers have no programmed forwarding policy there: media is missing until the registration succeeds or the meeting migrates."
+          runbook_url: "docs/runbooks/mc-incident-response.md#scenario-12-registermeeting-coordination-failures"
 
   - name: mc-service-info
     interval: 60s

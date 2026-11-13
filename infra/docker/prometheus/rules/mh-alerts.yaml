@@ -57,6 +57,12 @@
 #   rule to task 18, which never carried it. Tracked in docs/TODO.md
 #   §Observability Debt, "No leading indicator for registered-meeting
 #   exhaustion".
+#   STORY 4 (ADR-0039 §6): "indefinitely" no longer holds. A lost EndMeeting
+#   is now reclaimed by MC's RELEASED heartbeat verdict on the next heartbeat,
+#   and a meeting whose MC is gone by owner-silence release after
+#   MH_MEETING_OWNER_SILENCE_TIMEOUT_SECONDS. The zero-client residue past that
+#   bound warns as MHMeetingsHeldWithoutClients; the TODO entry above tracks
+#   whether a cap leading indicator is still needed.
 # - No registration-failure-rate alert: registration is a low-volume one-shot
 #   signal (single register + periodic heartbeats). Heartbeats give a continuous,
 #   larger-denominator signal - MHGCHeartbeatFailureRate below is the canonical
@@ -76,18 +82,51 @@ groups:
       # PAGE ALERTS - User-visible impact or SLO burn; page oncall immediately
       # ====================================================================
 
+      # ------------------------------------------------------------------
+      # ADR-0031 block — MHDown, RE-SCOPED fleet/region-level (story 4
+      # OBS-ALERTS, R-35; telemetry contract §Alerts PAGE)
+      #
+      # WHY NOT PER POD ANY MORE. The per-pod `up{job="mh-service"} == 0` page
+      # is gone: a single MH death is now routine and healed by replacement
+      # (MC declares it within N and migrates its meetings), and user impact
+      # from it pages through MCMediaMeetingsAwaitingHandler. This page means
+      # the region has NO replacement capacity at all.
+      #
+      # THE EXPR vs THE CONTRACT TEXT. The contract writes
+      # `gc_mh_available{state="healthy"} == 0`. Two Gate-1 corrections
+      # (global-controller + media-handler + observability):
+      #   - `region!="other"`: GC's set_mh_available writes the full closed set
+      #     {own GC_REGION, "other"} x states every recompute, zero-filled, so
+      #     the "other" cell reads 0 permanently in a single-region deployment
+      #     and the literal expr would page forever. Each regional GC is
+      #     authoritative for its own region only.
+      #   - `max by (region)`: every GC replica publishes the same
+      #     registry-derived value; without the aggregation one region fires
+      #     once per GC pod. `region` is bounded and not an identity.
+      # "Healthy" means fresh (within gc_mh_staleness_threshold_seconds) and
+      # not draining: MH reports only HEALTHY or DRAINING, draining is its own
+      # state, and stale rows count as unhealthy.
+      #
+      # ABSENT SERIES = SILENT, BY DESIGN. With GC down the gauge is absent and
+      # `== 0` never matches; GCDown pages that case, so no absent() is added.
+      # A failed count query leaves the gauge at its last value (logged, and
+      # counted gc_db_queries_total{operation="count_available_mh",
+      # status="error"}).
+      # `for: 1m` kept from the per-pod rule: the gauge is recompute-and-set on
+      # GC's health tick, so 1m spans several recomputes.
+      # ------------------------------------------------------------------
       - alert: MHDown
         expr: |
-          up{job="mh-service"} == 0
+          max by (region) (gc_mh_available{state="healthy", region!="other"}) == 0
         for: 1m
         labels:
           severity: page
           service: mh-service
           component: infrastructure
         annotations:
-          summary: "Media Handler service is down"
-          description: "Media Handler has no running pods for 1 minute. All WebTransport media sessions on affected pods are disrupted."
-          impact: "Users in active meetings lose media. New joins have no working media path."
+          summary: "No healthy media handler in region {{ $labels.region }}"
+          description: "GC sees no healthy, non-draining media handler in region {{ $labels.region }} for 1 minute (max by (region) of gc_mh_available{state=\"healthy\"}): there is no replacement capacity at all. A single MH pod going down is NOT this alert - MC replaces it. Check gc_mh_available by state (draining = a rollout or drain in progress; unhealthy = stale load reports), mh.sh list --json, and the MH pods. If GC itself is down this alert is silent and GCDown pages."
+          impact: "Meetings that lose a handler cannot be given a replacement, and new meetings have no media path. Existing meetings on any still-serving (draining) handler keep media until it exits."
           runbook_url: "docs/runbooks/mh-incident-response.md#scenario-1-complete-service-outage"
 
   - name: mh-service-warning
@@ -742,8 +781,8 @@ groups:
           component: mc-integration
         annotations:
           summary: "MH-MC notification delivery failure rate high ({{ $value | humanizePercentage }})"
-          description: "MH to MC connect/disconnect notification delivery failing at {{ $value | humanizePercentage }} for 5 minutes. Fire-and-forget design means failed events are not retried - MC may develop stale participant state."
-          impact: "Stale presence indicators, delayed disconnect detection, participants appearing still-present after leaving. Check MC service health."
+          description: "MH to MC connect/disconnect notification delivery failing at {{ $value | humanizePercentage }} for 5 minutes, counted per logical notification after send_with_retry's retries. Split by event_type first: the two arms have different consequences. Check MC service health."
+          impact: "A failed connected notification DECLINES that session (mh_media_session_starts_total{outcome=\"declined_mc_unavailable\"}): the client sees a failed dial and redials - no stale state. A lost disconnected notification self-corrects within N (mc_media_handler_heartbeat_deadline_seconds), normally on the next heartbeat (about N/3): every per-meeting heartbeat carries the full connection set and MC retires the absent connection (mc_media_handler_connected_set_corrections_total; sustained corrections warn as MCMediaHandlerConnectedSetCorrections)."
           runbook_url: "docs/runbooks/mh-incident-response.md#scenario-10-mhmc-notification-failures"
 
       - alert: MHPodRestartingFrequently
@@ -757,8 +796,209 @@ groups:
         annotations:
           summary: "MH pod {{ $labels.pod }} restarting frequently"
           description: "Pod {{ $labels.pod }} has restarted {{ $value }} times per hour. May indicate crashes, OOM kills, or liveness probe failures."
-          impact: "Repeated disconnection of WebTransport sessions on this pod. Users on this pod lose media each restart."
+          impact: "Repeated disconnection of WebTransport sessions on this pod. Users on this pod lose media each restart, until MC migrates their meetings or the handler re-registers in place. Replacement hides each death from users; MCMediaHandlerCrashRate is the MC-side view of the same crashloop."
           runbook_url: "docs/runbooks/mh-incident-response.md#scenario-11-pod-restarting-frequently"
+
+      # ====================================================================
+      # STORY 4 — MEDIA HANDLER REPLACEMENT WARNINGS (OBS-ALERTS, R-35;
+      # ADR-0039 §5, §6, §8; telemetry contract §Alerts WARNING)
+      # ====================================================================
+      # Shared ADR-0031 block. Authored by observability, media-handler
+      # reviews (ADR-0031 owner), operations owns the runbook targets. All
+      # warning: none of these is a single MH death, and none pages (R-35).
+      # Every selected series is zero-initialised at MH boot over its full
+      # label domain (mh_media_handler_releases_total trigger x clients;
+      # mh_jwt_validations_total over every media_dial MediaDialRejection), so
+      # `increase(...) > 0` is never silently inert. All fleet-aggregated with
+      # no identity grouping. `increase(...[15m]) > 0` + `for: 0m` where the
+      # occurrence is the signal; `for: 15m` where the contract says
+      # "sustained" (it must rise in every trailing 15m window for 15m: at
+      # least two increments over about 30 minutes, not a continuous rate).
+
+      # MHFalseDeclarations — an MC declared this live MH dead
+      # heartbeat_timeout + clients=present is the false-declaration ground
+      # truth, which only MH can see (it was alive, with clients, when told it
+      # had been removed). A false declaration is a SAFE outcome (one blip per
+      # meeting), so isolated ones are not the signal: sustained ones mean an
+      # MC<->MH path keeps breaking. apply_lag+present (a correct removal of a
+      # live-but-slow MH) and planned_transfer+present (a drain) are not
+      # selected.
+      - alert: MHFalseDeclarations
+        expr: |
+          sum(increase(mh_media_handler_releases_total{trigger="heartbeat_timeout", clients="present"}[15m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+          service: mh-service
+          component: mc-integration
+        annotations:
+          summary: "Media handlers keep being declared dead while alive with clients attached"
+          description: "mh_media_handler_releases_total{trigger=\"heartbeat_timeout\", clients=\"present\"} has risen in every trailing 15-minute window for 15 minutes (at least two increments spread over about 30 minutes, not a continuous rate): MCs keep declaring LIVE handlers dead (the handler still had clients when its removal arrived). Each one is a safe but unnecessary migration. Suspect the MC<->MH path: compare mc_media_handler_first_declarations_total by instance (one MC = its own path, MCMediaHandlerOwnPathSignature), mh_mc_heartbeats_total{outcome} on the releasing pods, and the heartbeat interval histogram against N."
+          impact: "Meetings on the affected handlers migrate needlessly: one media blip each, repeatedly."
+          runbook_url: "docs/runbooks/mc-incident-response.md#scenario-24-media-handler-declared-dead-or-impaired"
+
+      # MHOwnerSilenceReleaseWithClients — people were attached to a meeting
+      # no MC owned for the whole silence window. clients="none" is ROUTINE
+      # about 15 min after every MC rollout (per-process MC ids) and is
+      # dashboard-only, never selected.
+      - alert: MHOwnerSilenceReleaseWithClients
+        expr: |
+          sum(increase(mh_media_handler_releases_total{trigger="owner_silence", clients="present"}[15m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+          service: mh-service
+          component: mc-integration
+        annotations:
+          summary: "MH released a meeting on owner silence while clients were still connected"
+          description: "mh_media_handler_releases_total{trigger=\"owner_silence\", clients=\"present\"} rose: MH ended a meeting because its owning MC had been silent for MH_MEETING_OWNER_SILENCE_TIMEOUT_SECONDS (mh_media_meeting_owner_silence_timeout_seconds) while at least one client was still attached. Those participants sat in a meeting no MC owned for the whole window. Read MH's mh.session.owner_silence INFO line (owner mc_id, silence duration) and check whether that MC restarted or lost its path to MH. clients=\"none\" releases after an MC rollout are routine and not alerted."
+          impact: "The affected participants had no working meeting control for the silence window and are now disconnected (HANDLER_RELEASED)."
+          runbook_url: "docs/runbooks/mh-incident-response.md#scenario-26-owner-silence-release-with-clients-present"
+
+      # media_dial credential rejections, per failure_reason
+      # (mh-service/src/auth/mod.rs:MediaDialRejection). These reasons are
+      # metric-only: the client always sees a generic DECLINED.
+      # PRE- vs POST-SIGNATURE (security, Gate 1): no_meeting_key is decided
+      # BEFORE the signature check, so it is UNAUTHENTICATED and
+      # attacker-drivable (garbage tokens naming any meeting id). expired,
+      # wrong_type and aud_mismatch are decided AFTER it, so only a holder of
+      # the meeting's MC-minted key can move them.
+
+      # MHMediaDialTokenExpired — sustained: MC's TTL/3 refresh push is broken
+      # (the only signal for it), or clocks drift past the configured skew.
+      - alert: MHMediaDialTokenExpired
+        expr: |
+          sum(increase(mh_jwt_validations_total{token_type="media_dial", failure_reason="expired"}[15m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+          service: mh-service
+          component: media-admission
+        annotations:
+          summary: "Clients keep dialing media handlers with expired media_dial tokens"
+          description: "mh_jwt_validations_total{token_type=\"media_dial\", failure_reason=\"expired\"} has risen in every trailing 15-minute window for 15 minutes (at least two increments spread over about 30 minutes, not a continuous rate). This reason is post-signature: the token was minted by the meeting's MC. expired = exp has passed OR iat is in the future beyond MH_MEDIA_DIAL_CLOCK_SKEW_SECONDS (mh_media_dial_clock_skew_seconds). Two causes: MC's TTL/3 refresh push is broken (mc_media_handler_set_pushes_total{reason=\"token_refresh\"} flat; mc_media_dial_token_refresh_interval_seconds), or node clock drift past the skew - fix NTP, never raise the skew to mask it."
+          impact: "Affected clients are DECLINED on (re)dial and have no media from that handler until they receive a fresh token."
+          runbook_url: "docs/runbooks/mh-incident-response.md#scenario-24-media-dial-credential-rejections"
+
+      # MHMediaDialNoMeetingKey — sustained. UNAUTHENTICATED (pre-signature).
+      # A dial that lands after a release (replacement, owner silence, drain)
+      # is expected and transient; the register-before-token ordering bug
+      # (L4-2) is the SUSTAINED reading only, and only when it correlates with
+      # registration failures or legitimate clients failing to join -
+      # otherwise it is probing.
+      - alert: MHMediaDialNoMeetingKey
+        expr: |
+          sum(increase(mh_jwt_validations_total{token_type="media_dial", failure_reason="no_meeting_key"}[15m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+          service: mh-service
+          component: media-admission
+        annotations:
+          summary: "Media handlers keep receiving media_dial tokens for meetings they hold no key for"
+          description: "mh_jwt_validations_total{token_type=\"media_dial\", failure_reason=\"no_meeting_key\"} has risen in every trailing 15-minute window for 15 minutes (at least two increments spread over about 30 minutes, not a continuous rate): dials name a meeting this handler holds no key for (never registered, or released). This reason is decided BEFORE the signature check, so it is UNAUTHENTICATED and anyone who can reach MH's WebTransport port can drive it. Treat it as the register-before-token ordering bug (L4-2) ONLY when it correlates with mc_register_meeting_total{status=\"error\"} or with legitimate clients failing to join (dt_client_mh_connection_total{outcome=\"declined\"}); otherwise treat it as probing. Short bursts after a release (replacement, owner silence, drain) are expected redials."
+          impact: "If it is the ordering bug, clients on new handlers are DECLINED until registration lands; if it is probing, no client is affected."
+          runbook_url: "docs/runbooks/mh-incident-response.md#scenario-24-media-dial-credential-rejections"
+
+      # MHMediaDialWrongTokenType — any occurrence. Post-signature: a token
+      # signed with the meeting's key whose token_type is not media_dial. Only
+      # MC holds that key, so this is an MC mint defect or the meeting key
+      # having signed a non-media_dial token (a key-custody issue).
+      - alert: MHMediaDialWrongTokenType
+        expr: |
+          sum(increase(mh_jwt_validations_total{token_type="media_dial", failure_reason="wrong_type"}[15m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+          service: mh-service
+          component: media-admission
+        annotations:
+          summary: "A media handler rejected a correctly signed token of the wrong type"
+          description: "mh_jwt_validations_total{token_type=\"media_dial\", failure_reason=\"wrong_type\"} rose: a token signed with the meeting's MC-minted key (post-signature) carried a token_type other than media_dial. Two causes: an MC mint defect, or the meeting key having signed a non-media_dial token - a key-custody issue. Escalate to meeting-controller and security."
+          impact: "The dial is DECLINED. The concern is the key's use, not media: a meeting key signing other token types breaks the credential separation."
+          runbook_url: "docs/runbooks/mh-incident-response.md#scenario-24-media-dial-credential-rejections"
+
+      # MHMediaDialWrongHandler — sustained aud_mismatch, the WRONG_HANDLER
+      # rate (runbook-alert-changes.md §E). Post-signature: a valid token whose
+      # aud names another handler OF THE SAME MEETING (aud_mismatch is decided
+      # only after the token verified with that meeting's one Ed25519 key, so
+      # the dialed handler holds the meeting). The migration transient is
+      # sequential address reuse (ADR-0039 §7): a client redials an address
+      # now held by the replacement incarnation with a token still naming the
+      # previous one, until its refreshed set and token arrive. Sustained = an
+      # MC set/routing defect.
+      - alert: MHMediaDialWrongHandler
+        expr: |
+          sum(increase(mh_jwt_validations_total{token_type="media_dial", failure_reason="aud_mismatch"}[15m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+          service: mh-service
+          component: media-admission
+        annotations:
+          summary: "Clients keep dialing media handlers their token does not name (WRONG_HANDLER)"
+          description: "mh_jwt_validations_total{token_type=\"media_dial\", failure_reason=\"aud_mismatch\"} has risen in every trailing 15-minute window for 15 minutes (at least two increments spread over about 30 minutes, not a continuous rate): valid, MC-minted tokens (post-signature) whose aud names another handler - the client sees WRONG_HANDLER. Seconds of this around a migration are expected; sustained, it is an MC handler-set or routing defect (the set a client holds disagrees with the token it was given). Read dt_client_mh_connection_total{outcome=\"wrong_handler\"} and mc_media_handler_set_pushes_total by reason."
+          impact: "Affected clients cannot connect to that handler and get no media from it."
+          runbook_url: "docs/runbooks/mh-incident-response.md#scenario-24-media-dial-credential-rejections"
+
+      # ------------------------------------------------------------------
+      # MHMeetingsHeldWithoutClients — registered meetings with no client
+      # connection, past the owner-silence timeout
+      #
+      # Owner-silence release should have cleared a meeting nobody owns. TWO
+      # causes (media-handler, Gate 1): (a) owner-silence release is broken
+      # (the owner is silent or mismatched and owner_silence releases are
+      # flat); (b) a LIVE owning MC keeps answering OWNED for a meeting on this
+      # MH that no client reaches - owner silence is reset by every OWNED
+      # verdict, so it never clears these; an MC-side or client-dial problem,
+      # not an MH leak.
+      # PER HANDLER: `max by (instance)` (instance is a target label, the
+      # contract's per-pod view; round-3 provisioning). The contract's
+      # `mh_media_meetings_without_clients > 0` is per series, i.e. per pod;
+      # `by (instance)` keeps exactly that and only dedupes nothing else. A
+      # fleet `max` would let DIFFERENT pods alternately hold it above zero and
+      # satisfy `for:` with no single handler ever holding a zero-client
+      # meeting that long (observability, Gate 3).
+      # KNOWN FALSE POSITIVE, owned here rather than hidden: the gauge is a
+      # per-MH aggregate, so on a busy handler overlapping routine zero-client
+      # windows of DIFFERENT meetings (before first join, after last leave,
+      # disconnect grace) can hold it above zero continuously even though
+      # every meeting clears. The responder's discriminator: owner_silence
+      # releases flat / a stuck owner_mismatch verdict or failing heartbeats,
+      # versus a steady churn of releases and teardowns.
+      #
+      # THE `for:` (one convention for config-derived `for:` literals, story 4
+      # OBS-ALERTS): for = ceil_to_whole_minute(sum of these terms):
+      #   - owner-silence timeout: mh_media_meeting_owner_silence_timeout_seconds
+      #     (live gauge; 900 s shipped, config range [300, 3600])
+      #   - gauge refresh: the session actor recomputes this gauge on its
+      #     rotation tick, ADMISSION_WINDOW_BUCKET
+      #     (mh-service/src/session/admission.rs; 10 s)
+      #   - service-job scrape_interval (the max over the service jobs, infra/kubernetes/observability/prometheus.yml; read live)
+      #   - this group's evaluation `interval:` (mh-service-warning)
+      # = 900 + 10 + 5 + 60 = 975 s -> 17m.
+      # Term deliberately NOT included: owner-silence release batching
+      # (MAX_RELEASES_PER_WAKE). Release deadlines are exact per meeting (lazy
+      # timers); the batch cap only re-arms the wake immediately when more
+      # than 64 meetings expire at once, so it adds no bounded delay worth a
+      # term.
+      # env-test 33 asserts derived <= for < derived + 60 s, every term read
+      # from its source.
+      # ------------------------------------------------------------------
+      - alert: MHMeetingsHeldWithoutClients
+        expr: |
+          max by (instance) (mh_media_meetings_without_clients) > 0
+        # ANCHOR (DRY): mh_media_meeting_owner_silence_timeout_seconds + ADMISSION_WINDOW_BUCKET + service-job scrape_interval + mh-service-warning interval, rounded up to the minute (derivation above; env-test 33 checks it against the live gauge)
+        for: 17m
+        labels:
+          severity: warning
+          service: mh-service
+          component: mc-integration
+        annotations:
+          summary: "A media handler ({{ $labels.instance }}) has held meetings with no client attached past the owner-silence timeout"
+          description: "mh_media_meetings_without_clients on {{ $labels.instance }} has stayed above zero for longer than the owner-silence timeout (mh_media_meeting_owner_silence_timeout_seconds) plus sampling. Two causes: (a) owner-silence release is broken - the owner MC is silent or mismatched (mh_mc_heartbeat_verdicts_total{outcome=\"owner_mismatch\"}, or mh_mc_heartbeats_total{outcome=~\"error|timeout\"}) yet mh_media_handler_releases_total{trigger=\"owner_silence\"} stays flat; escalate to media-handler, mh.sh drain as relief. (b) a live owning MC keeps answering OWNED for a meeting no client reaches (mh_mc_heartbeat_verdicts_total{outcome=\"owned\"} with no clients) - an MC-side or client-dial problem. Possible false positive on a busy handler: overlapping routine zero-client windows of different meetings on this handler can hold the gauge up; a steady churn of releases and teardowns means nothing is stuck."
+          impact: "Held meetings keep registration and capacity on the handler; no participant has media from them."
+          runbook_url: "docs/runbooks/mh-incident-response.md#scenario-25-meetings-held-without-clients"
 
   # ======================================================================
   # STORY 3 STREAM-PER-GROUP ("video") WARNINGS — OBS-B

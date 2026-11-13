@@ -17,7 +17,9 @@ use crate::fixtures::kube::{
     is_terminating, max_termination_grace, pods_json, resolve_generation, settled_serving_pods,
     REDEPLOY_HINT,
 };
-use crate::fixtures::metrics::{format_instance_map, instance_for_pod_ip, PrometheusClient};
+use crate::fixtures::metrics::{
+    agreed_value, format_instance_map, instance_for_pod_ip, PrometheusClient,
+};
 
 /// The label every GC pod carries (`infra/services/gc-service/deployment.yaml`).
 pub const GC_SELECTOR: &str = "app=gc-service";
@@ -320,22 +322,70 @@ async fn removal_settle_budget_for(
         })
         .and_then(|src| gc_health_tick(&src))?;
 
-    let staleness = prom
-        .instance_counter_map(STALENESS_PER_REPLICA_PROMQL)
-        .await;
-    let mut bound_s = 0.0_f64;
-    for p in &gc.serving {
-        let (_, b) = instance_for_pod_ip(&staleness, &p.ip).ok_or_else(|| {
-            format!(
-                "SETTLE (removed-mh-still-selectable): GC pod {} publishes no \
-                 gc_mh_staleness_threshold_seconds; instances {}",
-                p.name,
-                format_instance_map(&staleness)
-            )
-        })?;
-        bound_s = bound_s.max(b);
-    }
+    let bound_s = gc_replica_values(prom, STALENESS_PER_REPLICA_PROMQL, gc)
+        .await
+        .map_err(|e| format!("SETTLE (removed-mh-still-selectable): {e}"))?
+        .into_iter()
+        .map(|(_, b)| b)
+        .fold(0.0_f64, f64::max);
     Ok(Duration::from_secs_f64(bound_s) + 2 * tick + ConsistencyCategory::MetricsScrape.timeout())
+}
+
+/// The load-report interval each running GC publishes (story 4 GC-1;
+/// `GC_MH_LOAD_REPORT_INTERVAL_MS`), per replica.
+pub const LOAD_REPORT_INTERVAL_PER_REPLICA_PROMQL: &str =
+    "max by (instance) (gc_mh_load_report_interval_seconds)";
+
+/// `promql` (a `max by (instance) (...)` per-replica read) for EVERY serving
+/// GC replica in `gc`, as `(pod name, value)`. The ONE per-replica GC reader:
+/// [`removal_settle_budget_for`] takes the max of it, and
+/// [`gc_config_gauge_agreed`] requires agreement.
+///
+/// # Errors
+/// A serving replica publishes no series for `promql` (a scrape/startup fault,
+/// never a default), or no replica serves.
+pub async fn gc_replica_values(
+    prom: &PrometheusClient,
+    promql: &str,
+    gc: &GcPods,
+) -> Result<Vec<(String, f64)>, String> {
+    if gc.serving.is_empty() {
+        return Err(format!("no serving GC replica to read `{promql}` from"));
+    }
+    let map = prom.instance_counter_map(promql).await;
+    gc.serving
+        .iter()
+        .map(|p| {
+            instance_for_pod_ip(&map, &p.ip)
+                .map(|(_, v)| (p.name.clone(), v))
+                .ok_or_else(|| {
+                    format!(
+                        "GC pod {} publishes no `{promql}`; instances {}",
+                        p.name,
+                        format_instance_map(&map)
+                    )
+                })
+        })
+        .collect()
+}
+
+/// A GC config gauge every serving replica publishes with the SAME value
+/// (`promql` is the per-replica read). For a derivation that must hold on
+/// every replica, never the max of a mixed fleet.
+///
+/// # Errors
+/// As [`gc_replica_values`] and [`agreed_value`].
+pub async fn gc_config_gauge_agreed(
+    prom: &PrometheusClient,
+    promql: &str,
+    gc: &GcPods,
+) -> Result<Duration, String> {
+    let values = gc_replica_values(prom, promql, gc).await?;
+    let v = agreed_value(promql, &values)?;
+    if v <= 0.0 {
+        return Err(format!("`{promql}` is not positive ({v})"));
+    }
+    Ok(Duration::from_secs_f64(v))
 }
 
 /// After a test REMOVED an MH (owner teardown), wait until no GC replica still
@@ -492,9 +542,84 @@ pub fn const_str_array(source: &str, name: &str) -> Result<Vec<String>, String> 
         .collect())
 }
 
+/// PURE: the value of the ONE `const <name>: Duration = Duration::from_secs(<n>);`
+/// (optionally `pub`) declaration in `source`. The home a derivation reads a
+/// service's source const from when that const has no gauge (env-tests cannot
+/// import service crates, ADR-0028).
+///
+/// # Errors
+/// FAIL-CLOSED, as `SOURCE-CONST-MISSING` (distinct from any content verdict):
+/// no such declaration, more than one, or any other initialiser form
+/// (`from_millis`, an expression, a non-integer) — never a default and never a
+/// unit guess.
+pub fn const_duration_secs(source: &str, name: &str) -> Result<Duration, String> {
+    let decls: Vec<&str> = source
+        .lines()
+        .map(str::trim)
+        .filter(|l| {
+            let l = l.strip_prefix("pub ").unwrap_or(l);
+            l.strip_prefix("const ")
+                .and_then(|rest| rest.strip_prefix(name))
+                .is_some_and(|rest| rest.trim_start().starts_with(':'))
+        })
+        .collect();
+    let [decl] = decls.as_slice() else {
+        return Err(format!(
+            "SOURCE-CONST-MISSING: expected exactly one `const {name}: Duration` declaration, \
+             found {}",
+            decls.len()
+        ));
+    };
+    decl.split_once('=')
+        .map(|(_, init)| init.trim())
+        .and_then(|init| init.strip_prefix("Duration::from_secs("))
+        .and_then(|rest| rest.strip_suffix(");"))
+        .and_then(|n| n.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .map(Duration::from_secs)
+        .ok_or_else(|| {
+            format!(
+                "SOURCE-CONST-MISSING: `{name}` is not `Duration::from_secs(<positive integer>);` \
+                 (found `{decl}`); re-derive the reader rather than guessing a unit"
+            )
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn const_duration_secs_reads_one_from_secs_and_fails_closed() {
+        let src = "const BACKOFF_BASE: Duration = Duration::from_secs(1);\n\
+                   /// docs\n\
+                   const BACKOFF_MAX: Duration = Duration::from_secs(30);\n";
+        assert_eq!(
+            const_duration_secs(src, "BACKOFF_MAX").unwrap(),
+            Duration::from_secs(30)
+        );
+        // `pub` and a prefix-sharing sibling are both handled.
+        let src_pub = "pub const ADMISSION_WINDOW_BUCKET: Duration = Duration::from_secs(10);\n\
+                       pub const ADMISSION_WINDOW_BUCKETS: usize = 30;\n";
+        assert_eq!(
+            const_duration_secs(src_pub, "ADMISSION_WINDOW_BUCKET").unwrap(),
+            Duration::from_secs(10)
+        );
+        // Renamed const: absent, never a default.
+        let renamed = src.replace("BACKOFF_MAX", "BACKOFF_CAP");
+        let e = const_duration_secs(&renamed, "BACKOFF_MAX").unwrap_err();
+        assert!(e.starts_with("SOURCE-CONST-MISSING"), "{e}");
+        // from_millis must NOT be read as seconds.
+        let millis = "const BACKOFF_MAX: Duration = Duration::from_millis(30000);";
+        let e = const_duration_secs(millis, "BACKOFF_MAX").unwrap_err();
+        assert!(e.starts_with("SOURCE-CONST-MISSING"), "{e}");
+        // Two declarations: ambiguous.
+        let twice = format!("{src}const BACKOFF_MAX: Duration = Duration::from_secs(31);");
+        let e = const_duration_secs(&twice, "BACKOFF_MAX").unwrap_err();
+        assert!(e.contains("found 2"), "{e}");
+        // Zero is not a bound.
+        assert!(const_duration_secs("const X: Duration = Duration::from_secs(0);", "X").is_err());
+    }
 
     #[test]
     fn rebaseline_handles_counter_reset_and_unseen_baseline() {

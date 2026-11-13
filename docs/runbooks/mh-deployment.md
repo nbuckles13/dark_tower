@@ -635,7 +635,7 @@ sum by (trigger, outcome) (increase(mc_media_handler_migrations_total{outcome=~"
 sum(increase(mc_media_handler_migrations_total{trigger="planned_transfer", outcome="completed"}[24h]))
 
 # 3. No meeting is awaiting a handler. Expected 0 on every MC pod (paged by
-#    MCMediaMeetingsAwaitingHandler, lands with OBS-ALERTS).
+#    MCMediaMeetingsAwaitingHandler).
 max(mc_media_meetings_without_handlers)
 
 # 4. GC registrations: address_conflict FLAT; superseded only at crash restarts (match="both").
@@ -1465,8 +1465,8 @@ assignment keep admitting participants (a sticky join never re-checks the MH poo
 those joins succeed into silence**: GC returns 200, the participant's handler is gone, and no media
 flows. That is worse for the operator than a clean failure, because nothing at the join tells the participant
 it went wrong. Every existing meeting loses its last handler and sits **awaiting a handler**, visible as
-`mc_media_meetings_without_handlers` > 0 and paged by `MCMediaMeetingsAwaitingHandler` (lands with
-OBS-ALERTS; [`mc-incident-response.md` Scenario 25](mc-incident-response.md#scenario-25-meetings-awaiting-a-media-handler)).
+`mc_media_meetings_without_handlers` > 0 and paged by `MCMediaMeetingsAwaitingHandler`
+([`mc-incident-response.md` Scenario 25](mc-incident-response.md#scenario-25-meetings-awaiting-a-media-handler)).
 So scaling to zero converts a media-path problem into a **new-meeting outage plus
 silent media in every existing meeting**, whose blast radius is strictly wider than the problem it
 was aimed at, including meetings that were not affected by whatever prompted the action.
