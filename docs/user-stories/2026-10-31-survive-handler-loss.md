@@ -2594,7 +2594,7 @@ tasks:
   slug: 2026-11-13-client-mh-replacement-ux-telemetry
   tag: story-2026-10-31-survive-handler-loss-task-C2
 - id: 27
-  status: pending
+  status: completed
   specialist: infrastructure
   deps:
   - 9
@@ -2649,6 +2649,7 @@ tasks:
     INDEX: add pointers for the new guard modules in docs/specialist-knowledge/infrastructure/INDEX.md (pointers only; run scripts/guards/simple/validate-knowledge-index.sh).
 
     COVERS: code (guards), unit-tests.
+  slug: 2026-11-13-mh-slot-deploy-guards
   tag: story-2026-10-31-survive-handler-loss-task-I-3
   tier: light
   tier_reason: 'Guard machinery only: dt-guard rules and fixtures with no runtime behaviour, no wire contract, no secrets'
