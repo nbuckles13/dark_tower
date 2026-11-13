@@ -335,6 +335,15 @@ export function parseList(doc: Record<string, unknown>): PoolSnapshot {
 }
 
 /**
+ * PURE: the SERVING slots of a snapshot — THE "live / GC-selectable MH" count
+ * (Rust `PoolSnapshot::serving`): the owned-placement search's `m` and the
+ * removed-MH settle's live ceiling (`mhLeg.ts`).
+ */
+export function servingSlotCount(snap: PoolSnapshot): number {
+  return snap.slots.filter((s) => s.state === 'serving').length;
+}
+
+/**
  * PURE: twin of Rust `baseline_verdict`. Returns the failure, or null when
  * clean. `reclaim(owner)` builds the hint per foreign owner (the pool's
  * `reclaimCommandFor`, so the printed command is the executed one).
@@ -366,6 +375,24 @@ export function baselineVerdict(
     `${FOREIGN_MH_ACTIVITY}: the MH pool is not {baseline B, this run ${run}}: ${problems.join('; ')}. ` +
     'Layer 7 supports one suite per cluster; inspect `$DT_MH_SH list`' +
     (hints.length === 0 ? '' : `; reclaim a leaked run with: ${hints.join(' ; ')}`)
+  );
+}
+
+/**
+ * PURE: twin of Rust `run_leak_verdict` — nothing left owned by `run`, nothing
+ * stuck past its grace. Returns the failure (naming the slots), or null. Used
+ * by `teardown` AFTER a leg and by `mhLeg.ts` BEFORE one (a leak from an
+ * earlier timed-out or killed leg is owned by this same run, so the baseline
+ * verdict alone accepts it).
+ */
+export function runLeakVerdict(snap: PoolSnapshot, run: string): string | null {
+  const leaked = snap.slots.filter(
+    (s) => s.pod !== null && (s.owner === run || s.terminating_past_grace),
+  );
+  if (leaked.length === 0) return null;
+  return (
+    `${MH_RUN_LEAK}: the pool holds slot(s) ` +
+    leaked.map((s) => `${s.slot} (${s.state}, owner ${JSON.stringify(s.owner)})`).join(', ')
   );
 }
 
@@ -666,14 +693,9 @@ export function createMhPool(opts: MhPoolOptions = {}): MhPool {
           `TEARDOWN (mh-teardown-failed): owner ${o} not drained: REASON=${r.reason}. Reclaim manually: ${reclaimCommandFor(o)}`,
         );
       }
-      const leaked = (await list()).slots.filter(
-        (s) => s.pod !== null && (s.owner === o || s.terminating_past_grace),
-      );
-      if (leaked.length > 0) {
-        throw new Error(
-          `TEARDOWN (${MH_RUN_LEAK}: after teardown the pool still holds slot(s) ${leaked.map((s) => s.slot).join(', ')}). ` +
-            `Reclaim manually: ${reclaimCommandFor(o)}`,
-        );
+      const leak = runLeakVerdict(await list(), o);
+      if (leak !== null) {
+        throw new Error(`TEARDOWN (${leak}). Reclaim manually: ${reclaimCommandFor(o)}`);
       }
     },
     async kill(slot) {

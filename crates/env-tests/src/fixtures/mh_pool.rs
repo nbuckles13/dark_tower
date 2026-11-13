@@ -1264,9 +1264,14 @@ impl MhPool {
         // Foreign activity also covers MC: no meeting from an earlier suite may
         // be alive, or MC can pull this leg's run-owned MH into it as a
         // replacement (story 4 MC-C) and the leg would count its releases.
-        crate::fixtures::metrics::await_no_mc_meetings(&prom, std::time::Duration::from_secs(2))
-            .await
-            .unwrap_or_else(|e| panic!("{e}"));
+        crate::fixtures::metrics::await_no_mc_meetings(
+            &prom,
+            // Two reads one SCRAPE apart (observability C3): reads closer than
+            // the service-job scrape interval compare one sample with itself.
+            crate::fixtures::metrics::service_job_scrape_settle(&prom).await,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
 
         let outcome = tokio::spawn(body(std::sync::Arc::clone(&pool), prom_url)).await;
 
@@ -1607,6 +1612,34 @@ impl MhSlot {
         .await;
     }
 
+    /// [`MhSlot::wait_scraped`], but only once the pinned instance's `up`
+    /// sample was TAKEN at or after `since_unix_secs`: an in-place restart
+    /// keeps the pod IP (so the instance), and the pre-restart `up == 1`
+    /// sample would otherwise satisfy the wait before Prometheus ever scraped
+    /// the new process. Same failure-only ceiling and token.
+    ///
+    /// # Panics
+    /// [`MH_SCRAPE_UP_TIMEOUT`] at the ceiling.
+    pub async fn wait_scraped_since(
+        &self,
+        prom: &crate::fixtures::metrics::PrometheusClient,
+        since_unix_secs: f64,
+    ) {
+        let ceiling = 2 * crate::fixtures::metrics::service_job_scrape_settle(prom).await;
+        crate::fixtures::metrics::poll_until_pinned_instance(
+            prom,
+            MH_UP_TIMESTAMP_PROMQL,
+            &self.pod_ip,
+            ceiling,
+            std::time::Duration::from_secs(1),
+            MH_SCRAPE_UP_TIMEOUT,
+            "a sample taken after the restart",
+            |t| t >= since_unix_secs,
+        )
+        .await;
+        self.wait_scraped(prom).await;
+    }
+
     fn drain_with(self, no_wait: bool) {
         let slot = self.slot.to_string();
         let mut args = vec!["drain", slot.as_str(), "--owner", self.owner.as_str()];
@@ -1705,7 +1738,14 @@ impl MhSlot {
         .await
         .unwrap_or_else(|e| panic!("{e} (polled for {ceiling:?})"));
         self.refresh(&after);
-        self.wait_scraped(prom).await;
+        // The restart keeps the pod IP, so `up` for this instance may still be
+        // the PRE-KILL incarnation's sample: require a scrape taken after the
+        // restart was observed before anyone re-baselines (observability C3).
+        let since = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after the epoch")
+            .as_secs_f64();
+        self.wait_scraped_since(prom, since).await;
     }
 
     /// Pool-mutating. SIGSTOP the mh-service process (`mh.sh signal STOP`).
@@ -1781,6 +1821,10 @@ fn best_effort_cont(slot: &MhSlot) {
 
 /// `up` of the mh-service job, the scrape-liveness series.
 pub const MH_UP_PROMQL: &str = r#"up{job="mh-service"}"#;
+
+/// When each MH instance's `up` sample was taken (unix seconds): the
+/// freshness half of [`MhSlot::wait_scraped_since`].
+pub const MH_UP_TIMESTAMP_PROMQL: &str = r#"timestamp(up{job="mh-service"})"#;
 
 /// A SIGSTOPped run-owned MH. [`FreezeGuard::resume`] is the explicit,
 /// asserted end. Dropped while still frozen (a panicking leg), it sends a

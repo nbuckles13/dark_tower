@@ -35,7 +35,13 @@ import {
   type Member,
 } from './cohortContexts.js';
 import type { CohortMemberPlan } from './cohort.js';
-import { bootstrapMeeting, busEvents, handlerUrls, latestBusEventsOf } from './fixtures.js';
+import {
+  bootstrapMeeting,
+  busEvents,
+  connectedUrls,
+  handlerUrls,
+  latestBusEventsOf,
+} from './fixtures.js';
 import { mhAdmissionRejectionsByInstance } from './mcMetrics.js';
 import {
   acceptedProbe,
@@ -52,24 +58,13 @@ import { parseVideoSlots } from './videoBusShape.js';
 import { judgeUnreachable } from './videoEvidence.js';
 import { VideoScenario } from './videoScenario.js';
 
-/**
- * The handler URLs this context's own bus reports connected (deduped: a redial
- * of the same handler is not a second connection).
- */
-async function connectedSet(member: Pick<JoinedMember, 'page'>): Promise<string[]> {
-  const urls = (await busEvents(member.page))
-    .filter((e) => e['type'] === 'mediaConnected')
-    .map((e) => e['url'] as string);
-  return [...new Set(urls)].sort();
-}
-
 /** How many handlers `member`'s own bus reports connected — must stay flat. */
 function connectedCountProbe(member: JoinedMember): Probe {
   return {
     label: `${member.label}.connectedHandlers`,
     observer: member.label,
     expect: 'flat',
-    read: async () => (await connectedSet(member)).length,
+    read: async () => (await connectedUrls(member.page)).length,
   };
 }
 
@@ -123,10 +118,14 @@ test.describe('story 2 S10a: partial connectivity (client handler lever)', () =>
         ).toEqual(offered);
       }
       await expect
-        .poll(() => connectedSet(a), { message: 'A connects to every handler' })
+        .poll(() => connectedUrls(a.page), { message: 'A connects to every handler' })
         .toEqual(offered);
-      await expect.poll(() => connectedSet(b), { message: 'B connects to u0 only' }).toEqual([u0]);
-      await expect.poll(() => connectedSet(c), { message: 'C connects to u1 only' }).toEqual([u1]);
+      await expect
+        .poll(() => connectedUrls(b.page), { message: 'B connects to u0 only' })
+        .toEqual([u0]);
+      await expect
+        .poll(() => connectedUrls(c.page), { message: 'C connects to u1 only' })
+        .toEqual([u1]);
 
       // A hears B and C; B and C each hear A — all three layers.
       const cohort = [a.tone, b.tone, c.tone];
@@ -233,8 +232,12 @@ test.describe('story 3 R-33: partial connectivity with video slots', () => {
         expectAllHandlers: false,
         handlers: [u1],
       });
-      await expect.poll(() => connectedSet(b), { message: 'B connects to u0 only' }).toEqual([u0]);
-      await expect.poll(() => connectedSet(c), { message: 'C connects to u1 only' }).toEqual([u1]);
+      await expect
+        .poll(() => connectedUrls(b.page), { message: 'B connects to u0 only' })
+        .toEqual([u0]);
+      await expect
+        .poll(() => connectedUrls(c.page), { message: 'C connects to u1 only' })
+        .toEqual([u1]);
 
       // Every video slot per the oracle: A sees B and C; B and C each see A only.
       for (const m of [a, b, c]) await scenario.expectVideo(m.label, 'partial connectivity');
