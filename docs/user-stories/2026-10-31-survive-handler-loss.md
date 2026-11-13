@@ -2412,7 +2412,7 @@ tasks:
   slug: 2026-11-12-mc-crash-replacement-via-gc
   tag: story-2026-10-31-survive-handler-loss-task-MC-C
 - id: 24
-  status: pending
+  status: completed
   specialist: meeting-controller
   deps:
   - 23
@@ -2459,6 +2459,7 @@ tasks:
     SAME-COMMIT OBLIGATIONS: (a) MC_PLANNED_TRANSFER_MARGIN_MS Configuration Reference row; (b) n/a; (c) the config gauge with panel + catalog + zero-init + ADR-0032 test; (d) test-gates items above; (e) no id labels.
 
     Tier: full (cross-service behaviour with MH drain, architectural seam).
+  slug: 2026-11-12-mc-planned-transfer
   tag: story-2026-10-31-survive-handler-loss-task-MC-F
 - id: 25
   status: pending
