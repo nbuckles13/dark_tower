@@ -51,6 +51,7 @@ use crate::common::cargo_manifest::read_root_manifest;
 use crate::common::explain::{print_finding, Finding};
 use crate::common::git_changes::{get_tracked_files, get_untracked_files};
 use crate::common::ident::is_ident_byte;
+use crate::common::shell_consts::shell_const;
 use crate::common::status::{emit_ok, emit_scope};
 use anyhow::Result;
 use once_cell::sync::Lazy;
@@ -230,15 +231,16 @@ fn enumerate(repo_root: &Path) -> Result<BTreeSet<String>> {
 }
 
 /// Parse tool-bins.sh's `DT_TOOLS_PROFILE=` and `DT_TOOLS_CRATES=` assignments.
-/// Each must appear exactly once, at line start, unconditionally.
+/// Each must appear exactly once, at line start, as a literal — read through
+/// the ONE Bash-constant reader, `common::shell_consts::shell_const`.
 pub fn parse_tool_bins(src: &str) -> std::result::Result<ToolBins, String> {
-    let profile = single_assignment(src, "DT_TOOLS_PROFILE")?;
+    let profile = shell_const(src, "DT_TOOLS_PROFILE")?;
     if profile.is_empty() || !profile.chars().all(is_name_char) {
         return Err(format!(
             "DT_TOOLS_PROFILE='{profile}' is not a plain profile name"
         ));
     }
-    let crates_raw = single_assignment(src, "DT_TOOLS_CRATES")?;
+    let crates_raw = shell_const(src, "DT_TOOLS_CRATES")?;
     let crates: Vec<String> = crates_raw.split_whitespace().map(str::to_string).collect();
     if crates.is_empty() || crates.iter().any(|c| !c.chars().all(is_name_char)) {
         return Err(format!(
@@ -246,24 +248,6 @@ pub fn parse_tool_bins(src: &str) -> std::result::Result<ToolBins, String> {
         ));
     }
     Ok(ToolBins { profile, crates })
-}
-
-fn single_assignment(src: &str, var: &str) -> std::result::Result<String, String> {
-    let prefix = format!("{var}=");
-    let values: Vec<&str> = src
-        .lines()
-        .filter_map(|l| l.strip_prefix(&prefix))
-        .collect();
-    match values.as_slice() {
-        [v] => Ok(v.trim().trim_matches(|c| c == '"' || c == '\'').to_string()),
-        [] => Err(format!(
-            "no `{var}=` assignment at line start — the guard cannot learn what to police"
-        )),
-        _ => Err(format!(
-            "{} `{var}=` assignments — exactly one is the contract",
-            values.len()
-        )),
-    }
 }
 
 fn is_name_char(c: char) -> bool {

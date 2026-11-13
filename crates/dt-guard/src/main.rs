@@ -21,6 +21,7 @@ use dt_guard::cross_boundary_scope;
 use dt_guard::dashboard_panels;
 use dt_guard::docker_context;
 use dt_guard::env_config;
+use dt_guard::force_delete_ban;
 use dt_guard::grafana_datasources;
 use dt_guard::gsa_sync;
 use dt_guard::histogram_buckets;
@@ -32,6 +33,7 @@ use dt_guard::kustomize;
 use dt_guard::media_telemetry_deny;
 use dt_guard::metric_coverage;
 use dt_guard::metric_labels;
+use dt_guard::mh_slot_model;
 use dt_guard::no_insecure_browser_flags;
 use dt_guard::proto_no_any;
 use dt_guard::proto_per_kind_fields;
@@ -492,6 +494,27 @@ enum Command {
         #[arg(long)]
         explain: bool,
     },
+    /// MH slot model (ADR-0039 §7, R-31): no MH workload in the environment-root
+    /// apply set, and no drift between the slot table (ports.rs), the
+    /// kind-configs, the per-slot ConfigMaps and GC's MH allowlists.
+    MhSlotModel {
+        /// Repository root for path resolution.
+        #[arg(long)]
+        root: PathBuf,
+        /// Emit single-line `EXPLAIN:` records per finding (ADR §7).
+        #[arg(long)]
+        explain: bool,
+    },
+    /// Force-delete ban (ADR-0039 §9, R-28): no pod deletion with `--force`
+    /// (zero grace) in infra/, scripts/, crates/env-tests/ or packages/*/e2e.
+    ForceDeleteBan {
+        /// Repository root for path resolution.
+        #[arg(long)]
+        root: PathBuf,
+        /// Emit single-line `EXPLAIN:` records per finding (ADR §7).
+        #[arg(long)]
+        explain: bool,
+    },
     /// Test-coverage quick-check (warning-only; --full mode deferred to Wave 3).
     TestCoverage {
         /// Repository root for path resolution.
@@ -671,6 +694,8 @@ fn run(cli: Cli) -> Result<()> {
         Command::TodoTracking { root, explain } => todo_tracking::run(&root, explain),
         Command::EnvConfig { root, explain } => env_config::run(&root, explain),
         Command::Kustomize { root, explain } => kustomize::run(&root, explain),
+        Command::MhSlotModel { root, explain } => mh_slot_model::run(&root, explain),
+        Command::ForceDeleteBan { root, explain } => force_delete_ban::run(&root, explain),
         Command::TestCoverage { root, explain } => test_coverage::run(&root, explain),
         Command::TestRegistration { root, explain } => test_registration::run(&root, explain),
         Command::TestRigidity { root, explain } => test_rigidity::run(&root, explain),

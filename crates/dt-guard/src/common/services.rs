@@ -26,6 +26,12 @@ pub const INFRA_SERVICES_DIR: &str = "infra/services";
 /// `kustomize` selects the `kind` overlay from it.
 pub const INFRA_OVERLAYS_DIR: &str = "infra/kubernetes/overlays";
 
+/// The Kind environment's directory name under [`INFRA_OVERLAYS_DIR`]. THE one
+/// spelling: `kustomize` renders it (`build_targets`), classifies renders under
+/// it as Kind, and treats every OTHER environment as unrendered (fail closed;
+/// `kustomize_mh_template::unrendered_environments`).
+pub const KIND_ENV: &str = "kind";
+
 /// Every Kustomize base under `infra/services/` — the directory names, sorted.
 ///
 /// THE ONE enumeration of service bases. `kustomize` R-15/R-16 build and

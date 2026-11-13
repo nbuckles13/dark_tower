@@ -1079,6 +1079,16 @@ yaml_docs_to_json() {
 # (the placeholder advertise ConfigMap).
 MH_TEMPLATE_PART_JQ='def mh_template_part($n; $l): (.kind == "Deployment" and .metadata.name == $n) or (((.metadata.labels // {})[$l] // "") == "true");'
 
+# THE environment-root APPLY SET: the render on stdin (render_env_root_json
+# output, one JSON doc per line) minus every MH template part, printed as ONE
+# kubectl List. The ONE derivation: apply_env_root applies exactly this, and
+# `dt-guard mh-slot-model` (crates/dt-guard/src/mh_slot_model.rs) runs it to
+# prove no MH workload is in the root apply set. Pipes only (Secrets).
+env_root_apply_list() {
+    jq -s -c --arg n "${MH_TEMPLATE_DEPLOYMENT}" --arg l "${MH_TEMPLATE_INPUT_LABEL}" \
+        "${MH_TEMPLATE_PART_JQ}"' {apiVersion: "v1", kind: "List", items: [.[] | select(mh_template_part($n; $l) | not)]}'
+}
+
 # Apply the environment root, ALWAYS through the wrapper rendered above — chosen
 # HERE and nowhere else, so no caller can apply the plain root (placeholder
 # images; on a devloop cluster, localhost advertise addresses). A render failure
@@ -1104,10 +1114,7 @@ apply_env_root() (
         exit 1
     fi
     log_step "Applying environment root ${ENV_ROOT_REL} (content-tagged images${DT_HOST_GATEWAY_IP:+; devloop advertise addresses via ${DT_HOST_GATEWAY_IP}}; MH template stored, not applied)..."
-    printf '%s\n' "${docs}" \
-        | jq -s -c --arg n "${MH_TEMPLATE_DEPLOYMENT}" --arg l "${MH_TEMPLATE_INPUT_LABEL}" \
-            "${MH_TEMPLATE_PART_JQ}"' {apiVersion: "v1", kind: "List", items: [.[] | select(mh_template_part($n; $l) | not)]}' \
-        | ${KUBECTL} apply -f -
+    printf '%s\n' "${docs}" | env_root_apply_list | ${KUBECTL} apply -f -
     retire_stale_slot_configmaps "${docs}"
     write_mh_template "${docs}"
 )
