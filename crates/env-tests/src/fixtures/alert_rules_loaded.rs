@@ -116,27 +116,10 @@ pub fn mounted_rules_files(kustomization: &str) -> Option<BTreeSet<String>> {
 /// file declares no alerts" have different causes and the caller must not
 /// collapse them into a clean result.
 pub fn alert_names_in_yaml(content: &str) -> Option<BTreeSet<String>> {
-    #[derive(serde::Deserialize)]
-    struct Doc {
-        groups: Vec<Group>,
-    }
-    #[derive(serde::Deserialize)]
-    struct Group {
-        #[serde(default)]
-        rules: Vec<Rule>,
-    }
-    #[derive(serde::Deserialize)]
-    struct Rule {
-        #[serde(default)]
-        alert: Option<String>,
-    }
-    let doc: Doc = serde_norway::from_str(content).ok()?;
     Some(
-        doc.groups
+        committed_rules(content)?
             .into_iter()
-            .flat_map(|g| g.rules)
-            .filter_map(|r| r.alert)
-            .filter(|a| !a.is_empty())
+            .map(|r| r.alert)
             .collect(),
     )
 }
@@ -147,27 +130,9 @@ pub fn alert_names_in_yaml(content: &str) -> Option<BTreeSet<String>> {
 /// so the probe cannot keep testing a stale expression after the rule changes.
 /// `None` when the document does not parse, or declares no such alert.
 pub fn alert_expr_in_yaml(content: &str, alert: &str) -> Option<String> {
-    #[derive(serde::Deserialize)]
-    struct Doc {
-        groups: Vec<Group>,
-    }
-    #[derive(serde::Deserialize)]
-    struct Group {
-        #[serde(default)]
-        rules: Vec<Rule>,
-    }
-    #[derive(serde::Deserialize)]
-    struct Rule {
-        #[serde(default)]
-        alert: Option<String>,
-        #[serde(default)]
-        expr: Option<String>,
-    }
-    let doc: Doc = serde_norway::from_str(content).ok()?;
-    doc.groups
+    committed_rules(content)?
         .into_iter()
-        .flat_map(|g| g.rules)
-        .find(|r| r.alert.as_deref() == Some(alert))
+        .find(|r| r.alert == alert)
         .and_then(|r| r.expr)
 }
 
@@ -192,21 +157,46 @@ pub fn committed_alert_expr(file: &str, alert: &str) -> String {
 /// Parsed as JSON, never line-matched. Returns `None` when the envelope is not
 /// a successful, well-formed rules response — again distinct from an empty set.
 pub fn loaded_alert_names(body: &str) -> Option<BTreeSet<String>> {
+    Some(
+        loaded_alerting_rules(body)?
+            .into_iter()
+            .map(|r| r.name)
+            .collect(),
+    )
+}
+
+/// One loaded ALERTING rule from `/api/v1/rules`, with its group's interval.
+struct LoadedAlertingRule {
+    name: String,
+    group_interval_seconds: Option<f64>,
+    rule: serde_json::Value,
+}
+
+/// THE `/api/v1/rules` envelope walk (status == success, data.groups, the
+/// `type == "alerting"` filter, the name): every loaded-rule reader below is a
+/// projection of this. `None` when the body is not a successful, well-formed
+/// rules envelope — distinct from an empty set.
+fn loaded_alerting_rules(body: &str) -> Option<Vec<LoadedAlertingRule>> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
     if v.get("status").and_then(serde_json::Value::as_str) != Some("success") {
         return None;
     }
-    let groups = v.get("data")?.get("groups")?.as_array()?;
-    let mut out = BTreeSet::new();
-    for g in groups {
+    let mut out = Vec::new();
+    for g in v.get("data")?.get("groups")?.as_array()? {
+        let interval = g.get("interval").and_then(serde_json::Value::as_f64);
         let Some(rules) = g.get("rules").and_then(serde_json::Value::as_array) else {
             continue;
         };
         for r in rules {
-            if r.get("type").and_then(serde_json::Value::as_str) == Some("alerting") {
-                if let Some(name) = r.get("name").and_then(serde_json::Value::as_str) {
-                    out.insert(name.to_string());
-                }
+            if r.get("type").and_then(serde_json::Value::as_str) != Some("alerting") {
+                continue;
+            }
+            if let Some(name) = r.get("name").and_then(serde_json::Value::as_str) {
+                out.push(LoadedAlertingRule {
+                    name: name.to_string(),
+                    group_interval_seconds: interval,
+                    rule: r.clone(),
+                });
             }
         }
     }
@@ -260,6 +250,18 @@ impl MatchOp {
     #[must_use]
     pub const fn is_negated(self) -> bool {
         matches!(self, Self::Ne | Self::Nre)
+    }
+
+    /// The operator's PromQL spelling: the inverse of [`scan_matchers`]'
+    /// text-to-operator mapping, so one type owns both directions.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Eq => "=",
+            Self::Ne => "!=",
+            Self::Re => "=~",
+            Self::Nre => "!~",
+        }
     }
 }
 
@@ -628,30 +630,19 @@ pub fn formatted_query(body: &str) -> Option<String> {
 pub fn loaded_alert_queries(
     body: &str,
 ) -> Option<std::collections::BTreeMap<String, Option<String>>> {
-    let v: serde_json::Value = serde_json::from_str(body).ok()?;
-    if v.get("status").and_then(serde_json::Value::as_str) != Some("success") {
-        return None;
-    }
-    let mut out = std::collections::BTreeMap::new();
-    for g in v.get("data")?.get("groups")?.as_array()? {
-        let Some(rules) = g.get("rules").and_then(serde_json::Value::as_array) else {
-            continue;
-        };
-        for r in rules {
-            if r.get("type").and_then(serde_json::Value::as_str) != Some("alerting") {
-                continue;
-            }
-            if let Some(name) = r.get("name").and_then(serde_json::Value::as_str) {
-                out.insert(
-                    name.to_string(),
-                    r.get("query")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_string),
-                );
-            }
-        }
-    }
-    Some(out)
+    Some(
+        loaded_alerting_rules(body)?
+            .into_iter()
+            .map(|r| {
+                let q = r
+                    .rule
+                    .get("query")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                (r.name, q)
+            })
+            .collect(),
+    )
 }
 
 /// Verdict of comparing a loaded rule's expression with the committed one.
@@ -761,8 +752,769 @@ pub fn ts_numeric_array_const(src: &str, name: &str) -> Result<Vec<f64>, String>
     Ok(values)
 }
 
+// =============================================================================
+// Story 4 (OBS-ALERTS): `for:` derivations, APPLY probes, page-posture check
+// =============================================================================
+//
+// Pure kernels for env-test 33's story-4 tests, unit-tested below for the same
+// reason as everything else in this module: a cluster-gated file gets no unit
+// coverage. Every one fails CLOSED (an `Err` / `None` the caller reports as
+// COULD-NOT-EVALUATE), never "nothing found".
+
+/// One alerting rule as committed, with its group's evaluation interval.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedRule {
+    /// `alert:`
+    pub alert: String,
+    /// `labels.severity`, if present.
+    pub severity: Option<String>,
+    /// `expr:` (`None` if the rule has none; callers that need it report
+    /// COULD-NOT-EVALUATE).
+    pub expr: Option<String>,
+    /// `for:` as written, if present.
+    pub for_: Option<String>,
+    /// The enclosing group's `interval:` as written, if present.
+    pub group_interval: Option<String>,
+}
+
+/// Every alerting rule in one rules file's YAML: THE rule-file YAML kernel
+/// (`alert_names_in_yaml` and `alert_expr_in_yaml` are projections of it).
+/// `None` when the document does not parse (a broken extraction, not an empty
+/// file).
+#[must_use]
+pub fn committed_rules(content: &str) -> Option<Vec<CommittedRule>> {
+    #[derive(serde::Deserialize)]
+    struct Doc {
+        groups: Vec<Group>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Group {
+        #[serde(default)]
+        interval: Option<String>,
+        #[serde(default)]
+        rules: Vec<Rule>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Rule {
+        #[serde(default)]
+        alert: Option<String>,
+        #[serde(default)]
+        expr: Option<String>,
+        #[serde(default, rename = "for")]
+        for_: Option<String>,
+        #[serde(default)]
+        labels: std::collections::BTreeMap<String, String>,
+    }
+    let doc: Doc = serde_norway::from_str(content).ok()?;
+    let mut out = Vec::new();
+    for g in doc.groups {
+        for r in g.rules {
+            let Some(alert) = r.alert.filter(|a| !a.is_empty()) else {
+                continue;
+            };
+            out.push(CommittedRule {
+                alert,
+                severity: r.labels.get("severity").cloned(),
+                expr: r.expr,
+                for_: r.for_,
+                group_interval: g.interval.clone(),
+            });
+        }
+    }
+    Some(out)
+}
+
+/// The marker a `for:` literal that stands in for a config gauge carries.
+pub const FOR_ANCHOR_MARKER: &str = "ANCHOR (DRY):";
+
+/// The alerts whose `for:` line is ANCHORED: `ANCHOR (DRY):` inline on the
+/// `for:` line, or in the contiguous comment lines immediately above it.
+///
+/// STRUCTURAL by design (test review, Gate 1): an `ANCHOR (DRY):` elsewhere in a
+/// rule's ADR-0031 block (e.g. `GCMhRegistrationPingPong` citing the
+/// load-report interval in its derivation, which is not a `for:` proxy) is NOT
+/// an anchored `for:`, so the closed-set check never sweeps it in.
+///
+/// # Errors
+/// FAIL-CLOSED: an anchored `for:` that resolves to no `- alert:` name (an
+/// orphan, or an alert written in a form this line scan does not read), or a
+/// name the YAML parse ([`committed_rules`]) does not know — the line scan and
+/// the parse must agree, never silently differ.
+pub fn anchored_for_alerts(content: &str) -> Result<BTreeSet<String>, String> {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut current: Option<String> = None;
+    let mut out = BTreeSet::new();
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim_start();
+        if let Some(name) = t.strip_prefix("- alert:") {
+            current = Some(name.trim().to_string());
+            continue;
+        }
+        if !t.starts_with("for:") {
+            continue;
+        }
+        let inline = t
+            .split_once('#')
+            .is_some_and(|(_, c)| c.contains(FOR_ANCHOR_MARKER));
+        let above = lines[..i]
+            .iter()
+            .rev()
+            .take_while(|l| l.trim_start().starts_with('#'))
+            .any(|l| l.contains(FOR_ANCHOR_MARKER));
+        if inline || above {
+            let name = current.clone().ok_or_else(|| {
+                format!(
+                    "anchored `for:` at line {} resolves to no `- alert:` name",
+                    i + 1
+                )
+            })?;
+            out.insert(name);
+        }
+    }
+    let parsed: BTreeSet<String> = committed_rules(content)
+        .ok_or("the rules YAML does not parse")?
+        .into_iter()
+        .map(|r| r.alert)
+        .collect();
+    if let Some(stray) = out.iter().find(|n| !parsed.contains(*n)) {
+        return Err(format!(
+            "anchored `for:` resolved to `{stray}`, which the YAML parse does not declare"
+        ));
+    }
+    Ok(out)
+}
+
+/// A loaded alerting rule's timing as Prometheus evaluates it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LoadedTiming {
+    /// The rule's `duration` (its `for:`), seconds; `None` if absent.
+    pub for_seconds: Option<f64>,
+    /// The group's evaluation `interval`, seconds; `None` if absent.
+    pub group_interval_seconds: Option<f64>,
+}
+
+/// Every loaded alerting rule's [`LoadedTiming`] from a `/api/v1/rules` body,
+/// keyed by alert name. `None` if the body is not a successful envelope.
+#[must_use]
+pub fn loaded_rule_timings(body: &str) -> Option<std::collections::BTreeMap<String, LoadedTiming>> {
+    Some(
+        loaded_alerting_rules(body)?
+            .into_iter()
+            .map(|r| {
+                let t = LoadedTiming {
+                    for_seconds: r.rule.get("duration").and_then(serde_json::Value::as_f64),
+                    group_interval_seconds: r.group_interval_seconds,
+                };
+                (r.name, t)
+            })
+            .collect(),
+    )
+}
+
+/// Every range window (`[5m]`) in `expr`, in source order.
+///
+/// # Errors
+/// An unterminated range, a subquery (`[1h:5m]`, outside the subset the rule
+/// files use), or a window [`crate::fixtures::metrics::parse_prometheus_duration`]
+/// rejects.
+pub fn range_windows(expr: &str) -> Result<Vec<std::time::Duration>, String> {
+    let bytes = expr.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while let Some(&b) = bytes.get(i) {
+        match b {
+            b'"' | b'\'' | b'`' => i = scan_string(bytes, i)?.0,
+            b'[' => {
+                let end = bytes[i..]
+                    .iter()
+                    .position(|c| *c == b']')
+                    .ok_or_else(|| format!("unterminated range at byte {i}"))?;
+                let raw = &expr[i + 1..i + end];
+                if raw.contains(':') {
+                    return Err(format!("subquery `[{raw}]` is outside the scanned subset"));
+                }
+                out.push(
+                    crate::fixtures::metrics::parse_prometheus_duration(raw)
+                        .ok_or_else(|| format!("unparseable range `[{raw}]`"))?,
+                );
+                i += end + 1;
+            }
+            _ => i += 1,
+        }
+    }
+    Ok(out)
+}
+
+/// The alternatives of a regex matcher value that is a PURE literal
+/// alternation (`a|b|c`, every arm `[A-Za-z0-9_]+`). `None` for anything with
+/// a regex metacharacter, which must NOT be split (`a.*|b`, `(a|b)`), or for a
+/// single literal (no `|`).
+#[must_use]
+pub fn literal_alternatives(value: &str) -> Option<Vec<String>> {
+    if !value.contains('|') {
+        return None;
+    }
+    let arms: Vec<&str> = value.split('|').collect();
+    arms.iter()
+        .all(|a| !a.is_empty() && a.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_'))
+        .then(|| arms.iter().map(|a| (*a).to_string()).collect())
+}
+
+/// The APPLY probes for one selector: one `name{...}` per combination of its
+/// literal alternations (`outcome=~"a|b"` becomes `outcome="a"` and
+/// `outcome="b"`), because a `count()` over the whole regex stays green when one
+/// arm is misspelled. NEGATED matchers are dropped (a negated set is
+/// legitimately empty on a healthy cluster) but every POSITIVE matcher is kept,
+/// so `gc_mh_available{state="healthy", region!="other"}` probes
+/// `gc_mh_available{state="healthy"}` and a misspelled `state` still fails.
+/// Only a selector with no positive matcher left probes its bare NAME. A
+/// selector with only plain matchers probes its own text.
+#[must_use]
+pub fn apply_probes(sel: &VectorSelector, expr: &str) -> Vec<String> {
+    let positive: Vec<&LabelMatcher> = sel.matchers.iter().filter(|m| !m.op.is_negated()).collect();
+    let has_alternation = positive
+        .iter()
+        .any(|m| m.op == MatchOp::Re && literal_alternatives(&m.value).is_some());
+    if positive.len() == sel.matchers.len() && !has_alternation {
+        return vec![sel.text(expr).to_string()];
+    }
+    if positive.is_empty() {
+        return vec![sel.name.clone()];
+    }
+    let mut combos: Vec<Vec<String>> = vec![Vec::new()];
+    for m in positive {
+        let choices: Vec<String> = match (m.op, literal_alternatives(&m.value)) {
+            (MatchOp::Re, Some(arms)) => arms
+                .iter()
+                .map(|a| format!("{}=\"{a}\"", m.label))
+                .collect(),
+            _ => vec![format!("{}{}\"{}\"", m.label, m.op.as_str(), m.value)],
+        };
+        combos = combos
+            .into_iter()
+            .flat_map(|c| {
+                choices.iter().map(move |ch| {
+                    let mut n = c.clone();
+                    n.push(ch.clone());
+                    n
+                })
+            })
+            .collect();
+    }
+    combos
+        .into_iter()
+        .map(|c| format!("{}{{{}}}", sel.name, c.join(", ")))
+        .collect()
+}
+
+/// Round `d` UP to a whole minute (an exact minute stays put; zero stays zero).
+#[must_use]
+pub fn ceil_to_minute(d: std::time::Duration) -> std::time::Duration {
+    let s = d.as_secs() + u64::from(d.subsec_nanos() > 0);
+    std::time::Duration::from_secs(s.div_ceil(60) * 60)
+}
+
+/// The verdict of one anchored `for:` against its derivation (the ONE
+/// convention: `for = ceil_to_minute(sum of the sourced terms)`, so a correct
+/// `for:` sits in `[derived, derived + 60 s)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForVerdict {
+    /// `derived <= for < derived + 60 s`.
+    Ok,
+    /// `for < derived`: the UNSAFE direction — the alert fires before the
+    /// mechanism it waits on (replacement, staleness, owner silence) could have
+    /// repaired the condition.
+    TooShort,
+    /// `for >= derived + 60 s`: stale upward (a config value dropped and the
+    /// literal was not re-derived), so the alert is later than it needs to be.
+    TooLong,
+}
+
+/// PURE: [`ForVerdict`] of `for_` against `derived`.
+#[must_use]
+pub fn for_verdict(for_: std::time::Duration, derived: std::time::Duration) -> ForVerdict {
+    if for_ < derived {
+        ForVerdict::TooShort
+    } else if for_ >= derived + std::time::Duration::from_secs(60) {
+        ForVerdict::TooLong
+    } else {
+        ForVerdict::Ok
+    }
+}
+
+/// The selectors in `expr` that read PER-POD MH liveness: `up` with a `job`
+/// matcher naming `mh-service`, or `kube_pod_container_status_restarts_total`
+/// with any matcher naming `mh-service`. R-35: no PAGE may select these, since
+/// a single MH death is routine and healed by replacement. Structural (the
+/// selector scanner), so spacing or an extra matcher cannot evade it.
+///
+/// RESIDUAL (stated, not hidden): `=` and regex matchers whose value CONTAINS
+/// `mh-service` are covered; a regex that matches `mh-service` without
+/// containing it (`job=~"mh-.*"`) is not. Regex evaluation is fenced to
+/// canonical homes by `clippy.toml`, so this kernel does not evaluate one.
+///
+/// # Errors
+/// As [`vector_selectors`].
+pub fn per_pod_mh_liveness_selectors(expr: &str) -> Result<Vec<String>, String> {
+    Ok(vector_selectors(expr)?
+        .into_iter()
+        .filter(|s| {
+            let names_mh = |label: Option<&str>| {
+                s.matchers.iter().any(|m| {
+                    !m.op.is_negated()
+                        && label.is_none_or(|l| m.label == l)
+                        && m.value.contains("mh-service")
+                })
+            };
+            (s.name == "up" && names_mh(Some("job")))
+                || (s.name == "kube_pod_container_status_restarts_total" && names_mh(None))
+        })
+        .map(|s| s.text(expr).to_string())
+        .collect())
+}
+
+/// The rule files actually MOUNTED in-cluster (the `configMapGenerator`
+/// list), each with its content: THE on-disk walk every rule reader in this
+/// crate builds on.
+///
+/// # Errors
+/// COULD-NOT-EVALUATE reasons: the kustomization or a mounted file cannot be
+/// read, or no rule-file entry is found — an empty mounted set would make
+/// every assertion built on it pass vacuously, so it is a broken extraction,
+/// never a clean result.
+pub fn mounted_rule_file_contents() -> Result<Vec<(String, String)>, String> {
+    let root = crate::repo_root();
+    let kust_path = root.join(RULES_KUSTOMIZATION);
+    let kust = std::fs::read_to_string(&kust_path)
+        .map_err(|e| format!("cannot read {}: {e}", kust_path.display()))?;
+    let mounted = mounted_rules_files(&kust).ok_or_else(|| {
+        format!(
+            "no `configMapGenerator` rule-file entries found in {RULES_KUSTOMIZATION}. An empty \
+             mounted set makes every assertion built on it pass vacuously, so this is a \
+             broken-extraction failure, NOT a clean result."
+        )
+    })?;
+    mounted
+        .into_iter()
+        .map(|f| {
+            let path = root.join(RULES_DIR).join(&f);
+            std::fs::read_to_string(&path)
+                .map(|c| (f.clone(), c))
+                .map_err(|e| {
+                    format!(
+                        "{RULES_KUSTOMIZATION} mounts {f}, but it cannot be read at {}: {e}",
+                        path.display()
+                    )
+                })
+        })
+        .collect()
+}
+
+/// Every committed rule across the mounted files (with its file), and the
+/// anchored-`for:` set.
+#[derive(Debug, Clone)]
+pub struct OnDiskRules {
+    /// `(file, rule)` in file order.
+    pub rules: Vec<(String, CommittedRule)>,
+    /// [`anchored_for_alerts`] over every mounted file.
+    pub anchored: BTreeSet<String>,
+}
+
+/// [`OnDiskRules`] for the mounted rule files.
+///
+/// # Errors
+/// As [`mounted_rule_file_contents`], plus a file that does not parse as
+/// alert rules, or an [`anchored_for_alerts`] error.
+pub fn on_disk_rules() -> Result<OnDiskRules, String> {
+    let mut rules = Vec::new();
+    let mut anchored = BTreeSet::new();
+    for (file, content) in mounted_rule_file_contents()? {
+        let parsed = committed_rules(&content)
+            .ok_or_else(|| format!("{file} did not parse as alert-rules YAML"))?;
+        rules.extend(parsed.into_iter().map(|r| (file.clone(), r)));
+        anchored.extend(anchored_for_alerts(&content).map_err(|e| format!("{file}: {e}"))?);
+    }
+    Ok(OnDiskRules { rules, anchored })
+}
+
+/// The story-4 page set (R-35). Positive control for [`page_posture`]: each
+/// must be SEEN as a page rule (containment only; other pages, e.g. `MCDown`,
+/// legitimately exist).
+pub const STORY_4_PAGES: &[&str] = &[
+    "MCMediaMeetingsAwaitingHandler",
+    "MCMediaGenerationDivergence",
+    "MHDown",
+    "GCMhRegistrationPingPong",
+];
+
+/// The rules whose `for:` stands in for a config gauge (`ANCHOR (DRY):` on the
+/// `for:` line). The anchored set on disk must EQUAL this (closed): a Layer-4
+/// unit test checks it statically, and env-test 33 derives each live.
+pub const ANCHORED_FOR_RULES: &[&str] = &[
+    "MCMediaMeetingsAwaitingHandler",
+    "GCMhAddressConflictPersisting",
+    "MHMeetingsHeldWithoutClients",
+];
+
+/// Home of `ADMISSION_WINDOW_BUCKET`, the MH session actor's rotation tick
+/// that republishes `mh_media_meetings_without_clients` (a term of
+/// `MHMeetingsHeldWithoutClients`' `for:`).
+pub const MH_ADMISSION_SRC: &str = "crates/mh-service/src/session/admission.rs";
+/// Home of `BACKOFF_MAX`, MH's registration-retry backoff cap (a term of
+/// `GCMhAddressConflictPersisting`' `for:`).
+pub const MH_GC_CLIENT_SRC: &str = "crates/mh-service/src/grpc/gc_client.rs";
+
+/// PURE page posture of a rule set: the page rules seen, and every page-rule
+/// selector that reads per-pod MH liveness ([`per_pod_mh_liveness_selectors`]).
+/// Only `severity: page` is inspected; the same selector at warning is not a
+/// finding.
+///
+/// # Errors
+/// A page rule with no expr, or an expr the scanner cannot read.
+pub fn page_posture(rules: &[CommittedRule]) -> Result<(BTreeSet<String>, Vec<String>), String> {
+    let mut pages = BTreeSet::new();
+    let mut hits = Vec::new();
+    for r in rules
+        .iter()
+        .filter(|r| r.severity.as_deref() == Some("page"))
+    {
+        pages.insert(r.alert.clone());
+        let expr = r
+            .expr
+            .as_deref()
+            .ok_or_else(|| format!("page rule `{}` has no expr", r.alert))?;
+        let found = per_pod_mh_liveness_selectors(expr)
+            .map_err(|e| format!("`{}` expr did not scan: {e}", r.alert))?;
+        hits.extend(found.into_iter().map(|s| format!("{}: {s}", r.alert)));
+    }
+    Ok((pages, hits))
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn match_op_as_str_round_trips_through_the_parser() {
+        for op in [
+            super::MatchOp::Eq,
+            super::MatchOp::Ne,
+            super::MatchOp::Re,
+            super::MatchOp::Nre,
+        ] {
+            let expr = format!("m{{a{}\"v\"}}", op.as_str());
+            let sels = super::vector_selectors(&expr).unwrap();
+            assert_eq!(sels[0].matchers[0].op, op, "{expr}");
+        }
+    }
+
+    #[test]
+    fn apply_probes_keep_positive_matchers_beside_a_negation() {
+        let expr = r#"x{a="1", b!="2"} or y{a=~"p|q", b!~"z"}"#;
+        let sels = super::vector_selectors(expr).unwrap();
+        assert_eq!(
+            super::apply_probes(&sels[0], expr),
+            vec![r#"x{a="1"}"#.to_string()]
+        );
+        assert_eq!(
+            super::apply_probes(&sels[1], expr),
+            vec![r#"y{a="p"}"#.to_string(), r#"y{a="q"}"#.to_string()]
+        );
+        // MHDown's shape: the positive `state` survives.
+        let md = r#"max by (region) (gc_mh_available{state="healthy", region!="other"}) == 0"#;
+        let s = super::vector_selectors(md).unwrap();
+        assert_eq!(
+            super::apply_probes(&s[0], md),
+            vec![r#"gc_mh_available{state="healthy"}"#.to_string()]
+        );
+    }
+
+    #[test]
+    fn anchored_for_orphan_or_unparsed_name_is_an_error() {
+        let orphan = "groups:\n  - name: g\n    rules: []\n# ANCHOR (DRY): x\nfor: 3m\n";
+        assert!(super::anchored_for_alerts(orphan).is_err());
+        assert!(super::anchored_for_alerts("not: [yaml").is_err());
+    }
+
+    #[test]
+    fn page_posture_flags_liveness_only_at_page() {
+        let yaml = r#"groups:
+  - name: g
+    rules:
+      - alert: PagedPerPod
+        expr: up{job="mh-service"} == 0
+        labels:
+          severity: page
+      - alert: WarnedPerPod
+        expr: up{job="mh-service"} == 0
+        labels:
+          severity: warning
+"#;
+        let rules = super::committed_rules(yaml).unwrap();
+        let (pages, hits) = super::page_posture(&rules).unwrap();
+        assert_eq!(
+            pages.into_iter().collect::<Vec<_>>(),
+            vec!["PagedPerPod".to_string()]
+        );
+        assert_eq!(hits.len(), 1, "page flagged, warning not: {hits:?}");
+        assert!(hits[0].starts_with("PagedPerPod:"));
+    }
+
+    // ---- story 4: the REAL committed files (Layer 4, no cluster) -----------
+
+    #[test]
+    fn committed_anchored_for_set_is_closed() {
+        let on_disk = super::on_disk_rules().unwrap_or_else(|e| panic!("COULD-NOT-EVALUATE: {e}"));
+        let want: std::collections::BTreeSet<String> = super::ANCHORED_FOR_RULES
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        assert!(
+            !on_disk.anchored.is_empty(),
+            "positive control: anchors found"
+        );
+        assert_eq!(
+            on_disk.anchored, want,
+            "FOR-ANCHOR-SET: the rules whose `for:` carries `ANCHOR (DRY):` must equal \
+             ANCHORED_FOR_RULES (add a derivation row in env-test 33 for a new one)"
+        );
+    }
+
+    #[test]
+    fn no_committed_page_rule_selects_per_pod_mh_liveness() {
+        let on_disk = super::on_disk_rules().unwrap_or_else(|e| panic!("COULD-NOT-EVALUATE: {e}"));
+        let rules: Vec<_> = on_disk.rules.into_iter().map(|(_, r)| r).collect();
+        let (pages, hits) = super::page_posture(&rules).unwrap();
+        for name in super::STORY_4_PAGES {
+            assert!(
+                pages.contains(*name),
+                "positive control: `{name}` seen as a page rule"
+            );
+        }
+        assert!(
+            hits.is_empty(),
+            "R-35 VIOLATION: a page rule selects per-pod MH liveness, so a single MH death \
+             (routine, healed by replacement) would page:\n{}",
+            hits.join("\n")
+        );
+    }
+
+    #[test]
+    fn derivation_source_consts_are_readable() {
+        for (src, name) in [
+            (super::MH_GC_CLIENT_SRC, "BACKOFF_MAX"),
+            (super::MH_ADMISSION_SRC, "ADMISSION_WINDOW_BUCKET"),
+        ] {
+            let text = std::fs::read_to_string(crate::repo_root().join(src))
+                .unwrap_or_else(|e| panic!("COULD-NOT-EVALUATE: read {src}: {e}"));
+            crate::fixtures::gc_fleet::const_duration_secs(&text, name)
+                .unwrap_or_else(|e| panic!("{e} (in {src})"));
+        }
+    }
+
+    // ---- story 4 (OBS-ALERTS) kernels --------------------------------------
+
+    const ANCHOR_YAML: &str = r#"groups:
+  - name: g-page
+    interval: 30s
+    rules:
+      # Derivation block. ANCHOR (DRY): some_interval_seconds (not a for: proxy)
+      - alert: PingPongShaped
+        expr: |
+          sum(increase(a_total[10m])) >= 20
+        for: 10m
+        labels:
+          severity: page
+      - alert: AnchoredAbove
+        expr: |
+          max(b) > 0
+        # ANCHOR (DRY): b_bound_seconds + scrape + eval
+        for: 3m
+        labels:
+          severity: page
+  - name: g-warn
+    interval: 60s
+    rules:
+      - alert: AnchoredInline
+        expr: |
+          max(c) > 0
+        for: 17m # ANCHOR (DRY): c_timeout_seconds
+        labels:
+          severity: warning
+      - alert: Unanchored
+        expr: |
+          max(d) > 0
+        for: 5m
+        labels:
+          severity: warning
+"#;
+
+    #[test]
+    fn anchored_for_is_structural_not_anywhere_in_the_block() {
+        let set = super::anchored_for_alerts(ANCHOR_YAML).unwrap();
+        assert_eq!(
+            set.into_iter().collect::<Vec<_>>(),
+            vec!["AnchoredAbove".to_string(), "AnchoredInline".to_string()],
+            "an ANCHOR in a derivation block (PingPong-shaped) is NOT an anchored for:"
+        );
+    }
+
+    #[test]
+    fn committed_rules_carry_severity_for_and_group_interval() {
+        let rules = super::committed_rules(ANCHOR_YAML).expect("parses");
+        let a = rules.iter().find(|r| r.alert == "AnchoredInline").unwrap();
+        assert_eq!(a.severity.as_deref(), Some("warning"));
+        assert_eq!(a.for_.as_deref(), Some("17m"));
+        assert_eq!(a.group_interval.as_deref(), Some("60s"));
+        assert_eq!(rules.len(), 4);
+        assert!(super::committed_rules("groups: [").is_none());
+    }
+
+    #[test]
+    fn loaded_rule_timings_reads_duration_and_group_interval() {
+        let body = r#"{"status":"success","data":{"groups":[{"name":"g","interval":60,
+            "rules":[{"type":"alerting","name":"A","duration":240,"query":"x"},
+                     {"type":"alerting","name":"B","query":"y"},
+                     {"type":"recording","name":"r","query":"z"}]}]}}"#;
+        let t = super::loaded_rule_timings(body).unwrap();
+        assert_eq!(t["A"].for_seconds, Some(240.0));
+        assert_eq!(t["A"].group_interval_seconds, Some(60.0));
+        assert_eq!(
+            t["B"].for_seconds, None,
+            "missing duration is None, never 0"
+        );
+        assert!(!t.contains_key("r"));
+        assert!(super::loaded_rule_timings(r#"{"status":"error"}"#).is_none());
+    }
+
+    #[test]
+    fn range_windows_parse_and_refuse_subqueries() {
+        use std::time::Duration;
+        assert_eq!(
+            super::range_windows(r#"sum(increase(x{a="[q]"}[1m])) > 0 and rate(y[1h30m]) > 0"#)
+                .unwrap(),
+            vec![Duration::from_secs(60), Duration::from_secs(5400)]
+        );
+        assert!(super::range_windows("max_over_time(x[1h:5m])").is_err());
+        assert!(super::range_windows("rate(x[5q])").is_err());
+        assert!(super::range_windows("rate(x[5m)").is_err());
+        assert!(super::range_windows("max(x) > 0").unwrap().is_empty());
+    }
+
+    #[test]
+    fn literal_alternatives_split_only_pure_literals() {
+        assert_eq!(
+            super::literal_alternatives("no_capacity|gc_unavailable"),
+            Some(vec![
+                "no_capacity".to_string(),
+                "gc_unavailable".to_string()
+            ])
+        );
+        assert_eq!(super::literal_alternatives("single"), None);
+        assert_eq!(
+            super::literal_alternatives("a.*|b"),
+            None,
+            "metachar: never split"
+        );
+        assert_eq!(super::literal_alternatives("(a|b)"), None);
+        assert_eq!(super::literal_alternatives("a||b"), None);
+    }
+
+    #[test]
+    fn apply_probes_expand_alternations_and_keep_negations_bare() {
+        let expr = r#"sum(increase(m_total{outcome=~"a|b", trigger="t"}[5m])) unless n{x!="y"} or p{k="v"}"#;
+        let sels = super::vector_selectors(expr).unwrap();
+        assert_eq!(
+            super::apply_probes(&sels[0], expr),
+            vec![
+                r#"m_total{outcome="a", trigger="t"}"#.to_string(),
+                r#"m_total{outcome="b", trigger="t"}"#.to_string()
+            ]
+        );
+        // Negated-only: no positive matcher left, so the bare name.
+        assert_eq!(super::apply_probes(&sels[1], expr), vec!["n".to_string()]);
+        assert_eq!(
+            super::apply_probes(&sels[2], expr),
+            vec![r#"p{k="v"}"#.to_string()]
+        );
+    }
+
+    #[test]
+    fn ceil_to_minute_boundaries() {
+        use std::time::Duration;
+        assert_eq!(super::ceil_to_minute(Duration::ZERO), Duration::ZERO);
+        assert_eq!(
+            super::ceil_to_minute(Duration::from_secs(180)),
+            Duration::from_secs(180)
+        );
+        assert_eq!(
+            super::ceil_to_minute(Duration::from_secs(181)),
+            Duration::from_secs(240)
+        );
+        assert_eq!(
+            super::ceil_to_minute(Duration::from_millis(180_001)),
+            Duration::from_secs(240)
+        );
+        assert_eq!(
+            super::ceil_to_minute(Duration::from_secs(174)),
+            Duration::from_secs(180)
+        );
+    }
+
+    #[test]
+    fn for_verdict_both_sides() {
+        use super::ForVerdict;
+        use std::time::Duration;
+        let derived = Duration::from_secs(185);
+        assert_eq!(
+            super::for_verdict(Duration::from_secs(240), derived),
+            ForVerdict::Ok
+        );
+        assert_eq!(super::for_verdict(derived, derived), ForVerdict::Ok);
+        assert_eq!(
+            super::for_verdict(derived - Duration::from_secs(1), derived),
+            ForVerdict::TooShort
+        );
+        assert_eq!(
+            super::for_verdict(derived + Duration::from_secs(60), derived),
+            ForVerdict::TooLong
+        );
+    }
+
+    #[test]
+    fn per_pod_mh_liveness_is_structural() {
+        // Positive controls: the retired MHDown expr, spaced, and with an extra matcher.
+        assert_eq!(
+            super::per_pod_mh_liveness_selectors(r#"up{job="mh-service"} == 0"#)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            super::per_pod_mh_liveness_selectors(r#"up{ job = "mh-service", x="y" } == 0"#)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            super::per_pod_mh_liveness_selectors(
+                r#"rate(kube_pod_container_status_restarts_total{container="mh-service"}[1h]) > 0.016"#
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        // Benign: the re-scoped fleet expr and other jobs.
+        assert!(super::per_pod_mh_liveness_selectors(
+            r#"max by (region) (gc_mh_available{state="healthy", region!="other"}) == 0"#
+        )
+        .unwrap()
+        .is_empty());
+        assert!(
+            super::per_pod_mh_liveness_selectors(r#"up{job="mc-service"} == 0"#)
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     // ---- ts_numeric_array_const --------------------------------------------
 

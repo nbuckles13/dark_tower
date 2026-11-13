@@ -1771,8 +1771,8 @@ Verify with deploy smoke stanza (f): a fresh-`sub` 70-burst still shows the inte
 
 ### Scenario 14: Two Live Media Handlers on One Address
 
-**Alert**: `GCMhRegistrationPingPong` (PAGE; `sum(increase(gc_mh_registrations_total{outcome="superseded"}[10m])) >= 20 and sum(increase(gc_mh_load_reports_total{outcome="unknown_handler"}[10m])) >= 3`, `for: 10m`; lands with OBS-ALERTS). Related warnings (rule names assigned by OBS-ALERTS, lands with OBS-ALERTS): `gc_mh_registrations_total{outcome="address_conflict"}` still increasing past the MH staleness bound plus one MH registration retry; `gc_mh_load_reports_total{outcome="unknown_handler"}` increase > 0.
-**Severity**: Critical (page) for the ping-pong; Warning for the other two
+**Alert**: `GCMhRegistrationPingPong` (PAGE; `sum(increase(gc_mh_registrations_total{outcome="superseded"}[10m])) >= 20 and sum(increase(gc_mh_load_reports_total{outcome="unknown_handler"}[10m])) >= 3`, `for: 10m`). Related warnings: `GCMhAddressConflictPersisting` (`gc_mh_registrations_total{outcome="address_conflict"}` still increasing past the MH staleness bound plus one MH registration retry, plus the expr window and sampling; the current `for:` is in `gc-alerts.yaml` / `alerts.md`); `GCMhUnknownHandlerLoadReports` (`gc_mh_load_reports_total{outcome="unknown_handler"}` increase > 0); `GCMhRegistrationEndpointRejected` (`outcome=~"endpoint_changed|invalid_endpoint"` increase > 0, an MH config or allowlist defect). Handler identity is self-asserted (shared MH OAuth client), so a "duplicate" may be a second process presenting the MH credential, not only a misconfiguration.
+**Severity**: Critical (page) for the ping-pong; Warning for the other three
 **Runbook Section**: `#scenario-14-two-live-media-handlers-on-one-address`
 
 **What this is.** ADR-0039 §7: no two live MH processes may share a client-facing address. GC's
@@ -1855,8 +1855,9 @@ provisioned: handler identity is self-asserted).
 
 **Alert**: none — dashboard only, by design (known gap, ADR-0039 §3). Evidence:
 `gc_mh_replacement_requests_total{trigger, outcome, gc_view}` (GC Overview) and the
-`gc.mh.replacement_report` INFO event. Related warning: `gc_mh_replacement_requests_total{outcome="no_capacity"}`
-(rule name assigned by OBS-ALERTS, lands with OBS-ALERTS).
+`gc.mh.replacement_report` INFO event. Related warning: `GCMhReplacementNoCapacity`
+(`gc_mh_replacement_requests_total{outcome="no_capacity"}` sustained; its runbook is
+[`mc-incident-response.md` Scenario 25](mc-incident-response.md#scenario-25-meetings-awaiting-a-media-handler)).
 **Severity**: Warning (manual investigation)
 **Runbook Section**: `#scenario-15-gc-keeps-handing-out-a-handler-mcs-keep-replacing`
 

@@ -653,8 +653,10 @@ pub fn max_service_job_scrape_interval(body: &str) -> Result<Duration, ScrapeInt
 
 /// Parse the Prometheus duration forms a scrape interval uses (`500ms`, `5s`,
 /// `1m`, `1h`, and concatenations such as `1m30s`). `None` for anything else
-/// or for zero — never a guess.
-fn parse_prometheus_duration(raw: &str) -> Option<Duration> {
+/// or for zero — never a guess. Also the reader of a rule's `for:` and an
+/// expr's range window (env-test 33): ONE duration parser in this crate.
+#[must_use]
+pub fn parse_prometheus_duration(raw: &str) -> Option<Duration> {
     let mut total = Duration::ZERO;
     let mut rest = raw.trim();
     if rest.is_empty() {
@@ -1227,21 +1229,68 @@ pub fn heartbeat_interval_of(n: Duration) -> Duration {
 /// # Panics
 /// PRECONDITION if no MC pod serves or the gauge is absent or not positive.
 pub async fn mc_config_gauge_max(prom: &PrometheusClient, metric: &str) -> Duration {
-    let (_, mc_pods) = crate::fixtures::kube::settled_serving_pods(
-        "app=mc-service",
-        Duration::from_secs(60),
-        "mc-pods-unserving",
-    )
-    .await;
-    let seconds = gauge_by_pods(prom, metric, &mc_pods, PINNED_METRIC_BOUND)
+    let seconds = mc_config_gauge_values(prom, metric)
         .await
-        .into_values()
+        .into_iter()
+        .map(|(_, v)| v)
         .fold(0.0_f64, f64::max);
     assert!(
         seconds > 0.0,
         "PRECONDITION: MC publishes {metric} > 0 (got {seconds})"
     );
     Duration::from_millis((seconds * 1000.0).round() as u64)
+}
+
+/// `metric` on every settled, serving MC pod: the ONE MC pod lookup behind
+/// [`mc_config_gauge_max`] (a ceiling) and [`mc_config_gauge_agreed`] (a
+/// derivation input).
+async fn mc_config_gauge_values(prom: &PrometheusClient, metric: &str) -> Vec<(String, f64)> {
+    let (_, mc_pods) = crate::fixtures::kube::settled_serving_pods(
+        "app=mc-service",
+        Duration::from_secs(60),
+        "mc-pods-unserving",
+    )
+    .await;
+    gauge_by_pods(prom, metric, &mc_pods, PINNED_METRIC_BOUND)
+        .await
+        .into_iter()
+        .collect()
+}
+
+/// PURE: the one value every replica / pod agrees on: THE agreement kernel
+/// (the GC, MH and MC config-gauge readers all use it).
+///
+/// # Errors
+/// Empty input, or two disagree (a config roll in progress, or pods on
+/// different config: reading the max would hide it).
+pub fn agreed_value(metric: &str, values: &[(String, f64)]) -> Result<f64, String> {
+    let (first_pod, first) = values
+        .first()
+        .ok_or_else(|| format!("nothing published `{metric}`"))?;
+    if let Some((pod, v)) = values
+        .iter()
+        .find(|(_, v)| (*v - *first).abs() > f64::EPSILON)
+    {
+        return Err(format!(
+            "pods disagree on `{metric}`: {first_pod}={first} but {pod}={v}"
+        ));
+    }
+    Ok(*first)
+}
+
+/// An MC config gauge every serving MC pod publishes with the SAME value. For a
+/// derivation that must hold on every MC (an alert `for:` derived from it),
+/// never [`mc_config_gauge_max`], whose max hides an MC on different config
+/// (that max is the right CEILING for waits, not for a derivation).
+///
+/// # Panics
+/// PRECONDITION if no MC pod serves, a pod's series is absent, the pods
+/// disagree, or the value is not positive.
+pub async fn mc_config_gauge_agreed(prom: &PrometheusClient, metric: &str) -> Duration {
+    let values = mc_config_gauge_values(prom, metric).await;
+    let v = agreed_value(metric, &values).unwrap_or_else(|e| panic!("PRECONDITION: {e}"));
+    assert!(v > 0.0, "PRECONDITION: MC publishes {metric} > 0 (got {v})");
+    Duration::from_secs_f64(v)
 }
 
 /// THE env-test read of MC's heartbeat deadline N
@@ -1263,6 +1312,44 @@ pub async fn mc_heartbeat_deadline(prom: &PrometheusClient) -> Duration {
 /// As [`mc_config_gauge_max`].
 pub async fn mc_replacement_retry_budget(prom: &PrometheusClient) -> Duration {
     mc_config_gauge_max(prom, "mc_media_handler_replacement_retry_budget_seconds").await
+}
+
+/// MH's owner-silence timeout gauge (story 4 MH-3,
+/// `MH_MEETING_OWNER_SILENCE_TIMEOUT_SECONDS`). ONE home for the name: env-test
+/// 40 pins it per pod, and [`mh_owner_silence_timeout`] reads the fleet value.
+pub const MH_OWNER_SILENCE_TIMEOUT_GAUGE: &str = "mh_media_meeting_owner_silence_timeout_seconds";
+
+/// THE env-test read of MH's owner-silence timeout as the fleet runs it: every
+/// live MH pod (label-discovered) must publish it, and all must AGREE — a max
+/// would hide a pod on another config, which is exactly the drift a derivation
+/// from it (`MHMeetingsHeldWithoutClients`' `for:`) must see.
+///
+/// # Panics
+/// PRECONDITION if no MH pod serves, a pod's series is absent
+/// ([`gauge_by_pods`]), the pods disagree, or the value is not positive.
+pub async fn mh_owner_silence_timeout(prom: &PrometheusClient) -> Duration {
+    let pods = crate::fixtures::kube::live_mh_pods().await;
+    assert!(
+        !pods.is_empty(),
+        "PRECONDITION: no serving MH pod to read {MH_OWNER_SILENCE_TIMEOUT_GAUGE} from"
+    );
+    let values: Vec<(String, f64)> = gauge_by_pods(
+        prom,
+        MH_OWNER_SILENCE_TIMEOUT_GAUGE,
+        &pods,
+        PINNED_METRIC_BOUND,
+    )
+    .await
+    .into_iter()
+    .collect();
+    let v = agreed_value(MH_OWNER_SILENCE_TIMEOUT_GAUGE, &values).unwrap_or_else(|e| {
+        panic!("PRECONDITION: {e} (a config roll in progress, or pods on different config)")
+    });
+    assert!(
+        v > 0.0,
+        "PRECONDITION: MH publishes {MH_OWNER_SILENCE_TIMEOUT_GAUGE} > 0 (got {v})"
+    );
+    Duration::from_secs_f64(v)
 }
 
 /// THE env-test read of MC's planned-transfer cutover margin
@@ -1450,6 +1537,18 @@ pub fn group_reset_promql(reason: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn agreed_value_requires_every_pod_to_agree() {
+        let one = vec![("gc-0".to_string(), 10.0)];
+        assert_eq!(super::agreed_value("m", &one).unwrap(), 10.0);
+        let two = vec![("gc-0".to_string(), 10.0), ("gc-1".to_string(), 10.0)];
+        assert_eq!(super::agreed_value("m", &two).unwrap(), 10.0);
+        let split = vec![("gc-0".to_string(), 10.0), ("gc-1".to_string(), 20.0)];
+        let e = super::agreed_value("m", &split).unwrap_err();
+        assert!(e.contains("gc-1=20"), "{e}");
+        assert!(super::agreed_value("m", &[]).is_err());
+    }
+
     use super::*;
 
     #[test]

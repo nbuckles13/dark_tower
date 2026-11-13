@@ -173,6 +173,54 @@ groups:
           impact: "Total loss of client-side observability. May be the leading indicator of client-facing breakage (CORS, ingress, auth) the server cannot otherwise see. Check user-facing traffic immediately."
           runbook_url: "docs/runbooks/gc-incident-response.md#scenario-11-telemetry-ingest-silent"
 
+      # ------------------------------------------------------------------
+      # ADR-0031 block — GCMhRegistrationPingPong (story 4 OBS-ALERTS;
+      # security's ping-pong signature, telemetry contract §Alerts PAGE;
+      # ADR-0039 §7)
+      #
+      # WHAT IT MEANS: two LIVE MH processes share one client-facing address
+      # and evict each other's registration. Provisioning broke the
+      # one-process-per-address rule (the hostPort lock was defeated, almost
+      # always by a force-delete). Handler identity is self-asserted (shared MH
+      # OAuth client), so the second process may also be anything presenting
+      # the MH service credential - do not read it as purely a misconfiguration.
+      #
+      # DERIVATION (re-derive if the load-report interval changes):
+      #   - Ping-pong evicts at the MH->GC load-report cadence. GC owns it and
+      #     pushes it at registration: ANCHOR (DRY): gc_mh_load_report_interval_seconds
+      #     (GC_MH_LOAD_REPORT_INTERVAL_MS, default 10 s). Each live process
+      #     re-registers once on a NOT_FOUND load report, so the pair causes
+      #     about 2 supersedes and 2 unknown_handler reports per interval:
+      #     about 120 per 10m at 10 s.
+      #   - A dead process never load-reports, so routine in-place crash
+      #     restarts (each a `superseded`, match=both) never move
+      #     unknown_handler, AT ANY FLEET SIZE: the conjunction is fleet-size
+      #     independent. Kubelet CrashLoopBackOff caps a looping pod at about
+      #     1 supersede per 5m after a short burst.
+      #   - The `superseded` floor of 20 only rejects a one-off duplicate, which
+      #     GCMhUnknownHandlerLoadReports already warns on.
+      #   - VALIDITY RANGE: holds while the interval is <= ~30 s (>= 40
+      #     supersedes per 10m, twice the floor). Config allows up to 60 s
+      #     (MAX_MH_LOAD_REPORT_INTERVAL_MS), where the rate sits ON the floor:
+      #     re-derive before raising the interval past 30 s. env-test 33 asserts
+      #     every live GC replica's interval is within this bound.
+      # `sum()` across GC replicas is correct: each RegisterMH increments on
+      # exactly one replica. No identity labels (`match` is summed away).
+      # ------------------------------------------------------------------
+      - alert: GCMhRegistrationPingPong
+        expr: |
+          sum(increase(gc_mh_registrations_total{outcome="superseded"}[10m])) >= 20 and sum(increase(gc_mh_load_reports_total{outcome="unknown_handler"}[10m])) >= 3
+        for: 10m
+        labels:
+          severity: page
+          service: gc-service
+          component: mh-registry
+        annotations:
+          summary: "Two live media handlers are evicting each other's registration"
+          description: "In 10 minutes GC superseded at least 20 MH registrations AND received at least 3 load reports from handlers it has no row for, sustained for 10 minutes. A dead process never load-reports, so routine crash restarts cannot produce this: two LIVE processes share one address and evict each other at the load-report cadence (gc_mh_load_report_interval_seconds). Provisioning broke the one-process-per-address rule (usually a force-deleted MH pod whose process kept running) - or a second process is presenting the MH service credential. Find the duplicate MH on that slot (mh.sh list --json, pods by node) and retire it; do not touch GC."
+          impact: "The affected address's handler flaps in and out of GC's registry: replacements and new meetings may be granted a handler that is evicted moments later, and its meetings migrate repeatedly."
+          runbook_url: "docs/runbooks/gc-incident-response.md#scenario-14-two-live-media-handlers-on-one-address"
+
   - name: gc-service-warning
     interval: 60s
     rules:
@@ -412,6 +460,130 @@ groups:
           description: "Telemetry ingest rejection rate is {{ $value | humanizePercentage }} for 10 minutes, above the 10% threshold. Triage on the telemetry counter's own status values first: rejected_size / rejected_rate point at a broken or abusive client; error aggregates client-fault decode/content-type failures (HTTP 400/415) and collector-fault forwarding failures (HTTP 502/503) — split via the paired HTTP status codes in the runbook. The telemetry routes have their own endpoint label values on gc_http_requests_total (/api/v1/telemetry/v1/metrics and /api/v1/telemetry/v1/traces)."
           impact: "Client telemetry is being dropped — degraded client-side observability. If the error status dominates with 502/503, the collector path is failing and accepted telemetry may not be forwarding either."
           runbook_url: "docs/runbooks/gc-incident-response.md#scenario-10-telemetry-proxy-high-rejection-rate"
+
+      # ====================================================================
+      # STORY 4 — MH REGISTRY AND REPLACEMENT WARNINGS (OBS-ALERTS; telemetry
+      # contract §Alerts WARNING; ADR-0039 §3, §7)
+      # ====================================================================
+      # Shared ADR-0031 block. Authored by observability, global-controller
+      # reviews (ADR-0031 owner), operations owns the runbook targets. Every
+      # selected series is zero-initialised over its outcome set at GC boot,
+      # so `increase(...) > 0` is never silently inert. Fleet sums with no
+      # identity grouping (replacement requests' trigger and gc_view are summed
+      # away). No alert on gc_view or on the gc.mh.replacement_report evidence:
+      # dashboard and log only (gc Scenario 15, gray failure).
+
+      # GCMhUnknownHandlerLoadReports — any increase. A dead process never
+      # reports, so ANY unknown_handler means a process GC has no row for is
+      # ALIVE: a live duplicate on one address (the evicted side of a
+      # ping-pong), a lost registry, or a live MH whose row was
+      # retention-deleted. Handler identity is self-asserted (shared MH OAuth
+      # client): a duplicate may be a second process presenting the MH
+      # credential, not only a misconfiguration. Fail loud.
+      - alert: GCMhUnknownHandlerLoadReports
+        expr: |
+          sum(increase(gc_mh_load_reports_total{outcome="unknown_handler"}[10m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+          service: gc-service
+          component: mh-registry
+        annotations:
+          summary: "GC received load reports from a media handler it has no registration for"
+          description: "gc_mh_load_reports_total{outcome=\"unknown_handler\"} rose: GC answered NOT_FOUND to a load report. A dead process never reports, so a process GC has no row for is ALIVE: a live duplicate on one address (the evicted side of a ping-pong; see GCMhRegistrationPingPong), a lost registry, or a live MH whose row was retention-deleted. Handler identity is self-asserted, so a duplicate may be a second process presenting the MH service credential, not only a misconfiguration. The MH re-registers on its own; find out why its row was missing."
+          impact: "That handler is unselectable until it re-registers; if two processes share the address, they will keep evicting each other."
+          runbook_url: "docs/runbooks/gc-incident-response.md#scenario-14-two-live-media-handlers-on-one-address"
+
+      # ------------------------------------------------------------------
+      # GCMhAddressConflictPersisting — a conflicting registration that does
+      # not clear past the staleness bound
+      #
+      # Past B, a stale conflicting row would be superseded (case 2b), so a
+      # conflict that persists means two configured holders of one address.
+      # Warning: capacity was not added, but no meeting is dark. Handler
+      # identity is self-asserted (shared MH OAuth client), so the second
+      # holder may be a second process presenting the MH credential.
+      #
+      # THE `for:` (one convention for config-derived `for:` literals, story 4
+      # OBS-ALERTS): for = ceil_to_whole_minute(sum of these terms):
+      #   - B: gc_mh_staleness_threshold_seconds (live gauge; k x load-report
+      #     interval, 30 s shipped)
+      #   - one MH registration retry: BACKOFF_MAX in
+      #     crates/mh-service/src/grpc/gc_client.rs (30 s; a source const with
+      #     no gauge). GC answers a conflict FAILED_PRECONDITION, so the retry
+      #     is inside GcClient::register's exponential backoff (1 s doubling to
+      #     BACKOFF_MAX), not gc_task's REGISTRATION_RETRY_DELAY. The other path
+      #     (re-register after a NOT_FOUND load report) retries at the
+      #     load-report interval, which is shorter, so BACKOFF_MAX bounds both.
+      #     A FAILED_PRECONDITION returns fast, so GC_RPC_TIMEOUT adds nothing
+      #     the rounding does not absorb.
+      #   - the expr window w (1m): `increase([w]) > 0` stays true for w after
+      #     the last conflict, so without it a conflict that clears at
+      #     B + retry would still fire. DEVIATION from the contract's
+      #     "for = B + one retry", for that reason (global-controller +
+      #     observability + dry, Gate 1).
+      #   - service-job scrape_interval (the max over the service jobs, infra/kubernetes/observability/prometheus.yml; read live)
+      #   - this group's evaluation `interval:` (gc-service-warning)
+      # = 30 + 30 + 60 + 5 + 60 = 185 s -> 4m.
+      # CONSTRAINT: w >= BACKOFF_MAX, or `increase([w]) > 0` drops to false
+      # between a conflicting MH's retries and resets `for:`.
+      # env-test 33 asserts derived <= for < derived + 60 s and w >= BACKOFF_MAX,
+      # reading B live, BACKOFF_MAX from source, w from this expr, and the
+      # scrape and eval intervals from Prometheus's loaded config.
+      # ------------------------------------------------------------------
+      - alert: GCMhAddressConflictPersisting
+        expr: |
+          sum(increase(gc_mh_registrations_total{outcome="address_conflict"}[1m])) > 0
+        # ANCHOR (DRY): gc_mh_staleness_threshold_seconds + mh-service grpc/gc_client.rs:BACKOFF_MAX + expr window + service-job scrape_interval + gc-service-warning interval, rounded up to the minute (derivation above; env-test 33 checks it against the live gauge and the source const)
+        for: 4m
+        labels:
+          severity: warning
+          service: gc-service
+          component: mh-registry
+        annotations:
+          summary: "An MH registration keeps conflicting with a live handler's address"
+          description: "gc_mh_registrations_total{outcome=\"address_conflict\"} has kept rising past the MH staleness bound (gc_mh_staleness_threshold_seconds) plus one MH registration retry: a registering MH names an address a fresh, serving row already holds. A transient conflict clears when the old row goes stale; one that persists means two configured holders of one address (provisioning broke the one-process-per-address rule) - or a second process presenting the MH service credential, since handler identity is self-asserted. Find both holders via mh.sh list --json; retire the duplicate."
+          impact: "The registering handler never becomes capacity; no meeting is dark because of it."
+          runbook_url: "docs/runbooks/gc-incident-response.md#scenario-14-two-live-media-handlers-on-one-address"
+
+      # GCMhRegistrationEndpointRejected — any increase. An MH config or
+      # allowlist defect: its endpoints changed within one incarnation's life,
+      # or are not on the allowlist. The handler never becomes capacity.
+      - alert: GCMhRegistrationEndpointRejected
+        expr: |
+          sum by (outcome) (increase(gc_mh_registrations_total{outcome=~"endpoint_changed|invalid_endpoint"}[10m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+          service: gc-service
+          component: mh-registry
+        annotations:
+          summary: "GC rejected MH registrations for their endpoints ({{ $labels.outcome }})"
+          description: "gc_mh_registrations_total{outcome=\"{{ $labels.outcome }}\"} rose. endpoint_changed = an incarnation re-registered with different endpoints (endpoints are fixed for an incarnation's life); invalid_endpoint = the endpoint is not on GC's allowlist. Either is an MH config or allowlist defect, never load."
+          impact: "The rejected handler never becomes replacement or placement capacity."
+          runbook_url: "docs/runbooks/gc-incident-response.md#scenario-14-two-live-media-handlers-on-one-address"
+
+      # GCMhReplacementNoCapacity — sustained: no eligible handler after the
+      # request's exclude list (mh_replacement.rs). Usually capacity headroom
+      # gone; in a small region a repeatedly migrating meeting can exclude
+      # every healthy handler, so healthy > 0 WITH free slots points there
+      # instead (healthy handlers all at max_streams are missing capacity). Each request is one MC AcquireMediaHandler; a single burst after
+      # an MH death that GC answers no_capacity once is not the signal, a
+      # sustained run is. The runbook is MC's Scenario 25 (the capacity triage
+      # lives there; task-directed).
+      - alert: GCMhReplacementNoCapacity
+        expr: |
+          sum(increase(gc_mh_replacement_requests_total{outcome="no_capacity"}[15m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+          service: gc-service
+          component: mh-registry
+        annotations:
+          summary: "GC keeps answering media-handler replacement requests with no capacity"
+          description: "gc_mh_replacement_requests_total{outcome=\"no_capacity\"} has risen in every trailing 15-minute window for 15 minutes (at least two increments spread over about 30 minutes, not a continuous rate): GC found no eligible handler (healthy, fresh, below max_streams) AFTER each request's exclude list. Check gc_mh_available by state (region!=\"other\"), free slots (mh.sh list --json), and whether handlers are draining or stale. If gc_mh_available{state=\"healthy\"} > 0 AND those handlers have free slots (mh.sh list --json), the exclude lists have consumed the region's handlers: look for a repeatedly migrating meeting (mc_media_handler_migrations_total, MCMediaHandlerReplacementRateLimited) rather than missing capacity. Meetings with a surviving handler stay degraded; meetings with none page via MCMediaMeetingsAwaitingHandler."
+          impact: "Meetings that lost a handler are not getting a replacement: degraded on survivors, or dark if they have none."
+          runbook_url: "docs/runbooks/mc-incident-response.md#scenario-25-meetings-awaiting-a-media-handler"
 
   - name: gc-service-info
     interval: 60s

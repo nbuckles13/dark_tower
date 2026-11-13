@@ -669,6 +669,85 @@ mod tests {
     use std::sync::Mutex;
     use tokio::sync::Notify;
 
+    /// The `[Ns]` / `[Nm]` durations the rule files and the scrape config use;
+    /// anything else is `None` (the caller fails closed, never a unit guess).
+    fn rule_duration(raw: &str) -> Option<Duration> {
+        let raw = raw.trim();
+        if let Some(n) = raw.strip_suffix('m') {
+            return n.parse::<u64>().ok().map(|m| Duration::from_secs(m * 60));
+        }
+        raw.strip_suffix('s')?
+            .parse::<u64>()
+            .ok()
+            .map(Duration::from_secs)
+    }
+
+    /// The awaiting-handler page's REGISTERING-DIP BRIDGE (story 4 OBS-ALERTS,
+    /// observability + meeting-controller, Gate 3): the committed
+    /// `MCMediaMeetingsAwaitingHandler` reads
+    /// `max_over_time(mc_media_meetings_without_handlers[w])`, and the bridge
+    /// works only while `w >= initial_registration_bound() + one MC scrape`.
+    /// A grant still Registering takes a dark meeting out of the gauge for up
+    /// to that bound; a shorter `w` lets each dip reset the page's `for:`.
+    /// This test sits beside the formula so a change to `MH_RPC_TIMEOUT`,
+    /// `MH_CONNECT_TIMEOUT`, `MAX_REGISTER_ATTEMPTS` or
+    /// `REGISTER_BACKOFF_DELAYS` that grows the bound past the window goes red.
+    /// Reads the committed rule and the cluster Prometheus config (not a
+    /// fixture). Fails closed: a missing rule, expr, window or scrape interval
+    /// is COULD-NOT-EVALUATE, never a pass.
+    #[test]
+    fn awaiting_handler_bridge_window_covers_the_registration_bound() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let rules_text =
+            std::fs::read_to_string(root.join("infra/docker/prometheus/rules/mc-alerts.yaml"))
+                .expect("COULD-NOT-EVALUATE: mc-alerts.yaml is readable from the crate");
+        let rules: serde_norway::Value =
+            serde_norway::from_str(&rules_text).expect("COULD-NOT-EVALUATE: mc-alerts.yaml parses");
+        let expr = rules["groups"]
+            .as_sequence()
+            .expect("COULD-NOT-EVALUATE: groups")
+            .iter()
+            .filter_map(|g| g["rules"].as_sequence())
+            .flatten()
+            .find(|r| r["alert"].as_str() == Some("MCMediaMeetingsAwaitingHandler"))
+            .and_then(|r| r["expr"].as_str())
+            .expect("COULD-NOT-EVALUATE: MCMediaMeetingsAwaitingHandler with an expr")
+            .to_string();
+        let after = expr
+            .split_once("max_over_time(mc_media_meetings_without_handlers[")
+            .expect("COULD-NOT-EVALUATE: the rule has no max_over_time bridge")
+            .1;
+        let window = rule_duration(after.split(']').next().unwrap_or(""))
+            .expect("COULD-NOT-EVALUATE: the bridge window is not an Ns/Nm duration");
+
+        let prom_text =
+            std::fs::read_to_string(root.join("infra/kubernetes/observability/prometheus.yml"))
+                .expect("COULD-NOT-EVALUATE: prometheus.yml is readable from the crate");
+        let prom: serde_norway::Value =
+            serde_norway::from_str(&prom_text).expect("COULD-NOT-EVALUATE: prometheus.yml parses");
+        let job = prom["scrape_configs"]
+            .as_sequence()
+            .expect("COULD-NOT-EVALUATE: scrape_configs")
+            .iter()
+            .find(|j| j["job_name"].as_str() == Some("mc-service"))
+            .expect("COULD-NOT-EVALUATE: an mc-service scrape job");
+        let scrape = job["scrape_interval"]
+            .as_str()
+            .or_else(|| prom["global"]["scrape_interval"].as_str())
+            .and_then(rule_duration)
+            .expect("COULD-NOT-EVALUATE: an mc-service scrape interval");
+
+        let needed = initial_registration_bound() + scrape;
+        assert!(
+            window >= needed,
+            "BRIDGE-WINDOW-OUT-OF-RANGE: MCMediaMeetingsAwaitingHandler's max_over_time window \
+             {window:?} is shorter than initial_registration_bound() {:?} + the mc-service \
+             scrape interval {scrape:?}: Registering dips would reset the page's `for:`. Widen \
+             the window and re-derive the `for:` (env-test 33 checks the sum)",
+            initial_registration_bound()
+        );
+    }
+
     /// Scripted MH client: pops one result per call and records every
     /// generation it was sent.
     struct ScriptedMh {

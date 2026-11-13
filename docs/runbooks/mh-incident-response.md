@@ -127,10 +127,9 @@ Infrastructure Team / SRE Lead
 
 ### Scenario 1: Complete Service Outage
 
-**Alert**: `MHDown` (page), **re-scoped fleet/region-level** (lands with OBS-ALERTS):
-`max(gc_mh_available{state="healthy", region!="other"}) == 0` (own region: the `other` cell is always 0 in a single-region deployment; `max` because every GC replica publishes the same gauge) — no healthy, non-draining MH in the region, so **no
-replacement capacity at all**. Until OBS-ALERTS lands, the rule in `mh-alerts.yaml` is still the
-per-pod `up{job="mh-service"} == 0`.
+**Alert**: `MHDown` (page), **re-scoped fleet/region-level** (story 4):
+`max by (region) (gc_mh_available{state="healthy", region!="other"}) == 0` for 1m (own region: the `other` cell is always 0 in a single-region deployment; `max by (region)` because every GC replica publishes the same gauge) — no healthy, non-draining MH in the region, so **no
+replacement capacity at all**. With GC down the series is absent and this alert is silent; `GCDown` pages that case.
 **Severity**: page
 
 **A single MH death is routine and is NOT this scenario.** MC declares the dead handler within N and
@@ -669,7 +668,7 @@ kubectl logs -n dark-tower -l app=mh-service --tail=500 | grep -iE "token|refres
 - MH unable to notify MC of `connected` / `disconnected` events
 - MC participant state may drift from actual MH connection state
 
-**Impact**: MC's view of who is connected may be stale **for a short, bounded time**. Since story 4 (ADR-0039 §6) a lost `Disconnected` **self-corrects within about two heartbeat intervals**: every per-meeting heartbeat carries MH's connection ids, and MC's remove-only reconcile retires a connection absent from it (and releases its `sender_id` binding), counted `mc_media_handler_connected_set_corrections_total`. A failed `Connected` is not drift: the bind is its only add path, so MH declines that session (`mh_media_session_starts_total{outcome="declined_mc_unavailable"}`, [Scenario 15](#scenario-15-media-sessions-declining--no-sender-binding)) and the client redials. A **sustained** correction rate is the warning: it means the notification path is lossy (rule name assigned by OBS-ALERTS, lands with OBS-ALERTS).
+**Impact**: MC's view of who is connected may be stale **for a short, bounded time**. Since story 4 (ADR-0039 §6) a lost `Disconnected` **self-corrects within N** (`mc_media_handler_heartbeat_deadline_seconds`), normally on the next heartbeat (about N/3): every per-meeting heartbeat carries MH's connection ids, and MC's remove-only reconcile retires a connection absent from it (and releases its `sender_id` binding), counted `mc_media_handler_connected_set_corrections_total`. A failed `Connected` is not drift: the bind is its only add path, so MH declines that session (`mh_media_session_starts_total{outcome="declined_mc_unavailable"}`, [Scenario 15](#scenario-15-media-sessions-declining--no-sender-binding)) and the client redials. A **sustained** correction rate is the warning `MCMediaHandlerConnectedSetCorrections`: it means the notification path is lossy.
 
 **Immediate Response**:
 
@@ -2433,7 +2432,7 @@ DOES drop there); `docs/observability/metrics/mh-service.md` (`mh_media_paused_s
 
 ### Scenario 24: Media-Dial Credential Rejections
 
-**Alert**: `MHHighJwtValidationFailures` (the live rule is one aggregate failure ratio over both credential paths, `media_dial` and `service`, with no split; read this scenario's share with `{token_type="media_dial"}` in Diagnosis). Per-reason warnings, each a rule name assigned by OBS-ALERTS (lands with OBS-ALERTS), all on `mh_jwt_validations_total{token_type="media_dial"}`: `failure_reason="expired"` sustained; `failure_reason="no_meeting_key"` sustained; `failure_reason="wrong_type"` increase > 0; `failure_reason="aud_mismatch"` sustained (the `WRONG_HANDLER` rate).
+**Alert**: `MHHighJwtValidationFailures` (the live rule is one aggregate failure ratio over both credential paths, `media_dial` and `service`, with no split; read this scenario's share with `{token_type="media_dial"}` in Diagnosis). Per-reason warnings, all on `mh_jwt_validations_total{token_type="media_dial"}`: `MHMediaDialTokenExpired` (`failure_reason="expired"` sustained); `MHMediaDialNoMeetingKey` (`failure_reason="no_meeting_key"` sustained; decided **before** the signature check, so unauthenticated and attacker-drivable — the ordering-bug reading only when it correlates with `mc_register_meeting_total{status="error"}` or legitimate clients failing to join, otherwise probing); `MHMediaDialWrongTokenType` (`failure_reason="wrong_type"` increase > 0); `MHMediaDialWrongHandler` (`failure_reason="aud_mismatch"` sustained, the `WRONG_HANDLER` rate). `expired`, `wrong_type` and `aud_mismatch` are post-signature (only a holder of the meeting's MC-minted key moves them).
 **Severity**: warning
 **Runbook Section**: `#scenario-24-media-dial-credential-rejections`
 
@@ -2474,10 +2473,12 @@ sum by(failure_reason) (rate(mh_jwt_validations_total{token_type="media_dial",re
 
 ### Scenario 25: Meetings Held Without Clients
 
-**Alert**: dashboard first (MH Media - Meetings Without Clients). Warning:
-`mh_media_meetings_without_clients > 0` sustained past the owner-silence timeout plus margin (`for:`
-anchored to `mh_media_meeting_owner_silence_timeout_seconds`; rule name assigned by OBS-ALERTS,
-lands with OBS-ALERTS).
+**Alert**: dashboard first (MH Media - Meetings Without Clients). Warning `MHMeetingsHeldWithoutClients`:
+`mh_media_meetings_without_clients` above zero on one MH (per instance) for longer than the
+owner-silence timeout (`mh_media_meeting_owner_silence_timeout_seconds`, 900 s shipped) plus the
+gauge's refresh tick and sampling (the current `for:` is in `mh-alerts.yaml` / `alerts.md`). The
+gauge is a per-MH aggregate, so on a busy handler overlapping routine zero-client windows of
+different meetings can hold it up: a steady churn of releases and teardowns means nothing is stuck.
 **Severity**: Informational while under the owner-silence timeout; Warning past it
 **Runbook Section**: `#scenario-25-meetings-held-without-clients`
 
@@ -2537,8 +2538,8 @@ sum by (clients) (increase(mh_media_handler_releases_total{trigger="owner_silenc
 
 ### Scenario 26: Owner-Silence Release With Clients Present
 
-**Alert**: `mh_media_handler_releases_total{trigger="owner_silence", clients="present"}` increase > 0
-(warning; rule name assigned by OBS-ALERTS, lands with OBS-ALERTS).
+**Alert**: `MHOwnerSilenceReleaseWithClients` (warning;
+`mh_media_handler_releases_total{trigger="owner_silence", clients="present"}` increase > 0).
 **Severity**: Warning
 **Runbook Section**: `#scenario-26-owner-silence-release-with-clients-present`
 
