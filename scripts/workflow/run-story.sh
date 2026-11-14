@@ -1210,6 +1210,17 @@ canary_classify() {
 
   if [ "$is_err" = "false" ] && [ -n "$text" ]; then echo healthy; return 0; fi
 
+  # (1b) An edge/WAF block page, not a credential verdict. The CLI wraps EVERY
+  # 403 as "Failed to authenticate. API Error: 403 <page title>", so a Cloudflare
+  # challenge ("Attention Required! | Cloudflare") matches both auth arms below
+  # and sent the operator to rotate a valid token (story 4 task 28, 2026-11-13;
+  # the same token answered `ok` minutes later). It is transient: route it to the
+  # retryable default, whose exhaustion still stops loudly in the infra lane.
+  case "$lower" in
+    *cloudflare*|*"attention required"*|*"<html"*|*"<!doctype html"*)
+      echo session-limit; return 0 ;;
+  esac
+
   # (2) Auth, structured first then prose. Case-INsensitive and multi-phrase:
   # the previous single case-sensitive literal was the defect.
   case "$status" in 401|403) echo auth-expired; return 0 ;; esac
@@ -1920,8 +1931,19 @@ build_devloop_prompt() {
     # what this attempt did), NOT from a re-passed flag. Threading --tier here
     # would be a second, drifting source; the omission is deliberate — do not
     # "fix" it. (RESTART_FROM_TREE takes this lane too.)
-    printf '%b/devloop "This devloop was interrupted before completion. Resume from main.md state: finish incomplete phases, then gates and commit as normal." --continue=%s' \
-      "$prefix_resume" "$continue_slug"
+    if [ "${RESTART_FROM_TREE:-0}" -eq 1 ]; then
+      # --restart over an uncommitted tree resumes the escalated devloop, and the
+      # operator diagnosis lives ONLY in $prompt_file (appended out of band). The
+      # resume argument must point at it: a bare "resume from main.md" string
+      # never names the file, so the session resumed, re-ran its gates on the
+      # unchanged tree and committed work the diagnosis rejected (story 4 task
+      # 24, 2026-11-12).
+      printf '%b/devloop "This devloop escalated and the operator has issued a RESTART DIRECTIVE. Before anything else, read the section headed OPERATOR RESTART DIRECTIVE at the end of the file %s and act on it: it is authoritative and overrides the prior plan, review verdicts and deferrals wherever they conflict. Re-enter the phase it requires (implementation if it requires changes, followed by review), then gates and commit as normal. Record in main.md how each directive item was addressed." --continue=%s' \
+        "$prefix_resume" "$prompt_file" "$continue_slug"
+    else
+      printf '%b/devloop "This devloop was interrupted before completion. Resume from main.md state: finish incomplete phases, then gates and commit as normal." --continue=%s' \
+        "$prefix_resume" "$continue_slug"
+    fi
   else
     printf '%bThe task description for this devloop is the EXACT, COMPLETE contents of the file %s. Read that file now and treat its full text AS the /devloop prompt argument — do not paraphrase, summarise or truncate it, and do not re-quote it.\n/devloop "See %s — that file'"'"'s exact contents are this devloop'"'"'s task description." --specialist=%s --tier=%s' \
       "$prefix_fresh" "$prompt_file" "$prompt_file" "$specialist" "$tier"
@@ -2281,9 +2303,10 @@ while :; do
       if [ "$RESTART_FROM_TREE" -eq 1 ]; then
         # KEEP the resume pointer: the fresh-start path requires a clean tree,
         # and the uncommitted implementation must survive. The resume path
-        # tolerates (expects) a dirty tree, and the resumed session receives
-        # the prompt file with the operator paragraph appended — the session
-        # that escalated gets the answer to the question it asked. No reopen
+        # tolerates (expects) a dirty tree, and build_devloop_prompt's resume
+        # lane names the prompt file and its operator paragraph (the plain
+        # resume argument does not) — the session that escalated gets the
+        # answer to the question it asked. No reopen
         # commit needed: resumes do not run the clean-tree check.
         slog "STORY_RUN: RESTART task=${id} — operator paragraph appended to ${prompt_file}; resume pointer KEPT (uncommitted work in tree)."
       else

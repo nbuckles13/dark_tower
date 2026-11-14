@@ -1202,6 +1202,24 @@ run_story FAKE_DEVLOOP_RCS="1" FAKE_DEVLOOP_COMMIT=0 \
 assert_exit   "g6-status-401-exit2" 2 "$RC"
 assert_status "g6-status-401-auth" "AUTH-EXPIRED" "$OUTPUT"
 
+# G6b: a 403 that is an edge/WAF block page, not a credential verdict — the exact
+# canary production recorded (story 4 task 28, 2026-11-13). The CLI's "Failed to
+# authenticate" wrapper must not route it to AUTH-EXPIRED (whose recovery is a
+# token rotation the operator did not need); it is transient -> retryable lane.
+run_story FAKE_DEVLOOP_RCS="1" FAKE_DEVLOOP_COMMIT=0 \
+  FAKE_CANARY_JSON='{"is_error":true,"api_error_status":403,"api_error_origin":"first_party","result":"Failed to authenticate. API Error: 403 Attention Required! | Cloudflare","terminal_reason":"api_error"}' \
+  STORY_SESSION_LIMIT_RETRIES=1 -- fixture
+assert_status "g6b-cloudflare-403-retryable" "SESSION-LIMIT" "$OUTPUT"
+assert_absent "g6b-cloudflare-403-not-auth" "AUTH-EXPIRED" "$OUTPUT"
+assert_marker "g6b-cloudflare-403-slept" "$MARK" 'sleep.args'
+
+# G6c: the block-page arm must not swallow a GENUINE 403 credential rejection —
+# a plain 403 with no block-page marker still classifies as auth-expired.
+run_story FAKE_DEVLOOP_RCS="1" FAKE_DEVLOOP_COMMIT=0 \
+  FAKE_CANARY_JSON='{"is_error":true,"api_error_status":403,"result":"Failed to authenticate. API Error: 403 OAuth token has been revoked"}' -- fixture
+assert_exit   "g6c-plain-403-exit2" 2 "$RC"
+assert_status "g6c-plain-403-auth" "AUTH-EXPIRED" "$OUTPUT"
+
 # G7 (R-3): output that is not JSON at all -> infra (the substrate produced
 # nothing classifiable). This is the ONLY remaining infra lane.
 run_story FAKE_DEVLOOP_RCS="1" FAKE_DEVLOOP_COMMIT=0 \
@@ -1427,6 +1445,8 @@ assert_marker "k1-resume-slept" "$MARK" 'sleep.args'
 # The second attempt must carry --continue with that slug, not start fresh.
 resume_argv="$(grep -- '--continue=2026-08-13-fixture-devloop' "${MARK}/claude.argv" 2>/dev/null || true)"
 assert_status "k1-resume-continue-flag" "--continue=2026-08-13-fixture-devloop" "$resume_argv"
+# A plain resume (no --restart) must NOT claim an operator directive exists.
+assert_absent "k1-resume-no-directive" "RESTART" "$resume_argv"
 
 # =============================================================================
 # (L) REFUSAL LANES ADDED BY THIS COMMIT
@@ -1987,6 +2007,31 @@ if [ -n "$n11_diag_pos" ] && [ -n "$n11_tail_pos" ] && [ "$n11_diag_pos" -gt "$n
 n11_devloop_argv="$(grep -- '--output-format stream-json' "${MARK}/claude.argv" 2>/dev/null || true)"
 assert_status "n11-devloop-fresh-specialist" "--specialist=test" "$n11_devloop_argv"
 assert_absent "n11-devloop-not-resumed" "--continue=" "$n11_devloop_argv"
+
+# N11t: restart-FROM-TREE delivers the diagnosis to the RESUMED session. A devloop
+# that escalates WITHOUT committing leaves its implementation in the tree, so
+# --restart keeps the resume pointer and spawns /devloop --continue. The operator
+# paragraph is appended to the prompt FILE, which the plain resume argument never
+# names — so the session must be pointed at it explicitly, or the diagnosis is
+# silently dropped (story 4 task 24, 2026-11-12: it re-ran gates on the unchanged
+# tree and committed work the diagnosis rejected).
+run_story FAKE_DEVLOOP_COMMIT=0 FAKE_DEVLOOP_MKOUT=1 \
+  FAKE_DEVLOOP_MKOUT_NAME=2026-08-17-tree-restart-devloop \
+  FAKE_DEVLOOP_ESCALATION='{"reason":"stub-diagnosed"}' -- fixture
+assert_exit   "n11t-setup-escalated-exit1" 1 "$RC"
+assert_status "n11t-setup-reason" "reason=devloop-escalated" "$OUTPUT"
+[ -s "$(RUN_DIR_OF "$DT")/task-1.slug" ] || printf '2026-08-17-tree-restart-devloop\n' > "$(RUN_DIR_OF "$DT")/task-1.slug"
+rm -f "${MARK}/claude.argv"
+REUSE_FIXTURE=1 run_story -- fixture --restart 'RESTART-DIAG-7a1e remove the global gate'
+unset REUSE_FIXTURE
+assert_status "n11t-from-tree-announced" "resume pointer KEPT" "$OUTPUT"
+n11t_prompt_path="$(RUN_DIR_OF "$DT")/task-1.prompt"
+assert_status "n11t-prompt-has-diagnosis" "RESTART-DIAG-7a1e remove the global gate" "$(cat "$n11t_prompt_path" 2>/dev/null || true)"
+n11t_argv="$(grep -- '--output-format stream-json' "${MARK}/claude.argv" 2>/dev/null || true)"
+assert_status "n11t-resumed" "--continue=2026-08-17-tree-restart-devloop" "$n11t_argv"
+assert_status "n11t-argv-names-directive" "DIRECTIVE" "$n11t_argv"
+assert_status "n11t-argv-names-prompt-file" "task-1.prompt" "$n11t_argv"
+assert_absent "n11t-argv-not-plain-resume" "interrupted" "$n11t_argv"
 
 # N12: no-commit-refused. A devloop-no-commit escalation (the devloop exited 0
 # having committed nothing) has nothing to validate or restart from. BOTH flags
