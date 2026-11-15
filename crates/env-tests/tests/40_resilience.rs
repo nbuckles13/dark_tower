@@ -19,10 +19,19 @@
 //!
 //! Concurrent runs sharing one cluster are NOT isolated: they fail loudly with
 //! `foreign-mh-activity` (`MhPool::assert_baseline`, before and after every
-//! leg), never pass falsely. A leg also starts only once MC holds no live
-//! meeting (`foreign-mc-meetings`): an earlier suite's orphaned meeting could
-//! otherwise be given the leg's run-owned MH as a replacement (docs/TODO.md
-//! §Env-Test Resilience, injection-suite orphan).
+//! leg), never pass falsely.
+//!
+//! No leg reads a fleet-wide MC counter (operator ruling: env-tests never
+//! couple through shared counters). A meeting that could be handed a leg's
+//! run-owned MH as a replacement is one whose MHs were released behind MC's
+//! back; the suites that do that (the injection suites 26/37/38/39) prove
+//! their OWN meeting ended before returning (`fixtures::meeting_end`), and the
+//! binaries that run right before the pool-leg binaries (39 before 40; 41-43,
+//! which open no MC meeting, before 44) either do so or open none — keep that
+//! in mind when renumbering. BACKSTOP: a suite that PANICS before its end path
+//! still orphans its meeting for MC's disconnect grace; a later leg then fails
+//! LOUDLY as `foreign-mh-activity` (`assert_baseline`, and the zombie leg's
+//! re-assert just before the freeze), never with corrupted evidence.
 //!
 //! Every pool leg uses only FIXTURE-OWNED MHs (owner = the run token), tears
 //! down explicitly and asserts it (`MhPool::run_leg`: `teardown_and_settle`,
@@ -36,10 +45,12 @@
 //!
 //! Handler-loss legs (crash with replacement, zombie, stranded pair): see
 //! their section below. Since MC-C, MC asks GC for a replacement after EVERY
-//! removal, so each such leg ends its participants INSIDE the leg and waits
-//! for MC's meetings to drain before `run_leg` tears the owned MH down —
-//! otherwise MC would react to the teardown by placing the still-live meeting
-//! on a baseline MH and perturb later baselines.
+//! removal, so each such leg ends its participants INSIDE the leg — graceful
+//! leaves, then THAT meeting (and every placement miss) proved ended and
+//! released on MC from per-meeting Loki lines
+//! (`meeting_end::leave_and_await_ended`) — before `run_leg` tears the owned
+//! MH down; otherwise MC would react to the teardown by placing the
+//! still-live meeting on a baseline MH and perturb later baselines.
 //!
 //! Edge-sum (concurrent Σ P×(N+M)): 2
 
@@ -53,13 +64,15 @@ use env_tests::canary::{CanaryConfig, CanaryPod};
 use env_tests::cluster::ClusterConnection;
 use env_tests::fixtures::gc_fleet::live_gc_pods;
 use env_tests::fixtures::kube::blocking;
+use env_tests::fixtures::loki::require_loki;
 use env_tests::fixtures::mc_session::{JoinDeclaration, MhSession};
 use env_tests::fixtures::media::{assert_relayed_on_slot, bind_until_received};
+use env_tests::fixtures::meeting_end::leave_and_await_ended;
 use env_tests::fixtures::metrics::{
-    format_instance_map, heartbeat_interval_of, mc_heartbeat_deadline, mc_meetings_active_total,
-    mc_planned_transfer_margin, mc_replacement_retry_budget, planned_cutover_ceiling,
-    poll_until_any_instance_above, poll_until_pinned_instance, settled_baseline, sum_over_pods,
-    InstanceCounters, BASELINE_SETTLE_BOUND, MH_OWNER_SILENCE_TIMEOUT_GAUGE, PINNED_METRIC_BOUND,
+    format_instance_map, heartbeat_interval_of, mc_heartbeat_deadline, mc_planned_transfer_margin,
+    mc_replacement_retry_budget, planned_cutover_ceiling, poll_until_any_instance_above,
+    poll_until_pinned_instance, settled_baseline, sum_over_pods, InstanceCounters,
+    BASELINE_SETTLE_BOUND, MH_OWNER_SILENCE_TIMEOUT_GAUGE, PINNED_METRIC_BOUND,
 };
 use env_tests::fixtures::mh_address::assert_addresses_unique;
 use env_tests::fixtures::mh_pool::{
@@ -280,6 +293,8 @@ async fn mc_c_crash_moves_media_to_the_survivor_then_gc_replaces_the_handler() {
 async fn crash_leg(pool: Arc<MhPool>, prom_url: &str) {
     let prom = PrometheusClient::new(prom_url);
     let cluster = connected_cluster().await;
+    // The leg ends through the Loki-proved meeting end: fail now without Loki.
+    require_loki(&cluster).await;
     let auth = AuthClient::new(&cluster.ac_base_url);
     let gc = GcClient::new(&cluster.gc_base_url);
     let n = mc_heartbeat_deadline(&prom).await;
@@ -292,7 +307,6 @@ async fn crash_leg(pool: Arc<MhPool>, prom_url: &str) {
     let owned = slot.address.clone();
     let attempts = live_placement_attempts(&pool).await;
     let owned_heartbeats_before = prom.instance_counter_map(MC_OWNED_HEARTBEATS).await;
-    let meetings_before = settled_meetings_active(&prom).await;
 
     // PLACEMENT: a two-handler meeting holding the owned MH (precondition: a
     // survivor exists by construction).
@@ -608,9 +622,7 @@ async fn crash_leg(pool: Arc<MhPool>, prom_url: &str) {
 
     // Hygiene: end the meeting INSIDE the leg (module doc).
     drop(sessions);
-    drop(ps);
-    drop(meeting);
-    await_meetings_drained(&prom, meetings_before, "CRASH").await;
+    leave_and_await_ended("CRASH END", &cluster, &prom, ps, meeting.missed).await;
 }
 
 /// R-10, R-39: the zombie. Freeze (SIGSTOP via the injector, which proves the
@@ -650,6 +662,8 @@ async fn mc_b2_zombie_is_removed_while_frozen_and_released_on_resume() {
 async fn zombie_leg(pool: Arc<MhPool>, prom_url: &str) {
     let prom = PrometheusClient::new(prom_url);
     let cluster = connected_cluster().await;
+    // The leg ends through the Loki-proved meeting end: fail now without Loki.
+    require_loki(&cluster).await;
     let auth = AuthClient::new(&cluster.ac_base_url);
     let gc = GcClient::new(&cluster.gc_base_url);
     let n = mc_heartbeat_deadline(&prom).await;
@@ -680,7 +694,6 @@ async fn zombie_leg(pool: Arc<MhPool>, prom_url: &str) {
     .await;
     let attempts = live_placement_attempts(&pool).await;
     let owned_heartbeats_before = prom.instance_counter_map(MC_OWNED_HEARTBEATS).await;
-    let meetings_before = settled_meetings_active(&prom).await;
 
     let (mut z, meeting) =
         place_on_owned(&auth, &gc, "MC-B2 zombie", 1, "Z", &owned, None, attempts).await;
@@ -878,9 +891,7 @@ async fn zombie_leg(pool: Arc<MhPool>, prom_url: &str) {
     // MC-C acquires a replacement for the one-handler meeting here too; this
     // leg pins nothing about set size (only that the zombie left it). End the
     // meeting INSIDE the leg (module doc).
-    drop(z);
-    drop(meeting);
-    await_meetings_drained(&prom, meetings_before, "ZOMBIE").await;
+    leave_and_await_ended("ZOMBIE END", &cluster, &prom, vec![z], meeting.missed).await;
     assert_addresses_unique().await;
 }
 
@@ -906,6 +917,8 @@ async fn mc_c_stranded_pair_hears_each_other_on_the_replacement() {
 async fn stranded_leg(pool: Arc<MhPool>, prom_url: &str) {
     let prom = PrometheusClient::new(prom_url);
     let cluster = connected_cluster().await;
+    // The leg ends through the Loki-proved meeting end: fail now without Loki.
+    require_loki(&cluster).await;
     let auth = AuthClient::new(&cluster.ac_base_url);
     let gc = GcClient::new(&cluster.gc_base_url);
     let n = mc_heartbeat_deadline(&prom).await;
@@ -916,7 +929,6 @@ async fn stranded_leg(pool: Arc<MhPool>, prom_url: &str) {
     let mut slot = pool.up_scraped(&prom).await;
     let owned = slot.address.clone();
     let attempts = live_placement_attempts(&pool).await;
-    let meetings_before = settled_meetings_active(&prom).await;
 
     let (a, meeting) = place_on_owned(
         &auth,
@@ -1018,9 +1030,7 @@ async fn stranded_leg(pool: Arc<MhPool>, prom_url: &str) {
 
     assert_addresses_unique().await;
     drop(sessions);
-    drop(ps);
-    drop(meeting);
-    await_meetings_drained(&prom, meetings_before, "STRANDED").await;
+    leave_and_await_ended("STRANDED END", &cluster, &prom, ps, meeting.missed).await;
 }
 
 // ============================================================================
@@ -1093,6 +1103,8 @@ async fn mc_f_planned_transfer_adds_the_grant_before_dropping_the_draining_handl
 async fn planned_with_target_leg(pool: Arc<MhPool>, prom_url: &str) {
     let prom = PrometheusClient::new(prom_url);
     let cluster = connected_cluster().await;
+    // The leg ends through the Loki-proved meeting end: fail now without Loki.
+    require_loki(&cluster).await;
     let auth = AuthClient::new(&cluster.ac_base_url);
     let gc = GcClient::new(&cluster.gc_base_url);
     let view_bound = settle_window(&cluster).await + VIEW_MARGIN;
@@ -1105,7 +1117,6 @@ async fn planned_with_target_leg(pool: Arc<MhPool>, prom_url: &str) {
     let cutover =
         planned_cutover_ceiling(grace, margin, VIEW_MARGIN).unwrap_or_else(|e| panic!("{e}"));
     let attempts = live_placement_attempts(&pool).await;
-    let meetings_before = settled_meetings_active(&prom).await;
 
     let (a, meeting) = place_on_owned(
         &auth,
@@ -1234,9 +1245,7 @@ async fn planned_with_target_leg(pool: Arc<MhPool>, prom_url: &str) {
 
     assert_addresses_unique().await;
     drop(sessions);
-    drop(ps);
-    drop(meeting);
-    await_meetings_drained(&prom, meetings_before, "PLANNED").await;
+    leave_and_await_ended("PLANNED END", &cluster, &prom, ps, meeting.missed).await;
 }
 
 /// R-3 (MC side), R-39: planned transfer WITHOUT a target (ADR-0039 §4 survivor
@@ -1267,6 +1276,8 @@ async fn mc_f_planned_transfer_without_a_grant_moves_the_meeting_to_the_survivor
 async fn planned_without_target_leg(pool: Arc<MhPool>, prom_url: &str) {
     let prom = PrometheusClient::new(prom_url);
     let cluster = connected_cluster().await;
+    // The leg ends through the Loki-proved meeting end: fail now without Loki.
+    require_loki(&cluster).await;
     let auth = AuthClient::new(&cluster.ac_base_url);
     let gc = GcClient::new(&cluster.gc_base_url);
     let view_bound = settle_window(&cluster).await + VIEW_MARGIN;
@@ -1290,7 +1301,6 @@ async fn planned_without_target_leg(pool: Arc<MhPool>, prom_url: &str) {
             .collect::<Vec<_>>()
     );
     let attempts = live_placement_attempts(&pool).await;
-    let meetings_before = settled_meetings_active(&prom).await;
 
     let (a, meeting) = place_on_owned(
         &auth,
@@ -1442,9 +1452,7 @@ async fn planned_without_target_leg(pool: Arc<MhPool>, prom_url: &str) {
     );
 
     drop(sessions);
-    drop(ps);
-    drop(meeting);
-    await_meetings_drained(&prom, meetings_before, "NO-TARGET").await;
+    leave_and_await_ended("NO-TARGET END", &cluster, &prom, ps, meeting.missed).await;
     // The baseline restore runs in the scaffold (every exit path), and the
     // R-28 address invariant after it: the baseline is short until then.
 }
@@ -1846,66 +1854,6 @@ async fn await_replacement(
         between.refs()
     );
     new_ref
-}
-
-/// The pre-placement value of [`mc_meetings_active`], SETTLED: two reads one
-/// poll apart agreeing (a meeting ending from an earlier leg must not be
-/// mid-flight in the baseline).
-async fn settled_meetings_active(prom: &PrometheusClient) -> f64 {
-    let deadline = std::time::Instant::now() + BASELINE_SETTLE_BOUND;
-    let mut previous = mc_meetings_active_total(prom).await;
-    loop {
-        tokio::time::sleep(POLL).await;
-        let now = mc_meetings_active_total(prom).await;
-        #[expect(
-            clippy::float_cmp,
-            reason = "gauge sums of small integers are exact in f64"
-        )]
-        let settled = now == previous;
-        if settled {
-            return now;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "HYGIENE PRECONDITION (meetings-baseline-unsettled): mc_meetings_active did not \
-             settle within {BASELINE_SETTLE_BOUND:?} ({previous} -> {now}) — environment, not \
-             an MC defect"
-        );
-        previous = now;
-    }
-}
-
-/// LEG HYGIENE, NOT EVIDENCE. After a handler-loss leg dropped its
-/// participants, wait until MC's active meetings are back to the settled
-/// pre-placement count, so `run_leg`'s owned-MH teardown cannot make MC
-/// acquire a replacement for a still-live meeting and place it on a
-/// baseline MH (perturbing later legs' baselines).
-///
-/// Why the README §Evidence rule's exception applies: the fixture has no
-/// per-entity leave/end signal (no clean-leave API; dropping a participant is
-/// a disconnect, ended by MC after its disconnect grace period), so the only
-/// observable is the shared fleet gauge. RESIDUAL: a vacuous pass is possible
-/// (another meeting ending can satisfy the comparison while ours is still in
-/// grace), so nothing here proves anything about MC; it only makes the
-/// common case clean. The bound is the shared failure-only
-/// `PINNED_METRIC_BOUND`: MC publishes no gauge for its disconnect grace
-/// period (`MC_DISCONNECT_GRACE_PERIOD_SECONDS`, default 30 s) to derive one
-/// from.
-async fn await_meetings_drained(prom: &PrometheusClient, before: f64, phase: &str) {
-    let deadline = std::time::Instant::now() + PINNED_METRIC_BOUND;
-    loop {
-        let now = mc_meetings_active_total(prom).await;
-        if now <= before {
-            return;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "{phase} HYGIENE (meetings-not-drained): MC still holds {now} active meetings \
-             (settled before the leg: {before}) {PINNED_METRIC_BOUND:?} after the participants \
-             left — environment hygiene for the next leg, not an MC defect"
-        );
-        tokio::time::sleep(POLL).await;
-    }
 }
 
 /// `v`'s audio slot naming `peer` is on the handler `handler_ref` names.

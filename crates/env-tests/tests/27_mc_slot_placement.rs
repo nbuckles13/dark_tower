@@ -1265,9 +1265,7 @@ async fn test_pairing_stability_and_watched_only_video_directive() {
     assert_directive_shape("PAIRING 2", p.directive.as_ref().unwrap(), &both);
 
     // 3.
-    r.session
-        .connection()
-        .close(wtransport::VarInt::from_u32(0), b"leave");
+    env_tests::fixtures::mc_session::leave(r.session.connection());
     drop((r, r_mh));
     converge_slots("PAIRING 3 refill", &mut s, bound, &[Heard(p_id)], &[Live]).await;
     let s_video_ref = s.slots(VIDEO)[0].handler_ref;
@@ -1300,9 +1298,7 @@ async fn test_pairing_stability_and_watched_only_video_directive() {
     .await;
 
     // 6.
-    s.session
-        .connection()
-        .close(wtransport::VarInt::from_u32(0), b"leave");
+    env_tests::fixtures::mc_session::leave(s.session.connection());
     drop((s, s_mh, sub));
     p.converge("PAIRING 6 last watcher left", bound, |_, d| {
         d.is_some_and(|d| stream_of(d, VIDEO).is_some() && stream_of(d, AUDIO).is_some())

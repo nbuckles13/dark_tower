@@ -92,6 +92,7 @@ use env_tests::fixtures::gc_client::{CreateMeetingRequest, GcClient, JoinMeeting
 use env_tests::fixtures::injection::{
     self, assert_mc_programmed_a_carrying_pod, injectable_handlers, Injection,
 };
+use env_tests::fixtures::loki;
 use env_tests::fixtures::mc_session::{self, connect_wt, McSession};
 use env_tests::fixtures::media::{
     assert_relayed_on_slot, bind_until_received, bind_until_received_each, drain, read_frame,
@@ -1307,6 +1308,9 @@ async fn install_s4(
 
 async fn server_mute_s4() {
     let cluster = cluster().await;
+    // This fn ends its meeting through the Loki-proved end path: fail at once
+    // without Loki, not after the whole scenario.
+    loki::require_loki(cluster).await;
     let prom = PrometheusClient::new(&cluster.prometheus_base_url);
     let window = participant::settle_window(cluster).await;
     let auth = AuthClient::new(&cluster.ac_base_url);
@@ -1509,10 +1513,10 @@ async fn server_mute_s4() {
         "S4 UNMUTED: A's frames land on B's slot"
     );
 
-    // CLEANUP before any session closes, with the release PROVED.
-    for injection in injections {
-        injection.release_and_prove(&cleanup).await;
-    }
+    // CLEANUP: release PROVED before any session closes, then every
+    // participant leaves and THIS meeting is proved ended on MC.
+    injection::release_and_end_meeting("S4 CLEANUP", injections, &cleanup, cluster, &prom, ps)
+        .await;
     drop(sessions);
 }
 
@@ -1611,6 +1615,7 @@ async fn test_edge_churn_at_a_new_generation_does_not_stall_unrelated_egress() {
 
 async fn edge_churn() {
     let cluster = cluster().await;
+    loki::require_loki(cluster).await;
     let window = participant::settle_window(cluster).await;
     let auth = AuthClient::new(&cluster.ac_base_url);
     let gc = GcClient::new(&cluster.gc_base_url);
@@ -1708,8 +1713,7 @@ async fn edge_churn() {
     }
     phase(SEQ_CHURN_REMOVE, false, "CHURN REMOVE").await;
 
-    for injection in injections {
-        injection.release_and_prove(&cleanup).await;
-    }
+    injection::release_and_end_meeting("CHURN CLEANUP", injections, &cleanup, cluster, &prom, ps)
+        .await;
     drop(sessions);
 }

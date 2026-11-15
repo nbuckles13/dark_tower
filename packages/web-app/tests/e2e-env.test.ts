@@ -24,6 +24,7 @@ const OWNED_VARS = [
   'E2E_AC_URL',
   'E2E_GC_URL',
   'E2E_PROMETHEUS_URL',
+  'E2E_LOKI_URL',
 ] as const;
 
 let saved: Partial<Record<(typeof OWNED_VARS)[number], string | undefined>> = {};
@@ -244,3 +245,20 @@ test('describeEnv reports the org subdomain first, with its provenance', async (
   expect(lines[0]).toBe('E2E_ORG_SUBDOMAIN=e2e-0123456789abcdef (env)');
   expect(lines[1]).toBe('E2E_BASE_URL=http://e2e-0123456789abcdef.localhost:5173 (default)');
 });
+
+test.each(['E2E_LOKI_URL', 'E2E_PROMETHEUS_URL', 'E2E_GC_URL'])(
+  '%s carrying credentials throws without echoing them',
+  async (name) => {
+    process.env.E2E_ORG_SUBDOMAIN = 'e2e-0123456789abcdef';
+    process.env[name] = 'http://scrapeuser:s3cr3tpass@127.0.0.1:3100';
+    const err = await loadEnvModule().then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(Error);
+    const message = (err as Error).message;
+    expect(message).toMatch(new RegExp(`${name} must not contain credentials`));
+    expect(message).not.toContain('scrapeuser');
+    expect(message).not.toContain('s3cr3tpass');
+  },
+);

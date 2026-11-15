@@ -24,14 +24,18 @@
 // …)`), docs "Test timeouts".
 //   BEFORE  the pool is {baseline B, nothing foreign}; NOTHING run-owned is live
 //           (a leak from an earlier timed-out or killed leg is owned by this
-//           same run, which the baseline verdict alone accepts); MC holds no
-//           meeting (an earlier spec's meeting could otherwise be handed the
-//           leg's run-owned MH as a replacement);
+//           same run, which the baseline verdict alone accepts). No fleet-wide
+//           MC check (operator ruling: tests never couple through a shared
+//           counter); a meeting that could be handed this leg's run-owned MH is
+//           one released on MH behind MC's back, and the suites that do that
+//           prove their OWN meeting ended (Rust `fixtures::meeting_end`);
 //   AFTER   on EVERY exit path, in order, each an explicit asserted step (never a
-//           Drop-style backstop): every opened context leaves and closes; MC's
-//           meetings drain (so the owner teardown cannot make MC re-place a live
-//           meeting); `mh.sh drain --all --owner <run>` with the leak check; no GC
-//           replica still counts a removed MH selectable; the baseline again.
+//           Drop-style backstop): every opened context leaves and closes; EACH
+//           meeting the leg opened is PROVED ended and released on MC from its
+//           own Loki lines (`mcLoki.ts`; so the owner teardown cannot make MC
+//           re-place a live meeting); `mh.sh drain --all --owner <run>` with the
+//           leak check; no GC replica still counts a removed MH selectable; the
+//           baseline again.
 //   A teardown failure is the fixture's OWN error: Playwright reports it beside
 //   the test body's error (both in `testInfo.errors`), so neither hides the other.
 //
@@ -39,7 +43,7 @@
 // refs and handler URLs (config, not identity) — never a token, an email or a
 // meeting code.
 
-import { test as base, type Browser, type TestInfo } from 'playwright/test';
+import { test as base, type Browser, type Page, type TestInfo } from 'playwright/test';
 import {
   closeMembers,
   joinMember,
@@ -48,7 +52,7 @@ import {
   type JoinedMember,
   type Member,
 } from './cohortContexts.js';
-import { resilienceTimings, mcRotationBudget, type ResilienceTimings } from './configEnv.js';
+import { resilienceTimings, type ResilienceTimings } from './configEnv.js';
 import {
   bootstrapMeeting,
   handlerUrls,
@@ -61,7 +65,7 @@ import {
   gcRecomputeSuccessByInstance,
   gcSelectableByInstance,
   gcStalenessSecondsByReplica,
-  mcMeetingsActiveTotal,
+  mcDisconnectGraceMs,
   mcReplacementRetryBudgetMs,
   mhScrapeTimestampByInstance,
   mhScrapeUpByInstance,
@@ -76,13 +80,11 @@ import {
   type SlotEntry,
 } from './mhPool.js';
 import {
-  FOREIGN_MC_MEETINGS,
-  MEETINGS_NOT_DRAINED,
+  LOG_AGGREGATION_CEILING_MS,
   METRICS_SCRAPE_CEILING_MS,
   OWNED_MH_NOT_PLACED,
   PLACEMENT_MISS_CEILING,
   REMOVED_MH_STILL_SELECTABLE,
-  SERVICE_JOB_SCRAPE_SETTLE_MS,
   placementAttempts,
   placementHit,
   rebaseline,
@@ -91,6 +93,13 @@ import {
   type ReplicaSettle,
   type ResilienceCeilings,
 } from './mhLegRules.js';
+import {
+  classifyMember,
+  meetingEndBudgetMs,
+  proveMeetingsEnded,
+  scopeStartNs,
+  type MemberDeparture,
+} from './mcLoki.js';
 
 /** Poll CADENCE for the Prometheus and pool reads below (a cadence, never a bound). */
 const POLL_MS = 2_000;
@@ -221,32 +230,6 @@ async function waitRemovedMhUnselectable(pool: MhPool, budgetMs: number): Promis
   }
 }
 
-/**
- * MC's active meetings reach 0 on `consecutive` reads one SCRAPE apart
- * (`SERVICE_JOB_SCRAPE_SETTLE_MS`: reads closer than one scrape compare a sample
- * with itself), within `boundMs`. BEFORE a leg: 2 (settled: twin of
- * `metrics::await_no_mc_meetings`). AFTER a leg: 1 (the hygiene wait; a leave
- * only ever lowers the count).
- */
-async function awaitMcMeetingsZero(
-  consecutive: 1 | 2,
-  boundMs: number,
-  failure: (now: number) => string,
-): Promise<void> {
-  let zeros = 0;
-  const { converged, last } = await pollProm(
-    async () => {
-      const now = await mcMeetingsActiveTotal();
-      zeros = now === 0 ? zeros + 1 : 0;
-      return now;
-    },
-    () => zeros >= consecutive,
-    boundMs,
-    SERVICE_JOB_SCRAPE_SETTLE_MS,
-  );
-  if (!converged) throw new Error(failure(last));
-}
-
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -294,7 +277,8 @@ interface LegBounds {
   readonly timings: ResilienceTimings;
   readonly ceilings: ResilienceCeilings;
   readonly settleBudgetMs: number;
-  readonly meetingsBoundMs: number;
+  /** The per-meeting end proof's FAILURE ceiling: MC's published grace + log ingest. */
+  readonly meetingEndCeilingMs: number;
 }
 
 async function legBounds(testInfo: TestInfo): Promise<LegBounds> {
@@ -302,28 +286,30 @@ async function legBounds(testInfo: TestInfo): Promise<LegBounds> {
   const retryBudgetMs = await mcReplacementRetryBudgetMs();
   const ceilings = resilienceCeilings(timings, retryBudgetMs, HEAR_SENDER_TIMEOUT_MS);
   const settleBudgetMs = await removalSettleBudgetMs(timings);
-  // MC holds a left participant through its disconnect grace (README §Budgets
-  // residual), and may hold a replacement through its retry budget.
-  const meetingsBoundMs =
-    mcRotationBudget().graceSeconds * 1000 + retryBudgetMs + METRICS_SCRAPE_CEILING_MS;
+  // MC holds a browser leaver through its disconnect grace today (docs/TODO.md,
+  // "MC classifies the browser SDK's CLEAN disconnect as `server_initiated`"), so
+  // the end proof's ceiling is that grace, read from MC's config echo (the same
+  // source as Rust `metrics::mc_disconnect_grace`), plus the log-ingest ceiling.
+  const meetingEndCeilingMs = (await mcDisconnectGraceMs()) + LOG_AGGREGATION_CEILING_MS;
   testInfo.setTimeout(
-    // before/after baseline + the removed-MH settle + the two meeting waits +
+    // before/after baseline + the removed-MH settle + the meeting-end proof's whole
+    // budget (`meetingEndBudgetMs`: its shared deadline + one release window) +
     // the leg's own ceilings (kill/drain view, replacement), + the backstop.
     // Playwright gives fixture teardown its own slot of this size after a timeout.
     3 * settleBudgetMs +
-      2 * meetingsBoundMs +
+      meetingEndBudgetMs(meetingEndCeilingMs) +
       ceilings.replacementMs +
       ceilings.survivorMs +
       LEG_BACKSTOP_MS,
   );
   testInfo.annotations.push({
     type: 'resilience-ceilings-ms',
-    description: JSON.stringify({ ...ceilings, settleBudgetMs, meetingsBoundMs }),
+    description: JSON.stringify({ ...ceilings, settleBudgetMs, meetingEndCeilingMs }),
   });
-  return { timings, ceilings, settleBudgetMs, meetingsBoundMs };
+  return { timings, ceilings, settleBudgetMs, meetingEndCeilingMs };
 }
 
-/** BEFORE: baseline, nothing run-owned live, no MC meeting. */
+/** BEFORE: baseline, nothing run-owned live. */
 async function beforeLeg(pool: MhPool, bounds: LegBounds): Promise<void> {
   await pool.assertBaseline(bounds.settleBudgetMs);
   const leak = runLeakVerdict(await pool.list(), await pool.owner());
@@ -333,17 +319,93 @@ async function beforeLeg(pool: MhPool, bounds: LegBounds): Promise<void> {
         `a killed runner). Reclaim: ${await pool.reclaimCommand()}`,
     );
   }
-  await awaitMcMeetingsZero(
-    2,
-    bounds.meetingsBoundMs,
-    (now) =>
-      `PRECONDITION (${FOREIGN_MC_MEETINGS}): MC still holds ${now} active meeting(s) after ` +
-      `${bounds.meetingsBoundMs} ms; an earlier suite's meeting could be handed this leg's run-owned MH`,
+}
+
+// ---------------------------------------------------------------------------
+// The leg's meetings: what the per-meeting end proof needs (`mcLoki.ts`)
+// ---------------------------------------------------------------------------
+
+/** GC's join: `GET /api/v1/meetings/{code}` (create is a POST to the collection). */
+const GC_JOIN_PATH = /^\/api\/v1\/meetings\/[^/]+$/;
+
+/**
+ * One member page's GC joins: the `meetingId` of EVERY 2xx GC join response the
+ * page received (the SDK's join retry can make several). The listener is
+ * installed when the member OPENS, before anything can trigger a join. Only
+ * `meetingId` is read from the parsed body; the body (it carries the meeting
+ * token) is never kept, logged or annotated.
+ */
+interface JoinWatch {
+  readonly meetingIds: string[];
+  readonly pending: Promise<void>[];
+}
+
+function watchGcJoins(page: Page): JoinWatch {
+  const watch: JoinWatch = { meetingIds: [], pending: [] };
+  page.on('response', (response) => {
+    if (response.request().method() !== 'GET' || !response.ok()) return;
+    if (!GC_JOIN_PATH.test(new URL(response.url()).pathname)) return;
+    watch.pending.push(
+      response.json().then(
+        (body: unknown) => {
+          const id = (body as { meetingId?: unknown } | null)?.meetingId;
+          watch.meetingIds.push(typeof id === 'string' ? id : '<no meetingId>');
+        },
+        () => {
+          watch.meetingIds.push('<unparseable join response>');
+        },
+      ),
+    );
+  });
+  return watch;
+}
+
+/**
+ * What `member` contributes to the end proof, read BEFORE it closes: its GC
+ * meeting id(s) and every MC participant id its bus `joined` events carried
+ * (the SDK fills it from the JoinResponse). Classified by `mcLoki.classifyMember`:
+ * no GC join = nothing to prove; a GC join without a participant id fails loudly.
+ */
+async function departureOf(member: Member, watch: JoinWatch): Promise<MemberDeparture | undefined> {
+  await Promise.all(watch.pending);
+  const participantIds = await member.page.evaluate(
+    () =>
+      window.__darktower_test__?.events
+        .filter((e) => e['type'] === 'joined')
+        .map((e) => e['participantId'])
+        .filter((p): p is string => typeof p === 'string') ?? [],
   );
+  return classifyMember(member.label, watch.meetingIds, participantIds);
+}
+
+/** The leg's meeting bookkeeping, shared by the context and AFTER. */
+interface LegMeetings {
+  /** Scope start of every Loki read, taken before the leg's first join. */
+  readonly sinceNs: bigint;
+  readonly watches: Map<Member, JoinWatch>;
+  /** Members already left (placement misses, `release`), recorded before they closed. */
+  readonly departed: MemberDeparture[];
+}
+
+/** Record `member`'s departure (if it joined), THEN close it — the close runs even if recording fails. */
+async function recordAndClose(member: Member, meetings: LegMeetings): Promise<void> {
+  try {
+    const watch = meetings.watches.get(member);
+    if (watch === undefined) throw new Error(`member ${member.label} was opened outside the leg`);
+    const d = await departureOf(member, watch);
+    if (d !== undefined) meetings.departed.push(d);
+  } finally {
+    await closeMembers([member]);
+  }
 }
 
 /** AFTER, every exit path: each step asserted, every failure collected and thrown together. */
-async function afterLeg(pool: MhPool, opened: Member[], bounds: LegBounds): Promise<void> {
+async function afterLeg(
+  pool: MhPool,
+  opened: Member[],
+  bounds: LegBounds,
+  meetings: LegMeetings,
+): Promise<void> {
   const failures: string[] = [];
   const step = async (name: string, fn: () => Promise<void>): Promise<void> => {
     try {
@@ -352,17 +414,24 @@ async function afterLeg(pool: MhPool, opened: Member[], bounds: LegBounds): Prom
       failures.push(`${name}: ${messageOf(err)}`);
     }
   };
-  await step('leave members', () => closeMembers(opened.splice(0)));
-  await step('meetings drained', () =>
-    awaitMcMeetingsZero(
-      1,
-      bounds.meetingsBoundMs,
-      (now) =>
-        `HYGIENE (${MEETINGS_NOT_DRAINED}): MC still holds ${now} active meeting(s) ` +
-        `${bounds.meetingsBoundMs} ms after the leg left — tearing the owned MH down now would ` +
-        'make MC re-place a live meeting',
-    ),
-  );
+  for (const member of opened.splice(0)) {
+    await step(`leave ${member.label}`, () => recordAndClose(member, meetings));
+  }
+  // BEFORE the owner teardown, on purpose: a meeting still live when the
+  // run-owned MH goes would make MC acquire a replacement for it (the orphan
+  // class). `leaveGracefully` proves only that the SDK reached `disconnecting`,
+  // not that MC heard the leave, so each meeting is PROVED ended and released
+  // from MC's own lines (`mcLoki.ts`). Do not "simplify" this back into a
+  // fleet-counter wait or drop it. The departure check accepts MC's grace-expiry
+  // line beside its clean-close line because MC classifies the SDK's leave as
+  // `server_initiated` today (docs/TODO.md, "MC classifies the browser SDK's
+  // CLEAN disconnect as `server_initiated`"); that is also why this step costs
+  // about one disconnect grace until that is fixed.
+  if (meetings.departed.length > 0) {
+    await step('meetings ended (per-meeting proof)', () =>
+      proveMeetingsEnded(meetings.departed, meetings.sinceNs, bounds.meetingEndCeilingMs),
+    );
+  }
   await step('owner teardown', () => pool.teardown());
   await step('removed MH unselectable', () =>
     waitRemovedMhUnselectable(pool, bounds.settleBudgetMs),
@@ -385,6 +454,7 @@ function legContext(
   pool: MhPool,
   bounds: LegBounds,
   opened: Member[],
+  meetings: LegMeetings,
 ): LegContext {
   const initialHandlers = bounds.timings.initialHandlers;
   const ctx: LegContext = {
@@ -393,13 +463,14 @@ function legContext(
     ceilings: bounds.ceilings,
     async open(index, levers) {
       const m = await openMember(browser, index, levers);
+      meetings.watches.set(m, watchGcJoins(m.page));
       opened.push(m);
       return m;
     },
     async release(member) {
       const i = opened.indexOf(member);
       if (i >= 0) opened.splice(i, 1);
-      await closeMembers([member]);
+      await recordAndClose(member, meetings);
     },
     async upScraped() {
       const entry = await pool.up();
@@ -486,10 +557,11 @@ export const legTest = base.extend<{ leg: LegContext }>({
     const pool = createMhPool();
     await beforeLeg(pool, bounds);
     const opened: Member[] = [];
+    const meetings: LegMeetings = { sinceNs: scopeStartNs(), watches: new Map(), departed: [] };
     try {
-      await use(legContext(browser, testInfo, pool, bounds, opened));
+      await use(legContext(browser, testInfo, pool, bounds, opened, meetings));
     } finally {
-      await afterLeg(pool, opened, bounds);
+      await afterLeg(pool, opened, bounds, meetings);
     }
   },
 });

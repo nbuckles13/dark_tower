@@ -31,55 +31,26 @@
 
 #![cfg(feature = "flows")]
 
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use env_tests::cluster::ClusterConnection;
 use env_tests::eventual::ConsistencyCategory;
 use env_tests::fixtures::gc_client::GcClient;
 use env_tests::fixtures::kube::settled_serving_pods;
-use env_tests::fixtures::loki::{query_range, LokiEntry};
+use env_tests::fixtures::loki::{
+    require_loki, since_now_ns, MeetingScope, GC_ENDED, MC_CREATED, MC_MEETING_ENDED,
+    MC_WINDOW_FIRED,
+};
 use env_tests::fixtures::metrics::{gauge_by_pods, PrometheusClient, PINNED_METRIC_BOUND};
 use env_tests::fixtures::participant::{mc_join, Invited};
 use env_tests::fixtures::AuthClient;
 
-// ---------------------------------------------------------------------------
-// THE log lines this test matches: target + message, each citing its emitter.
-// A reworded or retargeted line fails as "created line never seen" (or its
-// sibling token) with this hint, never as a vacuous pass.
-// ---------------------------------------------------------------------------
+// The log lines this test matches (`MC_CREATED`, `MC_WINDOW_FIRED`,
+// `MC_MEETING_ENDED`, `GC_ENDED`) live in `env_tests::fixtures::loki`, their one
+// home, each pinned to its emitter by a hermetic test there.
 
-/// `crates/mc-service/src/actors/controller.rs` (`create_meeting`, the
-/// "Meeting actor created" INFO, ~:868).
-const MC_CREATED: LogLine = LogLine {
-    app: "mc-service",
-    target: "mc.actor.controller",
-    message: "Meeting actor created",
-};
-
-/// `crates/mc-service/src/actors/meeting.rs` (`on_join_window_deadline`):
-/// the actor's own join-window end, carrying `window_seconds`, `age_ms` and
-/// `lifetime_tick_ms`.
-const MC_WINDOW_FIRED: LogLine = LogLine {
-    app: "mc-service",
-    target: "mc.actor.meeting",
-    message: "No participant joined within the join window; ending the meeting",
-};
-
-/// `crates/mc-service/src/actors/controller.rs` (`reap_ended`, ~:1268): one
-/// per meeting end, carrying `cause`, `reason` and `age_ms`.
-const MC_ENDED: LogLine = LogLine {
-    app: "mc-service",
-    target: "mc.actor.controller",
-    message: "Meeting ended; releasing it on its media handlers",
-};
-
-/// `crates/gc-service/src/services/mc_assignment.rs` (`end_assignment`,
-/// ~:119): emitted only when GC actually ended a live row for this meeting.
-const GC_ENDED: LogLine = LogLine {
-    app: "gc-service",
-    target: "gc.service.assignment",
-    message: "Ended meeting assignment(s)",
-};
+/// This test's Loki poll interval.
+const POLL: Duration = Duration::from_secs(2);
 
 /// The largest join window this test will WAIT for. The Kind overlay
 /// (`infra/kubernetes/overlays/kind/services/mc-service/configmap-join-window-patch.yaml`)
@@ -90,119 +61,6 @@ const GC_ENDED: LogLine = LogLine {
 /// that, instead of eating the suite timeout (the Gate-2 L7 failure of the
 /// join-window devloop).
 const LAYER7_WINDOW_BUDGET: Duration = Duration::from_secs(20);
-
-#[derive(Clone, Copy)]
-struct LogLine {
-    app: &'static str,
-    target: &'static str,
-    message: &'static str,
-}
-
-/// One matched entry: its Loki timestamp (ns) and parsed JSON line.
-struct Entry {
-    ts_ns: u128,
-    json: serde_json::Value,
-}
-
-impl Entry {
-    fn field_u64(&self, name: &str) -> Option<u64> {
-        self.json
-            .get("fields")
-            .and_then(|f| f.get(name))
-            .and_then(serde_json::Value::as_u64)
-    }
-
-    fn field(&self, name: &str) -> Option<&str> {
-        self.json
-            .get("fields")
-            .and_then(|f| f.get(name))
-            .and_then(serde_json::Value::as_str)
-    }
-}
-
-fn now_ns() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock after epoch")
-        .as_nanos()
-}
-
-/// What every Loki read in this test is scoped to: THIS meeting's id, since
-/// just before its GC join.
-struct Scope<'a> {
-    cluster: &'a ClusterConnection,
-    loki: String,
-    meeting_id: String,
-    since_ns: u128,
-}
-
-impl Scope<'_> {
-    /// Every entry of `line` for this meeting, oldest first. Matching is
-    /// structural (JSON `target`, `fields.message`, `fields.meeting_id`); the
-    /// LogQL line filters only narrow the scan.
-    async fn entries(&self, line: LogLine) -> Vec<Entry> {
-        let meeting_id = self.meeting_id.as_str();
-        let query = format!(
-            "{{app=\"{}\"}} |= \"{meeting_id}\" |= \"{}\"",
-            line.app, line.message
-        );
-        // A query FAILURE fails at once with its own token — never read as
-        // "no line yet" (which would surface as a content failure after the
-        // whole poll ceiling).
-        let raw = query_range(
-            self.cluster,
-            &self.loki,
-            &query,
-            self.since_ns,
-            now_ns(),
-            100,
-        )
-        .await
-        .unwrap_or_else(|e| panic!("loki-query-failed: `{query}` for meeting {meeting_id}: {e}"));
-        raw.into_iter()
-            // A line that is not JSON is not one of the matched (JSON) lines.
-            .filter_map(|LokiEntry { ts_ns, line }| {
-                serde_json::from_str(&line)
-                    .ok()
-                    .map(|json| Entry { ts_ns, json })
-            })
-            .filter(|e| {
-                e.json.get("target").and_then(serde_json::Value::as_str) == Some(line.target)
-                    && e.field("message") == Some(line.message)
-                    && e.field("meeting_id") == Some(meeting_id)
-            })
-            .collect()
-    }
-
-    /// Poll until `pick` finds an entry, or fail with `token` after `ceiling`
-    /// (a FAILURE bound only — never the correctness bound).
-    async fn await_entry(
-        &self,
-        line: LogLine,
-        ceiling: Duration,
-        token: &str,
-        pick: impl Fn(&[Entry]) -> Option<usize>,
-    ) -> Entry {
-        let deadline = Instant::now() + ceiling;
-        loop {
-            let mut found = self.entries(line).await;
-            if let Some(i) = pick(&found) {
-                return found.swap_remove(i);
-            }
-            assert!(
-                Instant::now() < deadline,
-                "{token}: no `{}` line (target `{}`, app `{}`) for meeting {} within \
-                 {ceiling:?}. If the line was reworded or retargeted, update the const block at \
-                 the top of 47_mc_join_window.rs; otherwise see the token.",
-                line.message,
-                line.target,
-                line.app,
-                self.meeting_id
-            );
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        }
-    }
-}
 
 fn delta(later_ns: u128, earlier_ns: u128) -> Duration {
     Duration::from_nanos(u64::try_from(later_ns.saturating_sub(earlier_ns)).unwrap_or(u64::MAX))
@@ -216,12 +74,7 @@ async fn a_never_joined_meeting_ends_at_its_join_window_and_a_rejoin_gets_a_fres
         .expect("Failed to connect to cluster - ensure port-forwards are running");
     cluster.check_ac_health().await.expect("AC must be running");
     cluster.check_gc_health().await.expect("GC must be running");
-    assert!(
-        cluster.is_loki_available().await,
-        "PRECONDITION-loki-unavailable: this test's evidence is per-meeting Loki lines; \
-         Loki must be up (an unavailable Loki FAILS this test, never skips it)"
-    );
-    let loki = cluster.loki_base_url.clone().expect("Loki URL is set");
+    let loki = require_loki(&cluster).await;
 
     let prom = PrometheusClient::new(&cluster.prometheus_base_url);
     // The window every MC pod enforces, read from its config echo — and the
@@ -261,7 +114,7 @@ async fn a_never_joined_meeting_ends_at_its_join_window_and_a_rejoin_gets_a_fres
     let gc = GcClient::new(&cluster.gc_base_url);
     let invited = Invited::new(&auth, &gc, "Join window", 1).await;
     // Slack before the GC join so the creation line is inside the range.
-    let since_ns = now_ns().saturating_sub(Duration::from_secs(5).as_nanos());
+    let since_ns = since_now_ns();
 
     // GC assigns the meeting (MC creates its actor) — and nobody connects.
     // The TEST's own monotonic clock, started before GC assigns the meeting:
@@ -270,17 +123,17 @@ async fn a_never_joined_meeting_ends_at_its_join_window_and_a_rejoin_gets_a_fres
     // us (independent of `age_ms` and of wall-clock skew).
     let gc_join_started = Instant::now();
     let first = invited.gc_join(0).await;
-    let scope = Scope {
+    let scope = MeetingScope {
         cluster: &cluster,
         loki,
-        meeting_id: first.meeting_id.to_string(),
+        meeting_id: first.meeting_id,
         since_ns,
     };
-    let meeting_id = scope.meeting_id.clone();
+    let meeting_id = scope.meeting_id;
 
     // 1. Positive control: the actor was created (and ingested).
     let created = scope
-        .await_entry(MC_CREATED, ingest, "created-line-never-seen", |es| {
+        .await_entry(MC_CREATED, ingest, POLL, "created-line-never-seen", |es| {
             (!es.is_empty()).then_some(0)
         })
         .await;
@@ -292,6 +145,7 @@ async fn a_never_joined_meeting_ends_at_its_join_window_and_a_rejoin_gets_a_fres
         .await_entry(
             MC_WINDOW_FIRED,
             window + LAYER7_WINDOW_BUDGET + ingest,
+            POLL,
             "created-but-not-ended",
             |es| (!es.is_empty()).then_some(0),
         )
@@ -333,9 +187,13 @@ async fn a_never_joined_meeting_ends_at_its_join_window_and_a_rejoin_gets_a_fres
 
     // The controller's end line: cause and reason (and its own age field).
     let end = scope
-        .await_entry(MC_ENDED, ingest, "ended-line-never-seen", |es| {
-            (!es.is_empty()).then_some(0)
-        })
+        .await_entry(
+            MC_MEETING_ENDED,
+            ingest,
+            POLL,
+            "ended-line-never-seen",
+            |es| (!es.is_empty()).then_some(0),
+        )
         .await;
     assert_eq!(
         (end.field("cause"), end.field("reason")),
@@ -349,9 +207,13 @@ async fn a_never_joined_meeting_ends_at_its_join_window_and_a_rejoin_gets_a_fres
     //    at or after MC's end), so the re-join below takes GC's new-assignment
     //    path instead of reusing the ended row.
     scope
-        .await_entry(GC_ENDED, ingest, "gc-never-ended-the-assignment", |es| {
-            es.iter().position(|e| e.ts_ns >= end.ts_ns)
-        })
+        .await_entry(
+            GC_ENDED,
+            ingest,
+            POLL,
+            "gc-never-ended-the-assignment",
+            |es| es.iter().position(|e| e.ts_ns >= end.ts_ns),
+        )
         .await;
 
     // 4. A join after the end gets a FRESH meeting: GC re-assigns, MC admits,
@@ -360,9 +222,13 @@ async fn a_never_joined_meeting_ends_at_its_join_window_and_a_rejoin_gets_a_fres
     assert_eq!(again.meeting_id, first.meeting_id);
     let participant = mc_join("join-window-rejoin", &again, invited.display(0)).await;
     scope
-        .await_entry(MC_CREATED, ingest, "rejoin-not-a-fresh-incarnation", |es| {
-            es.iter().position(|e| e.ts_ns > end.ts_ns)
-        })
+        .await_entry(
+            MC_CREATED,
+            ingest,
+            POLL,
+            "rejoin-not-a-fresh-incarnation",
+            |es| es.iter().position(|e| e.ts_ns > end.ts_ns),
+        )
         .await;
     drop(participant);
 

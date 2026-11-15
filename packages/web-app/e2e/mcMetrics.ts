@@ -719,9 +719,9 @@ export async function loadedAlertClientNames(alert: string): Promise<Set<string>
 const GC_STALENESS_PROMQL = 'max by (instance) (gc_mh_staleness_threshold_seconds)';
 const GC_SELECTABLE_PROMQL = `sum by (instance) (${GC_SETTLE_HEALTHY_SERIES}{state=~"${GC_SETTLE_STATES}"})`;
 const GC_RECOMPUTE_PROMQL = `sum by (instance) (${GC_SETTLE_RECOMPUTE_SERIES}{operation="${GC_SETTLE_RECOMPUTE_OPERATION}",${GC_SETTLE_RECOMPUTE_SUCCESS}})`;
-const MC_MEETINGS_ACTIVE_PROMQL = 'sum by (instance) (mc_meetings_active)';
 const MC_REPLACEMENT_RETRY_BUDGET_PROMQL =
   'max by (instance) (mc_media_handler_replacement_retry_budget_seconds)';
+const MC_DISCONNECT_GRACE_PROMQL = 'max by (instance) (mc_meeting_disconnect_grace_seconds)';
 
 const MH_UP_TIMESTAMP_PROMQL = `max by (instance) (timestamp(up{job="${MH_SCRAPE_JOB}"}))`;
 
@@ -801,26 +801,36 @@ export async function gcRecomputeSuccessByInstance(): Promise<InstanceCounters> 
   return promInstantByInstance(GC_RECOMPUTE_PROMQL);
 }
 
-/** MC's active meetings, summed over the fleet (twin of Rust `mc_meetings_active_total`). */
-export async function mcMeetingsActiveTotal(): Promise<number> {
-  return [...(await promInstantByInstance(MC_MEETINGS_ACTIVE_PROMQL)).values()].reduce(
-    (a, b) => a + b,
-    0,
-  );
+/**
+ * An MC config-echo gauge (`promql`, seconds, one series per instance) as the
+ * MAX over every serving MC instance (a ceiling must cover the slowest), each
+ * presence-checked, in ms. The twin of Rust `metrics::mc_config_gauge_max`.
+ */
+async function mcConfigGaugeMaxMs(promql: string, what: string): Promise<number> {
+  const serving = await servingInstances(MC_SCRAPE_JOB);
+  const values = await valuesForEvery(promql, serving);
+  const max = Math.max(...values.values());
+  if (!(max > 0)) {
+    throw new Error(`PRECONDITION: MC publishes a non-positive ${what} (${max})`);
+  }
+  return Math.round(max * 1000);
 }
 
 /**
  * MC's published replacement retry budget (`mc_media_handler_replacement_retry_budget_seconds`,
  * story 4 MC-C: MC's OWN derivation — ladder to its cap + one cap + the initial
- * registration bound — read, never re-derived), in ms: the MAX over every
- * serving MC instance (a ceiling must cover the slowest), each presence-checked.
+ * registration bound — read, never re-derived), in ms.
  */
 export async function mcReplacementRetryBudgetMs(): Promise<number> {
-  const serving = await servingInstances(MC_SCRAPE_JOB);
-  const values = await valuesForEvery(MC_REPLACEMENT_RETRY_BUDGET_PROMQL, serving);
-  const max = Math.max(...values.values());
-  if (!(max > 0)) {
-    throw new Error(`PRECONDITION: MC publishes a non-positive replacement retry budget (${max})`);
-  }
-  return Math.round(max * 1000);
+  return mcConfigGaugeMaxMs(MC_REPLACEMENT_RETRY_BUDGET_PROMQL, 'replacement retry budget');
+}
+
+/**
+ * MC's published disconnect grace (`mc_meeting_disconnect_grace_seconds`, the
+ * config echo of the `MeetingTimers` every meeting actor enforces), in ms. The
+ * twin of Rust `metrics::mc_disconnect_grace`; the meeting-end proof's ceiling
+ * derives from it (`mcLoki.ts`).
+ */
+export async function mcDisconnectGraceMs(): Promise<number> {
+  return mcConfigGaugeMaxMs(MC_DISCONNECT_GRACE_PROMQL, 'disconnect grace');
 }

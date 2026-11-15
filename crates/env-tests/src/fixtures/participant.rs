@@ -224,11 +224,30 @@ pub struct Participant {
     /// removes a cleanly-closed participant at once, an abruptly lost one
     /// only after its disconnect grace). Ids only; never logged.
     pub left: BTreeSet<String>,
+    /// Host wall clock (Loki ns) just before this participant joined MC: the
+    /// start of the meeting-end proof's scan ([`crate::fixtures::meeting_end`]).
+    pub joined_ns: u128,
 }
 
 impl Participant {
     pub fn sender_id(&self) -> u32 {
         self.join.sender_id.expect("MC allocates a sender id")
+    }
+
+    /// Leave the meeting gracefully ([`mc_session::leave`]) and return what
+    /// the meeting-end proof needs ([`crate::fixtures::meeting_end`]).
+    #[must_use]
+    pub fn leave(self) -> crate::fixtures::meeting_end::Departure {
+        mc_session::leave(self.session.connection());
+        crate::fixtures::meeting_end::Departure {
+            meeting_id: self.gc.meeting_id,
+            participant_id: self.join.participant_id.clone(),
+            label: self.label,
+            had_handlers: self.sets.current().is_some_and(|v| !v.urls().is_empty()),
+            joined_ns: self.joined_ns,
+        }
+        // `self` (and with it the connection handle) drops here; the close
+        // is already queued.
     }
 
     /// The `JoinResponse.media_handler_set` (ADR-0039 §4). MC always sends
@@ -560,6 +579,7 @@ pub async fn mc_join_with(
     display_name: &str,
     declaration: &JoinDeclaration,
 ) -> Participant {
+    let joined_ns = crate::fixtures::loki::now_ns();
     let mut session = McSession::connect(&mc_url(gc)).await;
     let join = mc_session::mc_join_with(
         &mut session,
@@ -584,6 +604,7 @@ pub async fn mc_join_with(
         gc: gc.clone(),
         sets,
         left: BTreeSet::new(),
+        joined_ns,
     }
 }
 

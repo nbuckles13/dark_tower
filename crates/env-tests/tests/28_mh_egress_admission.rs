@@ -611,8 +611,6 @@ async fn test_mh_refuses_admission_past_the_deployed_stream_ceiling() {
 
     // ---- CLEANUP: clean closes; the last one ends the meeting and MC releases it on every handler ----
     for p in ps.into_iter().rev() {
-        p.session
-            .connection()
-            .close(wtransport::VarInt::from_u32(0), b"leave");
+        env_tests::fixtures::mc_session::leave(p.session.connection());
     }
 }

@@ -13,6 +13,7 @@ pub mod kube;
 pub mod loki;
 pub mod mc_session;
 pub mod media;
+pub mod meeting_end;
 pub mod metric_hygiene;
 pub mod metrics;
 pub mod mh_address;

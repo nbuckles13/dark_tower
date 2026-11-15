@@ -42,17 +42,34 @@ function readUrl(name: string, fallback: string): Resolved {
   if (raw === undefined || raw === '') {
     return { value: fallback, source: 'default' };
   }
+  return { value: validatedUrl(name, raw), source: 'env' };
+}
+
+/** `raw` trimmed of trailing slashes, if it is an http(s) URL without credentials. */
+function validatedUrl(name: string, raw: string): string {
   const trimmed = raw.replace(/\/+$/, '');
   let parsed: URL;
   try {
     parsed = new URL(trimmed);
   } catch {
-    throw new Error(`${name}="${raw}" is not a valid URL (expected e.g. "${fallback}")`);
+    throw new Error(`${name}="${raw}" is not a valid URL (expected an http(s) URL)`);
   }
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
     throw new Error(`${name}="${raw}" must be http(s), got "${parsed.protocol}"`);
   }
-  return { value: trimmed, source: 'env' };
+  // Never echo `raw` here: it would print the credentials. Twin of Rust
+  // `cluster.rs:parse_host_port`, which refuses any URL carrying '@'.
+  if (parsed.username !== '' || parsed.password !== '') {
+    throw new Error(`${name} must not contain credentials (userinfo in authority)`);
+  }
+  return trimmed;
+}
+
+/** An optional URL with NO default: `undefined` when unset or empty. */
+function readOptionalUrl(name: string): Resolved | undefined {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return undefined;
+  return { value: validatedUrl(name, raw), source: 'env' };
 }
 
 // ANCHOR (DRY): mirrors `SUBDOMAIN_REGEX` in
@@ -151,6 +168,10 @@ if (devServerHost !== DEV_SERVER_HOST) {
 const acUrl = readUrl('E2E_AC_URL', 'http://127.0.0.1:8443');
 const gcUrl = readUrl('E2E_GC_URL', 'http://127.0.0.1:8444');
 const prometheusUrl = readUrl('E2E_PROMETHEUS_URL', 'http://127.0.0.1:9090');
+// No default: the only consumer (`mcLoki.ts`, the MH-replacement legs' per-meeting
+// end proof) FAILS LOUDLY when it is unset rather than querying a guessed port —
+// Layer 7 exports it from ENV_TEST_LOKI_URL (scripts/layer7.sh).
+const lokiUrl = readOptionalUrl('E2E_LOKI_URL');
 
 /** Resolved browser-E2E environment (see module header for the default sources). */
 export const e2eEnv = {
@@ -190,6 +211,8 @@ export const e2eEnv = {
   gcUrl: gcUrl.value,
   /** Prometheus (assertion (d): `mc_participant_mh_status_total` — see mcMetrics.ts). */
   prometheusUrl: prometheusUrl.value,
+  /** Loki, or `undefined` when unset (`mcLoki.ts` fails loudly on use). */
+  lokiUrl: lokiUrl?.value,
   /**
    * Org subdomain used by sign-up/sign-in — a PER-RUN organization provisioned
    * by layer 7 (R-7), NOT the shared `demo` org: this suite creates ~7 meetings
@@ -261,5 +284,8 @@ export function describeEnv(): string[] {
     ['E2E_GC_URL', gcUrl],
     ['E2E_PROMETHEUS_URL', prometheusUrl],
   ];
-  return entries.map(([name, r]) => `${name}=${r.value} (${r.source})`);
+  return [
+    ...entries.map(([name, r]) => `${name}=${r.value} (${r.source})`),
+    `E2E_LOKI_URL=${lokiUrl === undefined ? '(unset)' : `${lokiUrl.value} (env)`}`,
+  ];
 }

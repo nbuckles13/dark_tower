@@ -10,6 +10,7 @@
 use env_tests::cluster::ClusterConnection;
 use env_tests::eventual::{assert_eventually, ConsistencyCategory};
 use env_tests::fixtures::collector::{assert_collector_log_has_no_secrets, collector_log};
+use env_tests::fixtures::loki::require_loki;
 use env_tests::fixtures::metrics::{
     format_instance_map, instances_exceeding_baseline, poll_until_any_instance_above,
 };
@@ -118,16 +119,8 @@ async fn test_all_services_scraped_by_prometheus() {
 async fn test_all_services_have_logs_in_loki() {
     let cluster = cluster().await;
 
-    // Loki must be available for this test.
-    assert!(
-        cluster.is_loki_available().await,
-        "Loki must be available for log aggregation tests - ensure observability stack is running"
-    );
-
-    let loki_url = cluster
-        .loki_base_url
-        .as_ref()
-        .expect("Loki URL should be set");
+    // Loki must be available for this test (a failure, never a skip).
+    let loki_url = require_loki(&cluster).await;
 
     // Verify every expected service has logs in Loki.
     // Uses a 29-day window to catch any logs from the cluster's lifetime while

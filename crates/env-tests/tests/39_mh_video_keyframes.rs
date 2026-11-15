@@ -292,6 +292,8 @@ async fn test_on_demand_keyframes_and_recovery() {
         .await
         .expect("PRECONDITION: cluster connection (ENV_TEST_* URLs)");
     let prom = PrometheusClient::new(&cluster.prometheus_base_url);
+    // Ends through the Loki-proved end path: fail at once without Loki.
+    env_tests::fixtures::loki::require_loki(&cluster).await;
     let window = participant::settle_window(&cluster).await;
     let auth = AuthClient::new(&cluster.ac_base_url);
     let gc = GcClient::new(&cluster.gc_base_url);
@@ -936,10 +938,17 @@ async fn test_on_demand_keyframes_and_recovery() {
     }
 
     eprintln!("[39] phase CLEANUP: start");
-    // CLEANUP before any session closes, with the release PROVED.
-    for injection in injections {
-        injection.release_and_prove(&cleanup).await;
-    }
+    // CLEANUP: release PROVED before any session closes, then every
+    // participant leaves and THIS meeting is proved ended on MC.
+    injection::release_and_end_meeting(
+        "KEYFRAMES CLEANUP",
+        injections,
+        &cleanup,
+        &cluster,
+        &prom,
+        ps,
+    )
+    .await;
     drop(b_held);
     drop(c_subs);
     drop(parked);

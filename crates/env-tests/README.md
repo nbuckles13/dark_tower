@@ -70,6 +70,8 @@ crates/env-tests/
 │   │   ├── mh_pool.rs      # THE MH pool fixture (T-1): MhPool/MhSlot/FreezeGuard over `mh.sh` (up, drain, signal KILL/STOP/CONT, baseline, owner teardown)
 │   │   ├── mh_address.rs   # R-28 address invariant: pure verdict + `assert_addresses_unique()` live gather
 │   │   ├── owned_placement.rs # Bounded, derived search placing a meeting on a run-owned MH (`owned-mh-not-placed`)
+│   │   ├── loki.rs         # THE Loki client + meeting-scoped log evidence (`MeetingScope`, one home per matched MC/GC log line)
+│   │   ├── meeting_end.rs  # End your OWN meeting, proved per meeting id (graceful leave, clean-close/end/release lines)
 │   │   └── metrics.rs      # Prometheus queries
 │   ├── canary.rs           # NetworkPolicy test pods (image = mh.sh MH_DEBUG_IMAGE)
 │   └── resilience_hygiene.rs # Layer-4 checks: every test in a pool-mutating binary is #[serial]; no MH pod-delete/force path
@@ -106,6 +108,8 @@ which `up`s an MH) carries a bare `#[serial]`; `resilience_hygiene` checks this
 at Layer 4, deriving the pool-mutating API from mh_pool.rs.
 Concurrent runs on one cluster fail with `foreign-mh-activity`. A leaked run's
 MHs are reclaimed with `DT_CLUSTER_NAME=<c> $DT_MH_SH drain --all --owner <run>`.
+No leg reads a fleet-wide MC counter; see the meeting-end rule under the
+evidence rule below.
 
 ## Pre-Seeded Test Credentials
 
@@ -141,6 +145,19 @@ Suites run in parallel against shared pods, so:
 - **Do not depend on shared capacity you do not need**: register a zero-edge policy when edges are irrelevant to what the test proves.
 
 `tests/29_mh_meeting_teardown.rs` is the worked example.
+
+### Meeting-end rule: prove your own meeting ended
+
+A suite that releases MH state behind MC's back (the injection suites 26 S4/churn, 37, 38, 39 — `injection::release_and_end_meeting`), or a meeting `40_resilience`'s legs depend on (each leg and its placement misses), MUST end its meeting through `fixtures/meeting_end.rs` before it returns: every participant leaves gracefully (`mc_session::leave` / `Participant::leave`, never a bare `drop`, which at runtime teardown never sends the close), then THAT meeting is proved ended from MC's per-meeting Loki lines. Never wait on a fleet counter such as `mc_meetings_active`. Other meeting-creating suites are outside the rule: they never release a meeting on MH behind MC, so MC's handlers keep heartbeating it and MC ends it after its disconnect grace (the operator's "ends when the last participant leaves" rule working, not a leak). The proof's tokens, in the order they fire:
+
+| Token | Meaning |
+|-------|---------|
+| `PRECONDITION-loki-unavailable` | Loki is down; checked at the START of the fn/leg (`loki::require_loki`). A failure, never a skip. |
+| `loki-query-failed` | A Loki query failed (transport, non-2xx, bad shape); never read as "no line yet". |
+| `clean-close-never-seen` | No "Clean transport close" line for a departed participant (named by label): a session was dropped, not left, or Loki is not ingesting mc-service. |
+| `meeting-not-ended` | Every passed participant closed cleanly, yet MC logged no single `empty`/`last_participant_left` end for the meeting (or one BEFORE the last clean close): an MC product defect (see 195b7059), escalate — unless a participant of the meeting was not passed to the end path and is still connected. |
+| `meeting-not-released` | The end was not followed by one complete "Meeting released on its media handlers" (`failed 0`, no quiesce timeout, `released == handlers`, `handlers >= 1` when a set was seen). |
+| `meeting-ended-by-grace` | ANY participant of the meeting (passed ones by label, others by count) was removed by grace expiry instead of a clean close: a session was dropped, not left. |
 
 ### Media fixtures (ADR-0036; story 3)
 

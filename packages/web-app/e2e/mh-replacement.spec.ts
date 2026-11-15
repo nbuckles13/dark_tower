@@ -3,9 +3,8 @@
 // Story 4 C3 — SURVIVE HANDLER LOSS in real browsers (R-1, R-2, R-3, R-20,
 // R-39; ADR-0039 §4 and §9; test-gates.md §Browser, §Round 3 "Browser stranded
 // A/B leg", §Crash assertions). Three legs, each inside `mhLeg.ts:legTest`'s `leg` fixture
-// (baseline + no-foreign-meeting BEFORE; explicit, asserted leave / meetings
-// drained / owner teardown / removed-MH settle / baseline AFTER, on every exit
-// path):
+// (baseline BEFORE; explicit, asserted leave / per-meeting end proof / owner
+// teardown / removed-MH settle / baseline AFTER, on every exit path):
 //
 //   CRASH     `kill -KILL` the run-owned MH carrying the meeting (mh.sh signal,
 //             a debug container; NEVER a forced, zero-grace pod delete,
@@ -34,10 +33,16 @@
 // interrupt nothing. A member blocked from the survivor (B in CRASH and PLANNED,
 // A and B in STRANDED) can reach ONLY the owned MH — proven from its own bus
 // before the event — so every stream to or from it is on that MH by
-// construction. The positive control is keyed on exactly those slots: the slot
-// carrying B's stream at A and at C, and B's own slots. Other slots' overlays
-// are recorded, never required (which handler MC colocates the rest on is MC's
-// preference, not a contract).
+// construction. The CRASH positive control is B's own overlay (B has no other
+// connected handler, so it must show one whichever side detects the loss
+// first). The slot carrying B's stream at A and at C is RECORDED, not required:
+// MH's QUIC idle timeout (MH_MAX_IDLE_TIMEOUT_MS) and MC's Dead declaration
+// (MC_MH_HEARTBEAT_TIMEOUT_MS) are EQUAL timers with arbitrary phase, so when
+// MC removes the dead handler first, A's and C's slots take slotContinuity's
+// planned-shape hold (`handlerRemoved`) onto a handler they are already
+// connected to and correctly show NO overlay — a coin flip, not a contract.
+// Other slots' overlays are recorded, never required (which handler MC
+// colocates the rest on is MC's preference, not a contract).
 //
 // URLS AND REFS. Handler URLs come from each page's bus `handlerSets` (MC's
 // set; `JoinResponse.media_servers` is gone) and are matched EXACTLY against the
@@ -222,7 +227,7 @@ async function expectPairsResume(
 }
 
 test.describe('story 4 C3: survive handler loss (MH replacement)', () => {
-  test('CRASH: kill -KILL the carrying MH; tone resumes, new handler_ref, overlay observed', async ({
+  test("CRASH: kill -KILL the carrying MH; tone resumes, new handler_ref, B's overlay observed", async ({
     leg,
   }) => {
     const owned = await leg.upScraped();
@@ -257,9 +262,25 @@ test.describe('story 4 C3: survive handler loss (MH replacement)', () => {
     const survivorBy = killedAt + leg.ceilings.survivorMs;
     const replacementBy = killedAt + leg.ceilings.replacementMs;
 
-    // POSITIVE CONTROL: the overlay, on the slots that were on the killed MH by construction.
-    await awaitOverlaySet(a, pre.get(a)!, slotOfBAtA, survivorBy, 'CRASH A[slot of B]');
-    await awaitOverlaySet(c, pre.get(c)!, slotOfBAtC, survivorBy, 'CRASH C[slot of B]');
+    // POSITIVE CONTROL: B's overlay, deterministic under BOTH detection orders
+    // (sdk-core/src/session/slotContinuity.ts): if the browser's QUIC idle timeout
+    // fires first, `handlerLost` sets the overlay at once; if MC's Dead declaration
+    // fires first, `handlerRemoved` HOLDS only when `wasConnected && otherConnected`,
+    // and B has NO other connected handler (blocked from the survivors), so it sets
+    // the overlay at once too (unit-pinned: slotContinuity.test.ts "(3a) NO other
+    // member connected").
+    //
+    // A[slot of B] and C[slot of B] are NOT gated. The two detectors race on EQUAL
+    // timers with arbitrary phase: the MH QUIC idle timeout MH_MAX_IDLE_TIMEOUT_MS
+    // (infra/services/mh-service/config.env; MH's 2 s keepalives reset the client's
+    // idle timer, so it fires 6 s after the last one) and MC's MC_MH_HEARTBEAT_TIMEOUT_MS
+    // (infra/services/mc-service/config.env), both 6000. When MC wins, A and C (also
+    // connected to a survivor) take the planned-shape hold onto an already-connected
+    // handler and correctly show NO overlay. Do not restore this gate without
+    // changing that equality. Both shapes are unit-pinned in slotContinuity.test.ts
+    // ("crash (no code → handlerLost) sets it at once"; the planned-hold cases), and
+    // A's and C's resumption of B stays GATED below; the shape each took is recorded
+    // (FINAL).
     await awaitOverlaySet(b, pre.get(b)!, 'any', survivorBy, 'CRASH B[any]');
 
     // REPLACEMENT: every participant's final set holds a ref outside its pre-kill history.
@@ -300,6 +321,22 @@ test.describe('story 4 C3: survive handler loss (MH replacement)', () => {
       test.info().annotations.push({
         type: 'observed-overlay-transitions',
         description: `CRASH ${m.label}=${JSON.stringify(after)}`,
+      });
+    }
+    // The slot carrying B's stream at A and at C: whether it showed the overlay is
+    // RECORDED, never gated (the equal-timer race in the positive-control comment).
+    for (const [m, slot] of [
+      [a, slotOfBAtA],
+      [c, slotOfBAtC],
+    ] as const) {
+      const after = (await busContinuity(m)).overlays.slice(pre.get(m)!.overlayCount);
+      // The bus projects no per-slot handler ref, so the planned-hold shape is told
+      // apart only by the ABSENCE of the overlay; resumption (gated above) is what
+      // fails if the slot took neither shape.
+      const overlay = after.some((o) => o.reconnecting && o.slotId === slot);
+      test.info().annotations.push({
+        type: 'observed-overlay-on-slot-of-B',
+        description: `CRASH ${m.label}[slot ${slot}]=${overlay ? 'loss-shape (overlay)' : 'planned-shape hold (no overlay)'}`,
       });
     }
   });
