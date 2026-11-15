@@ -370,16 +370,18 @@ mod tests {
             hash_secret: common::secret::SecretBox::new(Box::new(master_key.clone())),
             otel_enabled: false,
             otel_endpoint: String::new(),
-            otel_sample_rate: crate::config::DEFAULT_OTEL_SAMPLE_RATE,
-            environment: crate::config::DEFAULT_DEPLOYMENT_ENVIRONMENT.to_string(),
-            jwt_clock_skew_seconds: crate::config::DEFAULT_JWT_CLOCK_SKEW.as_secs() as i64,
-            bcrypt_cost: crate::config::DEFAULT_BCRYPT_COST,
-            rate_limit_window_minutes: crate::config::DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-            rate_limit_max_attempts: crate::config::DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+            otel_sample_rate: 1.0,
+            environment: "development".to_string(),
+            jwt_clock_skew_seconds: crate::config::RECOMMENDED_JWT_CLOCK_SKEW.as_secs() as i64,
+            bcrypt_cost: crate::config::RECOMMENDED_MIN_BCRYPT_COST,
+            rate_limit_window_minutes: crate::config::RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+            rate_limit_max_attempts: crate::config::RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
             registration_rate_limit_window_minutes:
-                crate::config::DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
+                crate::config::RECOMMENDED_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
             registration_rate_limit_max_attempts:
-                crate::config::DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
+                crate::config::RECOMMENDED_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
+            cluster_name: "test-cluster".to_string(),
+            drain_seconds: 0,
         };
         let state = Arc::new(auth_handler::AppState {
             pool: pool.clone(),
@@ -423,16 +425,18 @@ mod tests {
             hash_secret: common::secret::SecretBox::new(Box::new(vec![0u8; 32])), // Dummy hash secret for tests
             otel_enabled: false,
             otel_endpoint: String::new(),
-            otel_sample_rate: crate::config::DEFAULT_OTEL_SAMPLE_RATE,
-            environment: crate::config::DEFAULT_DEPLOYMENT_ENVIRONMENT.to_string(),
-            jwt_clock_skew_seconds: crate::config::DEFAULT_JWT_CLOCK_SKEW.as_secs() as i64,
-            bcrypt_cost: crate::config::DEFAULT_BCRYPT_COST,
-            rate_limit_window_minutes: crate::config::DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-            rate_limit_max_attempts: crate::config::DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+            otel_sample_rate: 1.0,
+            environment: "development".to_string(),
+            jwt_clock_skew_seconds: crate::config::RECOMMENDED_JWT_CLOCK_SKEW.as_secs() as i64,
+            bcrypt_cost: crate::config::RECOMMENDED_MIN_BCRYPT_COST,
+            rate_limit_window_minutes: crate::config::RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+            rate_limit_max_attempts: crate::config::RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
             registration_rate_limit_window_minutes:
-                crate::config::DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
+                crate::config::RECOMMENDED_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
             registration_rate_limit_max_attempts:
-                crate::config::DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
+                crate::config::RECOMMENDED_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
+            cluster_name: "test-cluster".to_string(),
+            drain_seconds: 0,
         };
         let state = Arc::new(auth_handler::AppState {
             pool: pool.clone(),

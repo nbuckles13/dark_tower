@@ -1,5 +1,5 @@
 #[cfg(test)]
-use crate::config::DEFAULT_BCRYPT_COST;
+use crate::config::RECOMMENDED_MIN_BCRYPT_COST;
 use crate::config::{MAX_BCRYPT_COST, MIN_BCRYPT_COST};
 use crate::errors::AcError;
 use crate::observability::metrics::{record_bcrypt_duration, record_token_validation};
@@ -504,7 +504,7 @@ pub fn verify_user_jwt(
 #[allow(clippy::panic, clippy::assertions_on_constants)]
 mod tests {
     use super::*;
-    use crate::config::DEFAULT_JWT_CLOCK_SKEW;
+    use crate::config::RECOMMENDED_JWT_CLOCK_SKEW;
 
     #[test]
     fn test_key_generation() {
@@ -541,7 +541,7 @@ mod tests {
         };
 
         let token = sign_jwt(&claims, &private_pkcs8, "test-key-01").unwrap();
-        let verified_claims = verify_jwt(&token, &public_pem, DEFAULT_JWT_CLOCK_SKEW).unwrap();
+        let verified_claims = verify_jwt(&token, &public_pem, RECOMMENDED_JWT_CLOCK_SKEW).unwrap();
 
         assert_eq!(verified_claims.sub, claims.sub);
         assert_eq!(verified_claims.scope, claims.scope);
@@ -550,7 +550,7 @@ mod tests {
     #[test]
     fn test_password_hashing() {
         let secret = "my-secure-secret";
-        let hash = hash_client_secret(secret, DEFAULT_BCRYPT_COST).unwrap();
+        let hash = hash_client_secret(secret, RECOMMENDED_MIN_BCRYPT_COST).unwrap();
 
         assert!(verify_client_secret(secret, &hash).unwrap());
         assert!(!verify_client_secret("wrong-secret", &hash).unwrap());
@@ -650,7 +650,7 @@ mod tests {
         };
 
         let token = sign_jwt(&claims, &private_pkcs8, "test-key-01").unwrap();
-        let result = verify_jwt(&token, &public_pem, DEFAULT_JWT_CLOCK_SKEW);
+        let result = verify_jwt(&token, &public_pem, RECOMMENDED_JWT_CLOCK_SKEW);
         let err = result.expect_err("Expected InvalidToken error for expired token");
         assert!(matches!(err, AcError::InvalidToken(_)));
     }
@@ -669,7 +669,7 @@ mod tests {
         };
 
         let token = sign_jwt(&claims, &private_pkcs8, "test-key-01").unwrap();
-        let result = verify_jwt(&token, &wrong_public_pem, DEFAULT_JWT_CLOCK_SKEW);
+        let result = verify_jwt(&token, &wrong_public_pem, RECOMMENDED_JWT_CLOCK_SKEW);
         let err = result.expect_err("Expected InvalidToken error for wrong public key");
         assert!(matches!(err, AcError::InvalidToken(_)));
     }
@@ -677,7 +677,7 @@ mod tests {
     #[test]
     fn test_password_hashing_empty_string() {
         // Empty password should still hash successfully
-        let result = hash_client_secret("", DEFAULT_BCRYPT_COST);
+        let result = hash_client_secret("", RECOMMENDED_MIN_BCRYPT_COST);
         assert!(result.is_ok());
 
         let hash = result.unwrap();
@@ -709,7 +709,8 @@ mod tests {
     #[test]
     fn test_bcrypt_cost_factor_is_12() {
         let secret = "test-password-for-cost-verification";
-        let hash = hash_client_secret(secret, DEFAULT_BCRYPT_COST).expect("Hashing should succeed");
+        let hash = hash_client_secret(secret, RECOMMENDED_MIN_BCRYPT_COST)
+            .expect("Hashing should succeed");
 
         // Bcrypt hash format: $2b$<cost>$<salt+hash>
         // Example: $2b$12$R9h/cIPz0gi.URNNX3kh2OPST9/PgBkqquzi.Ss7KIUgO2t0jWMUW
@@ -758,7 +759,7 @@ mod tests {
         let (public_pem, _) = generate_signing_key().unwrap();
 
         // Attempt to verify the oversized token
-        let result = verify_jwt(&oversized_token, &public_pem, DEFAULT_JWT_CLOCK_SKEW);
+        let result = verify_jwt(&oversized_token, &public_pem, RECOMMENDED_JWT_CLOCK_SKEW);
 
         // Should be rejected due to size limit
         assert!(
@@ -792,7 +793,7 @@ mod tests {
         );
 
         // Should verify successfully
-        let verified_claims = verify_jwt(&token, &public_pem, DEFAULT_JWT_CLOCK_SKEW).unwrap();
+        let verified_claims = verify_jwt(&token, &public_pem, RECOMMENDED_JWT_CLOCK_SKEW).unwrap();
 
         assert_eq!(verified_claims.sub, claims.sub);
         assert_eq!(verified_claims.scope, claims.scope);
@@ -822,7 +823,7 @@ mod tests {
         //
         // Our cost=12 provides good security without excessive latency.
 
-        let hash = hash_client_secret("test", DEFAULT_BCRYPT_COST).unwrap();
+        let hash = hash_client_secret("test", RECOMMENDED_MIN_BCRYPT_COST).unwrap();
         let cost = hash.split('$').nth(2).unwrap();
 
         assert_eq!(cost, "12", "Cost factor must be 12 per security policy");
@@ -853,7 +854,7 @@ mod tests {
         };
 
         let token = sign_jwt(&claims, &private_pkcs8, "test-key-01").unwrap();
-        let result = verify_jwt(&token, &public_pem, DEFAULT_JWT_CLOCK_SKEW);
+        let result = verify_jwt(&token, &public_pem, RECOMMENDED_JWT_CLOCK_SKEW);
 
         // Should be rejected - iat too far in the future
         assert!(
@@ -883,7 +884,7 @@ mod tests {
         };
 
         let token = sign_jwt(&claims, &private_pkcs8, "test-key-01").unwrap();
-        let result = verify_jwt(&token, &public_pem, DEFAULT_JWT_CLOCK_SKEW);
+        let result = verify_jwt(&token, &public_pem, RECOMMENDED_JWT_CLOCK_SKEW);
 
         // Should be accepted - iat within clock skew tolerance
         assert!(
@@ -898,13 +899,13 @@ mod tests {
 
     /// P1-SECURITY: Test JWT clock skew constant value
     ///
-    /// Documents that DEFAULT_JWT_CLOCK_SKEW is 300 seconds (5 minutes)
+    /// Documents that RECOMMENDED_JWT_CLOCK_SKEW is 300 seconds (5 minutes)
     /// per NIST SP 800-63B recommendations for time-based security controls.
     #[test]
     fn test_clock_skew_constant_value() {
         // This test documents the constant value for security review
         assert_eq!(
-            DEFAULT_JWT_CLOCK_SKEW,
+            RECOMMENDED_JWT_CLOCK_SKEW,
             std::time::Duration::from_secs(300),
             "Clock skew tolerance must be 300 seconds (5 minutes) per NIST SP 800-63B"
         );
@@ -1002,7 +1003,7 @@ mod tests {
         // Use invalid PEM format (not proper base64)
         let invalid_pem = "-----BEGIN PUBLIC KEY-----\ninvalid!@#$%\n-----END PUBLIC KEY-----";
 
-        let result = verify_jwt(&token, invalid_pem, DEFAULT_JWT_CLOCK_SKEW);
+        let result = verify_jwt(&token, invalid_pem, RECOMMENDED_JWT_CLOCK_SKEW);
         let err = result.expect_err("Invalid PEM format should be rejected during base64 decode");
         assert!(matches!(err, AcError::InvalidToken(_)));
     }
@@ -1031,7 +1032,7 @@ mod tests {
             general_purpose::STANDARD.encode(&invalid_key_bytes)
         );
 
-        let result = verify_jwt(&token, &invalid_pem, DEFAULT_JWT_CLOCK_SKEW);
+        let result = verify_jwt(&token, &invalid_pem, RECOMMENDED_JWT_CLOCK_SKEW);
         let err = result.expect_err("Invalid key bytes should be rejected during verification");
         assert!(matches!(err, AcError::InvalidToken(_)));
     }
@@ -1062,7 +1063,7 @@ mod tests {
         let tampered_payload = parts[1].to_string() + "X"; // Append character
         token = format!("{}.{}.{}", parts[0], tampered_payload, parts[2]);
 
-        let result = verify_jwt(&token, &public_pem, DEFAULT_JWT_CLOCK_SKEW);
+        let result = verify_jwt(&token, &public_pem, RECOMMENDED_JWT_CLOCK_SKEW);
         let err = result.expect_err("Tampered token should be rejected");
         assert!(matches!(err, AcError::InvalidToken(_)));
     }
@@ -1077,7 +1078,7 @@ mod tests {
         // Not a JWT at all
         let malformed_token = "not.a.valid.jwt.format.with.too.many.parts";
 
-        let result = verify_jwt(malformed_token, &public_pem, DEFAULT_JWT_CLOCK_SKEW);
+        let result = verify_jwt(malformed_token, &public_pem, RECOMMENDED_JWT_CLOCK_SKEW);
         let err = result.expect_err("Malformed token should be rejected");
         assert!(matches!(err, AcError::InvalidToken(_)));
     }
@@ -1091,17 +1092,17 @@ mod tests {
 
         let now = chrono::Utc::now().timestamp();
 
-        // Create token with iat exactly at the boundary (now + DEFAULT_JWT_CLOCK_SKEW)
+        // Create token with iat exactly at the boundary (now + RECOMMENDED_JWT_CLOCK_SKEW)
         let claims = Claims {
             sub: "test-user".to_string(),
-            exp: now + 7200,                                    // Expires in 2 hours
-            iat: now + DEFAULT_JWT_CLOCK_SKEW.as_secs() as i64, // Exactly at boundary
+            exp: now + 7200, // Expires in 2 hours
+            iat: now + RECOMMENDED_JWT_CLOCK_SKEW.as_secs() as i64, // Exactly at boundary
             scope: "read write".to_string(),
             service_type: None,
         };
 
         let token = sign_jwt(&claims, &private_pkcs8, "test-key-01").unwrap();
-        let result = verify_jwt(&token, &public_pem, DEFAULT_JWT_CLOCK_SKEW);
+        let result = verify_jwt(&token, &public_pem, RECOMMENDED_JWT_CLOCK_SKEW);
 
         // Should be accepted (boundary is inclusive: iat <= max_iat)
         assert!(
@@ -1123,13 +1124,13 @@ mod tests {
         let claims = Claims {
             sub: "test-user".to_string(),
             exp: now + 7200,
-            iat: now + DEFAULT_JWT_CLOCK_SKEW.as_secs() as i64 + 1, // 1 second past boundary
+            iat: now + RECOMMENDED_JWT_CLOCK_SKEW.as_secs() as i64 + 1, // 1 second past boundary
             scope: "read write".to_string(),
             service_type: None,
         };
 
         let token = sign_jwt(&claims, &private_pkcs8, "test-key-01").unwrap();
-        let result = verify_jwt(&token, &public_pem, DEFAULT_JWT_CLOCK_SKEW);
+        let result = verify_jwt(&token, &public_pem, RECOMMENDED_JWT_CLOCK_SKEW);
 
         // Should be rejected
         assert!(
@@ -1161,7 +1162,7 @@ mod tests {
         };
 
         let token = sign_jwt(&claims, &private_pkcs8, "test-key-01").unwrap();
-        let result = verify_jwt(&token, &public_pem, DEFAULT_JWT_CLOCK_SKEW);
+        let result = verify_jwt(&token, &public_pem, RECOMMENDED_JWT_CLOCK_SKEW);
 
         // Should be accepted (iat in the past is fine as long as not expired)
         assert!(
@@ -1376,7 +1377,7 @@ mod tests {
     fn test_verify_jwt_empty_token() {
         let (public_pem, _) = generate_signing_key().unwrap();
 
-        let result = verify_jwt("", &public_pem, DEFAULT_JWT_CLOCK_SKEW);
+        let result = verify_jwt("", &public_pem, RECOMMENDED_JWT_CLOCK_SKEW);
 
         let err = result.expect_err("Empty token should be rejected");
         assert!(matches!(err, AcError::InvalidToken(_)));
@@ -1695,26 +1696,26 @@ mod tests {
         );
     }
 
-    /// Test DEFAULT_BCRYPT_COST constant is used correctly
+    /// Test RECOMMENDED_MIN_BCRYPT_COST constant is used correctly
     #[test]
     fn test_default_bcrypt_cost_constant() {
-        use crate::config::{DEFAULT_BCRYPT_COST, MAX_BCRYPT_COST, MIN_BCRYPT_COST};
+        use crate::config::{MAX_BCRYPT_COST, MIN_BCRYPT_COST, RECOMMENDED_MIN_BCRYPT_COST};
 
         // Verify the constant value
-        assert_eq!(DEFAULT_BCRYPT_COST, 12, "Default cost should be 12");
+        assert_eq!(RECOMMENDED_MIN_BCRYPT_COST, 12, "Default cost should be 12");
 
         // Verify it's within the allowed range
         assert!(
-            DEFAULT_BCRYPT_COST >= MIN_BCRYPT_COST,
+            RECOMMENDED_MIN_BCRYPT_COST >= MIN_BCRYPT_COST,
             "Default should be >= minimum"
         );
         assert!(
-            DEFAULT_BCRYPT_COST <= MAX_BCRYPT_COST,
+            RECOMMENDED_MIN_BCRYPT_COST <= MAX_BCRYPT_COST,
             "Default should be <= maximum"
         );
 
-        // Verify a hash with DEFAULT_BCRYPT_COST uses cost 12
-        let hash = hash_client_secret("test", DEFAULT_BCRYPT_COST).unwrap();
+        // Verify a hash with RECOMMENDED_MIN_BCRYPT_COST uses cost 12
+        let hash = hash_client_secret("test", RECOMMENDED_MIN_BCRYPT_COST).unwrap();
         let cost = hash.split('$').nth(2).unwrap();
         assert_eq!(cost, "12");
     }
@@ -1745,7 +1746,7 @@ mod tests {
         assert_eq!(parts.len(), 3, "JWT should have 3 parts");
 
         // Verify the token can be verified with the public key
-        let verified = verify_user_jwt(&token, &public_pem, DEFAULT_JWT_CLOCK_SKEW).unwrap();
+        let verified = verify_user_jwt(&token, &public_pem, RECOMMENDED_JWT_CLOCK_SKEW).unwrap();
         assert_eq!(verified.sub, claims.sub);
         assert_eq!(verified.org_id, claims.org_id);
         assert_eq!(verified.email, claims.email);
@@ -1805,10 +1806,10 @@ mod tests {
         let token = sign_user_jwt(&claims, &private_pkcs8, "test-key").unwrap();
 
         // Should verify with correct key
-        assert!(verify_user_jwt(&token, &public_pem, DEFAULT_JWT_CLOCK_SKEW).is_ok());
+        assert!(verify_user_jwt(&token, &public_pem, RECOMMENDED_JWT_CLOCK_SKEW).is_ok());
 
         // Should fail with wrong key
-        let result = verify_user_jwt(&token, &wrong_public_pem, DEFAULT_JWT_CLOCK_SKEW);
+        let result = verify_user_jwt(&token, &wrong_public_pem, RECOMMENDED_JWT_CLOCK_SKEW);
         assert!(matches!(result, Err(AcError::InvalidToken(_))));
     }
 
@@ -1829,7 +1830,7 @@ mod tests {
 
         let token = sign_user_jwt(&claims, &private_pkcs8, "test-key").unwrap();
 
-        let result = verify_user_jwt(&token, &public_pem, DEFAULT_JWT_CLOCK_SKEW);
+        let result = verify_user_jwt(&token, &public_pem, RECOMMENDED_JWT_CLOCK_SKEW);
         assert!(matches!(result, Err(AcError::InvalidToken(_))));
     }
 
@@ -1851,7 +1852,7 @@ mod tests {
 
         let token = sign_user_jwt(&claims, &private_pkcs8, "test-key").unwrap();
 
-        let result = verify_user_jwt(&token, &public_pem, DEFAULT_JWT_CLOCK_SKEW);
+        let result = verify_user_jwt(&token, &public_pem, RECOMMENDED_JWT_CLOCK_SKEW);
         assert!(matches!(result, Err(AcError::InvalidToken(_))));
     }
 
@@ -1873,7 +1874,7 @@ mod tests {
 
         let token = sign_user_jwt(&claims, &private_pkcs8, "test-key").unwrap();
 
-        let result = verify_user_jwt(&token, &public_pem, DEFAULT_JWT_CLOCK_SKEW);
+        let result = verify_user_jwt(&token, &public_pem, RECOMMENDED_JWT_CLOCK_SKEW);
         assert!(result.is_ok());
     }
 
@@ -1885,7 +1886,7 @@ mod tests {
         // Create an oversized token
         let oversized_token = "a".repeat(MAX_JWT_SIZE_BYTES + 1);
 
-        let result = verify_user_jwt(&oversized_token, &public_pem, DEFAULT_JWT_CLOCK_SKEW);
+        let result = verify_user_jwt(&oversized_token, &public_pem, RECOMMENDED_JWT_CLOCK_SKEW);
         assert!(matches!(result, Err(AcError::InvalidToken(_))));
     }
 
@@ -2010,7 +2011,7 @@ mod tests {
         let malformed_tokens = ["", "a.b", "not-a-jwt", "a.b.c.d.e"];
 
         for token in malformed_tokens {
-            let result = verify_user_jwt(token, &public_pem, DEFAULT_JWT_CLOCK_SKEW);
+            let result = verify_user_jwt(token, &public_pem, RECOMMENDED_JWT_CLOCK_SKEW);
             assert!(
                 matches!(result, Err(AcError::InvalidToken(_))),
                 "Token '{}' should be rejected",

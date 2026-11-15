@@ -44,16 +44,16 @@ All MC service metrics follow ADR-0011 naming conventions with the `mc_` prefix.
 - **Labels**: None (cardinality 1)
 - **Semantics**: a meeting no participant is admitted to within this long of its creation (GC's assignment) ends through the same path as an emptied meeting (`cause="empty"`, `reason="join_window_expired"`; handlers released if any were programmed, KEK dropped, GC notified after release). It is enforced as an EXACT deadline from creation (not a polling tick); an observer checks the end against window ≤ age ≤ window + one `LIFETIME_TICK` (the task's tolerance). MC logs the meeting's age on its MONOTONIC clock with the end: `age_ms` (plus `window_seconds`, `lifetime_tick_ms`) on the actor's "No participant joined within the join window; ending the meeting" line, and `age_ms` on the controller's "Meeting ended" line. Check the end against `age_ms`, never wall-clock log timestamps: on a host whose wall clock steps (WSL2 in Kind) those can disagree with the monotonic deadline by seconds. A parked first join is already on the roster and keeps the meeting. Only a successful admission disarms the window; a refused connect or join never moves it.
 - **Configured values**: set explicitly per environment — production in `infra/services/mc-service/config.env`, Kind in `infra/kubernetes/overlays/kind/services/mc-service/configmap-join-window-patch.yaml` (operator direction 2026-11-13: short enough that an abandoned GC join holds MC capacity and its GC row only briefly, well above a real client's GC-join → MC-admission latency); read the live value from this gauge. Keep the window well above the p99 client GC-join → MC-admission latency: a client that is consistently slower than the window fails every retry, because each SDK retry gets a FRESH meeting with the SAME window. Symptom: `join_window_expired` rising together with `mc_session_join_failures_total{error_type=meeting_not_found|teardown_in_progress}`. Remedy: raise the window.
-- **Fallback (key unset) — DERIVED, and also the maximum**: `common::meeting_token::MEETING_TOKEN_MAX_TTL_SECONDS` + `common::jwt::JWT_EXP_LEEWAY_SECONDS` + `SDK_JOIN_DEADLINE` (`crates/mc-service/src/actors/meeting_timers.rs::MAX_JOIN_WINDOW`; 975 s with today's constants). Why: GC assigns the meeting and then mints the assigning joiner's token. MC accepts that token until `iat + TTL + exp leeway`, and the joiner then has at most the SDK's join deadline to be admitted. Past that, no credential issued at assignment can still produce a participant, so a meeting that is still empty can only be a leak. A larger value would only re-open the leak, so it is also the ceiling.
-- **Floor**: `LIFETIME_TICK` (`crates/mc-service/src/actors/meeting_timers.rs::MIN_JOIN_WINDOW`). The window is not a join-correctness bound: a parked first join is already on the roster (so the park is not exposed), and a join that loses the GC-join → MC-admission race is refused `meeting_not_found` / `teardown_in_progress` (keyless) and the SDK re-joins through GC with a fresh assignment. The window is enforced as an EXACT deadline; `LIFETIME_TICK` is only the observer tolerance the end is checked against ("window + one tick"), so a window below it could not be told apart from a much later end, and 0 / sub-tick is the degenerate configuration. Values outside [floor, ceiling], or unparseable, refuse boot.
-- **Assumes AC's and MC's wall clocks are synced**: `exp` is set on AC's clock and checked on MC's. If AC runs ahead, a token can outlive the window by the skew. The result is a refused join that the SDK's GC re-join recovers. Do NOT "fix" a skew-induced refusal by adding `DEFAULT_CLOCK_SKEW` to the default.
+- **REQUIRED — no fallback (meeting-end safety P2)**: an unset key refuses boot. **Ceiling — DERIVED**: `common::meeting_token::MEETING_TOKEN_MAX_TTL_SECONDS` + `common::jwt::JWT_EXP_LEEWAY_SECONDS` + `SDK_JOIN_DEADLINE` (`crates/mc-service/src/actors/meeting_timers.rs::MAX_JOIN_WINDOW`; 975 s with today's constants). Why: GC assigns the meeting and then mints the assigning joiner's token. MC accepts that token until `iat + TTL + exp leeway`, and the joiner then has at most the SDK's join deadline to be admitted. Past that, no credential issued at assignment can still produce a participant, so a meeting that is still empty can only be a leak. A larger value would only re-open the leak, so it is the ceiling (never a value MC runs).
+- **Floor**: 5 s — `common::meeting_lifecycle::MIN_MEETING_JOIN_WINDOW` (= `LIFETIME_TICK`; `crates/mc-service/src/actors/meeting_timers.rs::MIN_JOIN_WINDOW`), shared with GC, whose accept->commit budget for an assignment sits under it. The window is not a join-correctness bound: a parked first join is already on the roster (so the park is not exposed), and a join that loses the GC-join → MC-admission race is refused `meeting_not_found` / `teardown_in_progress` (keyless) and the SDK re-joins through GC with a fresh assignment. The window is enforced as an EXACT deadline; `LIFETIME_TICK` is only the observer tolerance the end is checked against ("window + one tick"), so a window below it could not be told apart from a much later end, and 0 / sub-tick is the degenerate configuration. Missing, outside [floor, ceiling], or unparseable refuses boot.
+- **Assumes AC's and MC's wall clocks are synced**: `exp` is set on AC's clock and checked on MC's. If AC runs ahead, a token can outlive the window by the skew. The result is a refused join that the SDK's GC re-join recovers. Do NOT "fix" a skew-induced refusal by adding `DEFAULT_CLOCK_SKEW` to the ceiling.
 - **Late joiners**: GC's reuse path does not tell MC about a later GC join, so a user who GC-joins a never-joined meeting and reaches MC after its window gets `meeting_not_found` or `teardown_in_progress`. The SDK re-runs the GC join (bounded, `JOIN_RETRY`), which re-assigns once GC has processed `NotifyMeetingEnded`. Residual: with a slow or unreachable MH, the refusal lasts until teardown completes (up to `teardown_fence_hold_max_seconds`, MC's startup line), the bounded retries run out, and the user must join again.
 - **Recorded in**: `main.rs` via `observability/metrics.rs::set_meeting_timers`
 - **Dashboard**: MC Overview - Meeting Join Window
 
 ### `mc_meeting_disconnect_grace_seconds`
 - **Type**: Gauge
-- **Description**: CONFIG ECHO of `MC_DISCONNECT_GRACE_PERIOD_SECONDS` (ADR-0023; default 30) as every meeting actor enforces it — how long an abruptly disconnected participant stays on the roster for a reconnect. Same boot-time source as `mc_meeting_join_window_seconds`.
+- **Description**: CONFIG ECHO of `MC_DISCONNECT_GRACE_PERIOD_SECONDS` (ADR-0023; REQUIRED, base value 30) as every meeting actor enforces it — how long a participant whose connection was LOST stays on the roster for a reconnect. A deliberate leave (`LeaveRequest`) or clean close never waits on it. Same boot-time source as `mc_meeting_join_window_seconds`.
 - **Labels**: None (cardinality 1)
 - **Recorded in**: `main.rs` via `observability/metrics.rs::set_meeting_timers`
 - **Dashboard**: MC Overview - Disconnect Grace
@@ -111,16 +111,34 @@ All MC service metrics follow ADR-0011 naming conventions with the `mc_` prefix.
 
 ### `mc_gc_notify_meeting_ended_total`
 - **Type**: Counter
-- **Description**: `NotifyMeetingEnded` calls to GC — MC telling GC a meeting ENDED (emptied — last participant left OR nobody joined within the join window — or closed) after its handlers were released (ADR-0010 §3). A never-joined meeting never registered on any MH, so its "release" is empty and the notify follows its teardown at once.
+- **Description**: `NotifyMeetingEnded` ATTEMPTS to GC — MC telling GC that the incarnation it held (the `assignment_id` GC sent with the assignment) ENDED (emptied — last participant left OR nobody joined within the join window — or closed) after its handlers were released (ADR-0010 §3). A never-joined meeting never registered on any MH, so its "release" is empty and the notify follows its teardown at once.
 - **Labels**:
-  - `status`: `success`, `error`
-- **Cardinality**: 2; zero-initialised
-- **A GC-coordination metric, like its `mc_gc_heartbeats_total` sibling — no `key_custody`.** Coarse `status`, because a fire-and-forget notification's remedies do not differ by failure mode.
-- **Send policy: AT MOST ONCE for anything GC may have processed.** Retried (with backoff, up to `MAX_NOTIFY_ATTEMPTS`, ~31 s) only when the request provably never left MC (the call failed in its connect phase, e.g. GC restarting); never after it may have been sent, because a duplicate landing after the meeting's NEXT incarnation was assigned would end that live assignment. So `error` is final for that meeting.
-- **What a sustained `error` costs, user-visibly**: GC keeps reusing the ended meeting's assignment, and every join to that meeting id gets `meeting_not_found` from MC until MC restarts. There is no other detector.
-- **Alert**: `MCNotifyMeetingEndedFailing`
+  - `outcome`: `acked` (GC answered `ENDED` or `NOT_CURRENT` — MC's action is the same: done), `retried` (this attempt failed; the notification stays pending), `rejected` (GC answered `INVALID_ARGUMENT` or no outcome — a defect, never retried)
+- **Cardinality**: 3; zero-initialised
+- **A GC-coordination metric, like its `mc_gc_heartbeats_total` sibling — no `key_custody`.**
+- **Send policy: FENCED, so RETRIED.** The request carries MC's `controller_id` and the `assignment_id`; GC ends only the active row matching both, so a duplicate can end nothing but its own incarnation. Each pending notification is retried on its own capped backoff (`BACKOFF_BASE` doubling to `BACKOFF_MAX`, one attempt bounded by `NOTIFY_ATTEMPT_TIMEOUT`) until GC answers; one notification GC keeps failing never delays another.
+- **`retried` is GC RPC flakiness, not user impact** (a retried notify that later acks harmed nobody); the user-visible symptom is `mc_gc_notify_meeting_ended_oldest_pending_age_seconds`.
+- **Alert**: `MCNotifyMeetingEndedRejected` (on `rejected`)
 - **Recorded in**: `grpc/gc_client.rs::notify_meeting_ended` via `observability/metrics.rs::record_gc_notify_meeting_ended`
 - **Dashboard**: MC Overview - GC Meeting-Ended Notifications (Fencing & Heartbeat Latency row)
+
+### `mc_gc_notify_meeting_ended_pending`
+- **Type**: Gauge
+- **Description**: Meeting-ended notifications MC holds unanswered by GC (count). Reads > 0 under routine churn; the stuck signal is the next metric. Set with it by `set_gc_notify_meeting_ended_pending`.
+- **Labels**: none
+- **Cardinality**: 1; initialised to 0 at boot
+- **Dashboard**: MC Overview - GC Meeting-Ended Notify Backlog
+
+### `mc_gc_notify_meeting_ended_oldest_pending_age_seconds`
+- **Type**: Gauge
+- **Description**: Meeting-ended notifications MC holds unanswered by GC (count), and the age of the OLDEST of them (seconds since the controller queued it). Both read 0 when nothing is pending. Set by the drain on every enqueue, attempt verdict and drop, AND every 5 s between events (`NOTIFY_PENDING_PUBLISH_INTERVAL`), so the age stays within one interval of the truth while an entry waits out its backoff.
+- **Labels**: none
+- **Cardinality**: 1 each; initialised to 0 at boot
+- **What a pending entry costs, user-visibly**: GC still routes joins for that meeting id to this MC, which no longer holds it (`meeting_not_found`), until GC answers or this MC stops heartbeating (GC then fails the rows over).
+- **Why the alert is on the AGE**: the count reads > 0 under routine churn (a notify milliseconds into a successful send); the oldest entry's age grows only when something is genuinely not getting through.
+- **Alert**: `MCNotifyMeetingEndedStuck` (`max(...oldest_pending_age_seconds) > 120`)
+- **Recorded in**: `grpc/gc_client.rs::PendingNotifies::publish` via `observability/metrics.rs::set_gc_notify_meeting_ended_pending`
+- **Dashboard**: MC Overview - GC Meeting-Ended Notify Backlog (Fencing & Heartbeat Latency row)
 
 ### `mc_gc_meeting_ended_notifications_dropped_total`
 - **Expected-empty**: yes
@@ -128,11 +146,11 @@ All MC service metrics follow ADR-0011 naming conventions with the `mc_` prefix.
 - **Description**: A meeting-ended notification DROPPED before it was attempted — the notify queue was full, or it was produced after the queue closed at shutdown, or it was still queued when the shutdown flush budget expired
 - **Labels**: none
 - **Cardinality**: 1; zero-initialised
-- **Its own series, not a `status` value on `mc_gc_notify_meeting_ended_total`**: a pre-attempt loss ("MC is losing events") and an RPC failure ("GC is down") are opposite investigations.
-- **Any non-zero is a stale GC assignment with no other detector** — joins to that meeting id fail until MC restarts.
+- **Its own series, not an `outcome` value on `mc_gc_notify_meeting_ended_total`**: a pre-attempt loss ("MC is losing events") and an RPC failure ("GC is down") are opposite investigations.
+- **Any non-zero is a stale GC assignment** — joins to that meeting id reach an MC that no longer holds it until this MC stops heartbeating.
 - **Alert**: `MCMeetingEndedNotificationsDropped` (warning, `> 0`)
 - **Two arms, and only one of them is reliably scraped.** The queue-full arm is ordinary runtime and is a dependable detector. The shutdown arms increment within seconds of process exit, so by this diff's own argument (a counter incremented that close to exit is never scraped) the counter there is BEST-EFFORT and the ERROR log line is the load-bearing evidence. Do not read a flat counter after a restart as proof nothing was dropped at shutdown; read the pod's last log lines.
-- **A mid-send cut-off at the shutdown deadline is deliberately NOT counted here**: whether GC committed it is unknown, and `NotifyMeetingEnded` is at-most-once, so it is never retried and is reported on its own ERROR line instead. This counter is only the provably-never-sent remainder.
+- **At shutdown, every notification still pending when the flush budget expires is counted here** (an attempt cut off mid-send included: the notify is fenced, so whether GC committed it does not matter for correctness — if it did not, the row fails over once this MC stops heartbeating).
 - **Recorded in**: `grpc/gc_client.rs::MeetingEndedQueue::meeting_ended` (queue full or closed) and `grpc/gc_client.rs::drain_meeting_ended` (the remainder past the shutdown flush budget), both via `observability/metrics.rs::record_gc_meeting_ended_notification_dropped`
 - **Dashboard**: MC Overview - GC Meeting-Ended Notifications Dropped (Fencing & Heartbeat Latency row)
 
@@ -1647,7 +1665,7 @@ client-controlled string, `handler_ref`, participant-id, or raw close-reason tex
 - **Labels**:
   - `cause`: `client_closed` (clean tab/app close → immediate removal, grace skipped),
     `connection_lost` (idle-timeout/abrupt loss → grace period kept for reconnection),
-    `server_initiated` (local close: shutdown/drain/already-handled leave)
+    `server_initiated` (local close — shutdown/drain — of a participant still rostered)
 - **Cardinality**: Low (3 causes)
 - **Usage**: Observe the idle-timeout path directly (otherwise hidden inside
   `leaves{reason="timeout"}`), verify the configured `MC_QUIC_MAX_IDLE_TIMEOUT_SECONDS`
@@ -1655,7 +1673,13 @@ client-controlled string, `handler_ref`, participant-id, or raw close-reason tex
   `disconnects{connection_lost} − leaves{timeout} ≈ reconnected within grace`.
   A `client_closed` disconnect always pairs with a `leaves{reason="voluntary"}`; a
   `connection_lost` disconnect resolves LATER as either a reconnect or a
-  `leaves{reason="timeout"}`.
+  `leaves{reason="timeout"}`. The converse does not hold: `leaves{voluntary}` ALSO
+  counts deliberate leaves (the SDK's `LeaveRequest`), which remove the participant
+  before its transport ends and so emit NO disconnect (the close MC then sends finds
+  the participant gone and is not counted).
+- **Only the end of the participant's LIVE connection counts**: a superseded
+  connection's end (after a reconnect on another connection) neither removes the
+  participant nor starts a grace, and is not counted.
 - **Recorded in**: `actors/meeting.rs::handle_disconnect`
 
 ### `mc_participant_leaves_total`
@@ -1664,7 +1688,8 @@ client-controlled string, `handler_ref`, participant-id, or raw close-reason tex
   broadcast — by leave reason. Emitted at the single roster-removal choke-point, so a
   `Left` broadcast can never occur without a matching increment.
 - **Labels**:
-  - `reason`: `voluntary` (clean transport close OR explicit leave — grace skipped),
+  - `reason`: `voluntary` (clean transport close OR the deliberate `LeaveRequest` —
+    grace skipped),
     `timeout` (disconnect grace period expired), `removed` (host-removed),
     `meeting_ended` (meeting ended)
   - **Emission honesty (ADR-0032 expected-vs-enforced):** `removed` is RESERVED —
@@ -1674,7 +1699,8 @@ client-controlled string, `handler_ref`, participant-id, or raw close-reason tex
     `timeout`, and `meeting_ended` are actually emitted; `removed` will light up when
     the host-remove path lands.
 - **Cardinality**: Low (4 reasons; `removed` reserved, see above)
-- **Usage**: A clean tab-close shows as `voluntary`; a crash/network-loss that did not
+- **Usage**: A deliberate leave (`LeaveRequest`; INFO "Participant left (LeaveRequest)
+  — removing immediately") or a clean tab-close shows as `voluntary`; a crash/network-loss that did not
   reconnect shows as `timeout`. A rising `timeout` share is the primary signal of
   involuntary departures (network issues / crashes) — see the disconnect-reason runbook
   section.
@@ -1703,12 +1729,14 @@ client-controlled string, `handler_ref`, participant-id, or raw close-reason tex
 - **Recorded in**: `actors/meeting.rs::handle_join`
 
 **Worst-case roster-remove latency (SSoT — derived from config, not a fixed number):**
+- Deliberate leave (the SDK's `LeaveRequest`): ≈ network RTT (sub-second). Removed on
+  receipt; the grace period is never entered.
 - Clean tab-close: ≈ network RTT (sub-second). `Connection::closed()` fires immediately
   and the grace period is skipped.
 - Crash / network-loss: `MC_QUIC_MAX_IDLE_TIMEOUT_SECONDS` + `MC_DISCONNECT_GRACE_PERIOD_SECONDS`
   (enforced by every meeting actor; echoed as `mc_meeting_disconnect_grace_seconds`)
-  + one `LIFETIME_TICK` (`actors/meeting_timers.rs`, the grace-check interval). With defaults:
-  `10 + 30 + 5 = 45s`. See the MC incident runbook for the operational budget + PromQL.
+  + one `LIFETIME_TICK` (`actors/meeting_timers.rs`, the grace-check interval). With the base
+  values: `10 + 30 + 5 = 45s`. See the MC incident runbook for the operational budget + PromQL.
 
 ---
 

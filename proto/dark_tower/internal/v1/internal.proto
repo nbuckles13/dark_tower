@@ -1106,25 +1106,58 @@ service MeetingControllerService {
 
 // Request to notify GC that a meeting has ended.
 //
-// NOT INCARNATION-SAFE, and MC compensates by how it sends it. GC ends whatever
-// assignment row is ACTIVE for (meeting_id, region), so a notify for one
-// incarnation of a meeting that arrived after the NEXT incarnation was assigned
-// would end the next incarnation's live row. MC therefore sends this only after
-// the meeting's handlers are released, and retries it only where the request
-// provably was not processed (a pre-send connect failure, or a definitive error
-// status), never on an ambiguous failure -- so a processed notify is never
-// delivered twice. What that does NOT cover: GC failover re-pointing a row to
-// another MC while a notify is in flight. The fix is a controller id and an
-// incarnation token on this message (tag 3 is free); docs/TODO.md,
-// "`NotifyMeetingEnded` is not incarnation-safe".
+// FENCED BY INCARNATION (single home of these rules). GC ends ONLY the active
+// row of (meeting_id, region) whose controller AND `assignment_id` both equal
+// the values carried here, in one conditional UPDATE; any other row -- a later
+// incarnation revived after this one ended, a row failed over to another MC,
+// or a race winner whose losing GC left an orphan meeting on this MC -- is left
+// untouched. A notify can therefore end nothing but the incarnation it names,
+// so a duplicate is harmless and MC RETRIES every failure (capped backoff, no
+// attempt cap, until answered or shutdown) EXCEPT `INVALID_ARGUMENT` and an
+// `UNSPECIFIED` outcome, which are defects and are never retried. MC still
+// sends this only AFTER the meeting's handlers are released.
+//
+// Fields are REQUIRED: GC rejects an empty `meeting_id`/`region`/`controller_id`
+// and an empty, malformed or nil `assignment_id` with INVALID_ARGUMENT (no
+// zero-means-any value, no legacy unfenced mode).
+//
+// NOT AUTHORIZATION. `controller_id` is SELF-ASSERTED: every MC authenticates
+// with the same service credential, so any holder of a meeting-controller
+// credential who knows (meeting_id, controller_id, assignment_id) can end that
+// row (see docs/TODO.md, per-instance MC identity). It is an anti-misroute /
+// anti-race narrowing match, exactly like `AcquireMediaHandlerRequest`.
+// `assignment_id` is a non-secret discriminator, not a credential.
 message NotifyMeetingEndedRequest {
   string meeting_id = 1; // Meeting that ended
   string region = 2; // Region where the meeting was hosted
+  string controller_id = 3; // The notifying MC's id (self-asserted; see above)
+  // The `AssignMeetingWithMhRequest.assignment_id` this MC accepted for the
+  // incarnation that ended (canonical UUID text).
+  string assignment_id = 4;
+}
+
+// What GC did with a `NotifyMeetingEndedRequest`.
+//
+// MC's ACTION is identical for ENDED and NOT_CURRENT: stop retrying. The split
+// exists only for MC's log/metric label. NOT_CURRENT is a SUCCESS, never an
+// error status, because it also covers "MC's own earlier ambiguous attempt
+// already committed". UNSPECIFIED (a default-decoded reply) is a defect: MC
+// logs it at ERROR and does not retry. The enum is no useful oracle: probing it
+// needs a 122-bit random guess, and a holder of a valid triple can end that
+// row anyway.
+enum NotifyMeetingEndedOutcome {
+  NOTIFY_MEETING_ENDED_OUTCOME_UNSPECIFIED = 0;
+  NOTIFY_MEETING_ENDED_OUTCOME_ENDED = 1; // The named row was active and is now ended
+  NOTIFY_MEETING_ENDED_OUTCOME_NOT_CURRENT = 2; // No active row matches (already ended, or another incarnation/MC)
 }
 
 // Response to meeting ended notification
 message NotifyMeetingEndedResponse {
-  bool acknowledged = 1;
+  // Was `bool acknowledged = 1;` (replaced by `outcome`, whose default value
+  // is the fail-closed UNSPECIFIED rather than an ambiguous `false`).
+  reserved 1;
+  reserved "acknowledged";
+  NotifyMeetingEndedOutcome outcome = 2;
 }
 
 // MC→GC service (MCs call this to register and heartbeat)
@@ -1178,10 +1211,32 @@ message MhAssignment {
 }
 
 // Request from GC to MC to assign a meeting with MH assignments
+//
+// `assignment_id` names ONE INCARNATION of the (meeting_id, region) assignment
+// row, not the row itself. GC mints a fresh UUIDv4 for EVERY AssignMeetingWithMh
+// attempt (a retry onto another MC gets a new value) and writes it to the row
+// only for the attempt MC ACCEPTED (insert, revive and failover re-point each
+// get a new value). MC echoes it in `NotifyMeetingEndedRequest`, which is how
+// GC fences an end to that incarnation.
+//
+// FENCE INVARIANT: a live row (MC X, assignment_id i) implies MC X accepted i
+// in that same attempt. It holds because GC writes a row only after MC accepted
+// that value, and MC holds at most one `assignment_id` per live meeting: an
+// Assign for a meeting MC already holds is REJECTED, never adopted. GC's sticky
+// reuse of a live row makes no MC call and sends nothing; adding an MC call
+// there would break this invariant. "X accepted i" does NOT mean X still HOLDS
+// i: if the commit lands after MC already ended the meeting at its join
+// window, the row names a meeting X no longer holds -- GC bounds that window
+// with GC_ASSIGN_COMMIT_BUDGET_MS <= half of
+// common::meeting_lifecycle::MIN_MEETING_JOIN_WINDOW (ADR-0010 §3 residuals).
+//
+// REQUIRED: MC rejects an empty, malformed or nil `assignment_id` with
+// REJECTION_REASON_INVALID_REQUEST. Non-secret discriminator, not a credential.
 message AssignMeetingWithMhRequest {
   string meeting_id = 1; // Meeting being assigned
   repeated MhAssignment mh_assignments = 2; // MH assignments for this meeting
   string requesting_gc_id = 3; // ID of the GC making the request
+  string assignment_id = 4; // GC-minted incarnation id (canonical UUID text)
 }
 
 // Response from MC to GC for meeting assignment

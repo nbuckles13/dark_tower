@@ -34,6 +34,8 @@ pub mod token_manager;
 /// Shared types for internal meeting/guest token requests (GC <-> AC)
 pub mod meeting_token;
 
+pub mod meeting_lifecycle;
+
 /// Canonical `service_type` claim vocabulary and its metric-label clamp.
 pub mod service_type;
 

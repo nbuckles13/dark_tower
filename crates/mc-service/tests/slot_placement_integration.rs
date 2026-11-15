@@ -642,7 +642,12 @@ async fn seamed_meeting(
     stack.handoffs.insert(meeting_id, handlers);
     stack
         .controller_handle
-        .create_meeting_with_seams(meeting_id.to_string(), set, seams)
+        .create_meeting_with_seams(
+            meeting_id.to_string(),
+            ::common::meeting_lifecycle::AssignmentId::new_v4(),
+            set,
+            seams,
+        )
         .await
         .expect("create meeting with seams");
 }

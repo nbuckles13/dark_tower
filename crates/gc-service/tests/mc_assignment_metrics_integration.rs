@@ -40,6 +40,7 @@ const ALL_REJECTION_REASONS: &[&str] = &[
     "unspecified",
     "no_mcs_available",
     "invalid_request",
+    "commit_budget_exceeded",
 ];
 
 #[test]

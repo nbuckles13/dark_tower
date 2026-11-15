@@ -47,7 +47,6 @@ import {
   MC_MAX_AUDIO_RECEIVE_SLOTS_KEY,
   MC_MAX_VIDEO_RECEIVE_SLOTS_KEY,
   ROTATION_POLL_MARGIN_MS,
-  mcRotationBudget,
 } from './configEnv.js';
 import type { InstanceCounters } from './instanceCounters.js';
 import { diagnoseMissingSender } from './mcMetrics.js';
@@ -1240,11 +1239,10 @@ export async function setServerMuteViaUi(
  * converged", with the last observed state, never an elapsed time. The one
  * bound the video specs use (no per-call literals).
  */
-// DERIVED from MC's own config: a leave's effects can wait out MC's disconnect
-// grace (MC holds a cleanly-closed participant through it — cohortContexts.ts),
-// plus the shared poll margin. Never restated as a literal.
-export const VIDEO_SLOT_STATE_LIVENESS_MS =
-  mcRotationBudget().graceSeconds * 1000 + ROTATION_POLL_MARGIN_MS;
+// The shared poll margin: a leave's effects are immediate (the SDK sends a
+// LeaveRequest and MC removes the participant at once — no disconnect grace),
+// so convergence needs only the push, the bus tick and the next poll.
+export const VIDEO_SLOT_STATE_LIVENESS_MS = ROTATION_POLL_MARGIN_MS;
 
 /**
  * THE bus-cadence poll kernel: read the page's bus on its own sampling cadence

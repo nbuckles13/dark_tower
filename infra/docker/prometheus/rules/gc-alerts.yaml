@@ -278,7 +278,7 @@ groups:
           component: mc-assignment
         annotations:
           summary: "MC assignment failure rate high ({{ $value | humanizePercentage }})"
-          description: "MC assignment failures are {{ $value | humanizePercentage }} for 5 minutes. Break down by `rejection_reason` FIRST (`sum by(rejection_reason) (increase(gc_mc_assignments_total{status!=\"success\"}[5m]))`): at_capacity/unhealthy/no_mcs_available point at MC capacity or connectivity; `invalid_request` is a GC-side contract violation (GC sent a malformed request), NOT a fleet problem — do not scale MCs, follow the runbook's invalid_request branch and escalate to the GC owner."
+          description: "MC assignment failures are {{ $value | humanizePercentage }} for 5 minutes. Break down by `rejection_reason` FIRST (`sum by(rejection_reason) (increase(gc_mc_assignments_total{status!=\"success\"}[5m]))`): at_capacity/unhealthy/no_mcs_available point at MC capacity or connectivity; `commit_budget_exceeded` points at GC->database latency (do not scale MCs); `invalid_request` is a GC-side contract violation (GC sent a malformed request), NOT a fleet problem — do not scale MCs, follow the runbook's invalid_request branch and escalate to the GC owner."
           impact: "Some users unable to join meetings. Triage by rejection_reason: MC health/capacity for most reasons, but invalid_request is a GC bug."
           runbook_url: "docs/runbooks/gc-incident-response.md#scenario-3-mc-assignment-failures"
 

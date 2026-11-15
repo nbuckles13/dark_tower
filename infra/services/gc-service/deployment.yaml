@@ -71,6 +71,58 @@ spec:
             configMapKeyRef:
               name: gc-service-config
               key: AC_INTERNAL_URL
+        # Required behaviour keys (2026-11-15 meeting-end-safety): REQUIRED in
+        # GC (no Rust default), so hard refs (no `optional: true`).
+        - name: JWT_CLOCK_SKEW_SECONDS
+          valueFrom:
+            configMapKeyRef:
+              name: gc-service-config
+              key: JWT_CLOCK_SKEW_SECONDS
+        - name: RATE_LIMIT_RPM
+          valueFrom:
+            configMapKeyRef:
+              name: gc-service-config
+              key: RATE_LIMIT_RPM
+        - name: MC_STALENESS_THRESHOLD_SECONDS
+          valueFrom:
+            configMapKeyRef:
+              name: gc-service-config
+              key: MC_STALENESS_THRESHOLD_SECONDS
+        - name: GC_ASSIGN_COMMIT_BUDGET_MS
+          valueFrom:
+            configMapKeyRef:
+              name: gc-service-config
+              key: GC_ASSIGN_COMMIT_BUDGET_MS
+        - name: GC_CLEANUP_INTERVAL_SECONDS
+          valueFrom:
+            configMapKeyRef:
+              name: gc-service-config
+              key: GC_CLEANUP_INTERVAL_SECONDS
+        - name: GC_INACTIVITY_HOURS
+          valueFrom:
+            configMapKeyRef:
+              name: gc-service-config
+              key: GC_INACTIVITY_HOURS
+        - name: GC_RETENTION_DAYS
+          valueFrom:
+            configMapKeyRef:
+              name: gc-service-config
+              key: GC_RETENTION_DAYS
+        - name: GC_DRAIN_SECONDS
+          valueFrom:
+            configMapKeyRef:
+              name: gc-service-config
+              key: GC_DRAIN_SECONDS
+        - name: TELEMETRY_PROXY_MAX_BYTES
+          valueFrom:
+            configMapKeyRef:
+              name: gc-service-config
+              key: TELEMETRY_PROXY_MAX_BYTES
+        - name: TELEMETRY_PROXY_RATE_LIMIT_PER_MINUTE
+          valueFrom:
+            configMapKeyRef:
+              name: gc-service-config
+              key: TELEMETRY_PROXY_RATE_LIMIT_PER_MINUTE
         # In-cluster OTel collector base for the /api/v1/telemetry proxy (R-2/R-59).
         # The forwarder appends /v1/metrics or /v1/traces (telemetry_forwarder.rs).
         - name: OTEL_COLLECTOR_ENDPOINT

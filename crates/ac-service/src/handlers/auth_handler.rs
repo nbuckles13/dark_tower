@@ -1,6 +1,6 @@
 use crate::config::Config;
 #[cfg(test)]
-use crate::config::DEFAULT_BCRYPT_COST;
+use crate::config::RECOMMENDED_MIN_BCRYPT_COST;
 use crate::errors::AcError;
 use crate::middleware::org_extraction::OrgContext;
 use crate::models::TokenResponse;
@@ -352,19 +352,10 @@ fn extract_client_credentials(
 mod tests {
     use super::*;
     use axum::http::header::AUTHORIZATION;
-    use base64::{engine::general_purpose, Engine};
-    use std::collections::HashMap;
 
     /// Create a test config with required environment variables
     fn test_config() -> crate::config::Config {
-        let master_key = general_purpose::STANDARD.encode([0u8; 32]);
-        let vars = HashMap::from([
-            (
-                "DATABASE_URL".to_string(),
-                "postgresql://localhost/test".to_string(),
-            ),
-            ("AC_MASTER_KEY".to_string(), master_key),
-        ]);
+        let vars = crate::config::test_support::complete_vars();
         crate::config::Config::from_vars(&vars).expect("Test config should be valid")
     }
 
@@ -957,7 +948,7 @@ mod tests {
             &pool,
             "global-controller",
             Some("test-region".to_string()),
-            DEFAULT_BCRYPT_COST,
+            RECOMMENDED_MIN_BCRYPT_COST,
         )
         .await
         .expect("Registration should succeed");
@@ -1016,7 +1007,7 @@ mod tests {
             &pool,
             "meeting-controller",
             None,
-            DEFAULT_BCRYPT_COST,
+            RECOMMENDED_MIN_BCRYPT_COST,
         )
         .await
         .expect("Registration should succeed");
@@ -1076,7 +1067,7 @@ mod tests {
             &pool,
             "media-handler",
             None,
-            DEFAULT_BCRYPT_COST,
+            RECOMMENDED_MIN_BCRYPT_COST,
         )
         .await
         .expect("Registration should succeed");
@@ -1134,7 +1125,7 @@ mod tests {
             &pool,
             "global-controller",
             None,
-            DEFAULT_BCRYPT_COST,
+            RECOMMENDED_MIN_BCRYPT_COST,
         )
         .await
         .expect("Registration should succeed");

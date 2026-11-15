@@ -149,7 +149,13 @@ async fn inbound_http_traceparent_bridges_to_outbound_mc_grpc_call() {
                 let mc_endpoint = mc_endpoint.clone();
                 async move {
                     let result = mc_client
-                        .assign_meeting(&mc_endpoint, "meeting-bridge-test", &[], "gc-bridge-test")
+                        .assign_meeting(
+                            &mc_endpoint,
+                            "meeting-bridge-test",
+                            gc_service::repositories::AssignmentId::new_v4(),
+                            &[],
+                            "gc-bridge-test",
+                        )
                         .await;
                     match result {
                         Ok(_) => StatusCode::OK,

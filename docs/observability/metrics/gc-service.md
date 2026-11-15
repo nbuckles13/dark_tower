@@ -77,12 +77,17 @@ All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
        edit in lockstep: this list, the Cardinality-Management table below, the
        gc-incident-response.md legend, and alerts.md GCMCAssignmentFailures response. -->
   - `rejection_reason`: Reason for rejection — emitted values: `at_capacity`, `draining`,
-    `unhealthy`, `unspecified`, `no_mcs_available`, `invalid_request`, `none` (success path).
+    `unhealthy`, `unspecified`, `no_mcs_available`, `invalid_request`, `commit_budget_exceeded`,
+    `none` (success path).
     Also `rpc_failed (declared/unemitted — see note)`.
     - `invalid_request` — GC sent a malformed `AssignMeetingWithMh` (empty MH selection, or an
       MH with an empty `grpc_endpoint`). A GC-side contract violation surfaced by MC; recorded with
       `status="error"` and GC fails fast rather than retrying the pool. It is **not** a controller
       health problem — do not read it as a sick fleet.
+    - `commit_budget_exceeded` — the last attempt's MC accepted, but GC could not commit the
+      assignment row within `GC_ASSIGN_COMMIT_BUDGET_MS` (ADR-0010 §3), so no row was written and
+      the accepting MC holds a fenced orphan. `status="error"`: a GC→database latency problem, not
+      an MC one.
 
   > **Note**: `rpc_failed` is **declared but not currently emitted**. An all-RPC-failed assignment
   > exhaustion surfaces as `no_mcs_available` (the `Err` branch at `mc_assignment.rs` sets no
@@ -92,7 +97,8 @@ All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
   > §Observability Debt (the `declared/unemitted` tag is provisional pending that reconciliation).
 - **Cardinality**: Low (~18 combinations)
 - **Usage**: Track assignment success rate and failure patterns. `status="success"` fires on
-  BOTH paths — a new assignment and the reuse of an existing healthy one (R-6) — so it counts
+  BOTH paths — a new assignment and the reuse of an existing live one (R-6; its MC still
+  heartbeats, whatever its `health_status`) — so it counts
   joins that obtained an MC, not new meetings.
 - **Example**:
   ```promql
@@ -161,6 +167,40 @@ All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
   `GCMCAssignmentFailures` and `GCHighJoinFailureRate`, neither touched by this change. Do not
   build replacement latency coverage — the error-side rules already cover the failure modes; what
   is lost is sensitivity to *slow* new assignments, not to *failed* ones.
+
+### `gc_meeting_end_notifications_total`
+- **Type**: Counter
+- **Description**: What GC did with each `NotifyMeetingEnded` from an MC (ADR-0010 §3). The notify is
+  FENCED: GC ends only the live row of (meeting, region) whose controller AND `assignment_id` both
+  match the notify, decided in ONE statement (`MeetingAssignmentsRepository::end_assignment`).
+- **Labels**:
+  - `outcome`:
+    - `ended` — the named incarnation was live and is now ended (the normal case).
+    - `already_ended` — THIS incarnation's row exists and was already ended: a re-sent notify (MC
+      retries every failure, since a duplicate can end nothing else), or the backstop got there
+      first. Exact by construction (the probe matches controller AND `assignment_id`). Benign.
+    - `fenced` — no row of this incarnation exists, so nothing was ended: a late notify after a
+      revive or a failover re-point replaced its row, or the end of an ORPHAN meeting whose row
+      never committed (an MC that accepted an assignment whose row another GC won, or whose row
+      was abandoned past the accept->commit budget). The WARN log `gc.grpc.notify_meeting_ended`
+      "Meeting-ended notify fenced" carries `meeting_id`, `mc_id`, `assignment_id` and
+      `caller_sub`.
+  Validation failures (`INVALID_ARGUMENT`) and DB errors are in none of these (DB errors:
+  `gc_db_queries_total{operation="end_assignment",status="error"}`). Both non-`ended` outcomes
+  answer MC with `NOT_CURRENT`, a success: MC stops retrying.
+- **Cardinality**: 3 series. Zero-initialized.
+- **Semantics**: before the fence, every `fenced` increase here would have been a live meeting's
+  row ended under it (a split meeting). Occasional `fenced` is expected at ordinary concurrency
+  (two first joins racing). A SUSTAINED rate is the detection signal for the accept->commit budget
+  being breached (`GC_ASSIGN_COMMIT_BUDGET_MS`): rows committing after MC already ended the
+  meeting, which leaves the row naming an MC that no longer holds it — joins to that meeting id
+  then fail with `meeting_not_found` until that MC stops heartbeating. Correlate with
+  `gc_db_queries_total{operation="atomic_assign",status="error"}` and the
+  `gc.repository.assignments` WARN "accept->commit budget exhausted".
+- **Example**:
+  ```promql
+  sum by(outcome) (increase(gc_meeting_end_notifications_total[5m]))
+  ```
 
 ---
 
@@ -1040,7 +1080,7 @@ All GC service metrics follow strict cardinality bounds per ADR-0011:
 | `status` | 5 | success, error, timeout, rejected, accepted (non-HTTP outcome metrics: mc_assignments, db_queries, token_refresh, ac_requests, grpc_mc_calls, mh_selections, meeting_creation, meeting_join) |
 | `operation` | ~18 | select_mc, atomic_assign, update_heartbeat, ac_meeting_token, ac_guest_token, mc_grpc, etc. |
 <!-- ANCHOR (DRY): source of truth = terminal match in crates/gc-service/src/services/mc_assignment.rs; mirrors the gc_mc_assignments_total label list above, the gc-incident-response.md legend, and alerts.md GCMCAssignmentFailures response. -->
-| `rejection_reason` | 7 emitted (+1 declared/unemitted) | at_capacity, draining, unhealthy, unspecified, no_mcs_available, invalid_request, none; plus rpc_failed (declared/unemitted — see `gc_mc_assignments_total` note) |
+| `rejection_reason` | 8 emitted (+1 declared/unemitted) | at_capacity, draining, unhealthy, unspecified, no_mcs_available, invalid_request, commit_budget_exceeded, none; plus rpc_failed (declared/unemitted — see `gc_mc_assignments_total` note) |
 | `error_type` | ~10 | not_found, forbidden, unauthorized, rate_limit, service_unavailable, internal, org_limit, org_inactive, org_not_provisioned, etc. `gc_meeting_creation_failures_total` carries 9 of these — near the bound. |
 
 **Total Estimated Cardinality**: HTTP metrics ~1,050 worst-case (realistically a few hundred), plus ~200 non-HTTP series — well within Prometheus limits.

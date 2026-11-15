@@ -13,7 +13,7 @@
 ## Code Locations
 - Entrypoint (HTTP + gRPC dual-server startup) -> `crates/gc-service/src/main.rs`
 - Route definitions and AppState -> `crates/gc-service/src/routes/mod.rs:build_routes()`
-- Configuration (env vars, thresholds) -> `crates/gc-service/src/config.rs:Config::from_env()`
+- Configuration (env vars, thresholds; every behaviour/topology key REQUIRED, no Rust default) -> `crates/gc-service/src/config.rs:Config::from_env()`; test maps via `crates/gc-test-utils/src/mh_endpoint_allowlist.rs:fill_required_config()`
 - Error enum: HTTP status, `error.code`, `error_type` metric label -> `crates/gc-service/src/errors.rs:GcError`
 - JWT validation (validate + validate_raw for gRPC failure_reason); JWKS caching; claims -> `crates/gc-service/src/auth/jwt.rs`, `crates/gc-service/src/auth/jwks.rs:JwksClient::get_key()`, `crates/gc-service/src/auth/claims.rs`
 - HTTP auth middleware (service + user token: require_auth, require_user_auth) -> `crates/gc-service/src/middleware/auth.rs`
@@ -30,10 +30,10 @@
 - AC HTTP client (meeting/guest tokens) -> `crates/gc-service/src/services/ac_client.rs:AcClient`
 - MC/MH repositories (register, heartbeat, staleness) -> `crates/gc-service/src/repositories/` (`meeting_controllers.rs`, `media_handlers.rs`); MH registry freshness: config (REQUIRED `GC_MH_*`, one staleness bound = k x interval) -> `crates/gc-service/src/config.rs:MhRegistryConfig`; tick (sweep -> retention -> `gc_mh_available`) -> `crates/gc-service/src/tasks/mh_health_checker.rs:mh_registry_tick()`
 - Meetings repository (create with limit check, audit log) -> `crates/gc-service/src/repositories/meetings.rs:MeetingsRepository::create_meeting_with_limit_check()`
-- Assignment repository (weighted select, atomic assign incl. ENDED-row revival; end + batch jobs keyed on (meeting, region)) -> `crates/gc-service/src/repositories/meeting_assignments.rs:MeetingAssignmentsRepository::atomic_assign()`, `end_assignment()`, `end_stale_assignments()`, `cleanup_old_assignments()`
-- Generic health checker loop -> `crates/gc-service/src/tasks/generic_health_checker.rs`; assignment cleanup (soft/hard delete) -> `crates/gc-service/src/tasks/assignment_cleanup.rs`
-- Observability metrics (incl. join metrics) -> `crates/gc-service/src/observability/metrics.rs`
-- Grafana dashboard -> `infra/grafana/dashboards/gc-overview.json`
+- Assignment repository (weighted select, atomic assign incl. ENDED-row revival + accept->commit budget txn; end + batch jobs keyed on (meeting, region)) -> `crates/gc-service/src/repositories/meeting_assignments.rs:MeetingAssignmentsRepository::atomic_assign()`, `end_assignment()`, `end_stale_assignments()`, `cleanup_old_assignments()`
+- MC liveness (heartbeat freshness, NEVER `health_status`) for reuse/failover/backstop: ONE SQL-literal macro -> `crates/gc-service/src/repositories/meeting_assignments.rs:mc_is_live!`, `get_live_assignment()`; threshold + commit budget config -> `crates/gc-service/src/config.rs:McAssignmentConfig`; shared join-window floor -> `crates/common/src/meeting_lifecycle.rs:MIN_MEETING_JOIN_WINDOW`; incarnation fence (`assignment_id`, minted per MC attempt; fenced end in one CTE; outcomes ended/already_ended/fenced) -> `crates/common/src/meeting_lifecycle.rs:AssignmentId`, `crates/gc-service/src/repositories/meeting_assignments.rs:EndAssignmentOutcome`, handler `crates/gc-service/src/grpc/mc_service.rs:notify_meeting_ended()`; ADR-0010 §3 item 1
+- Generic health checker loop -> `crates/gc-service/src/tasks/generic_health_checker.rs`; assignment cleanup (soft/hard delete; config parsed in `config.rs:AssignmentCleanupConfig`) -> `crates/gc-service/src/tasks/assignment_cleanup.rs`
+- Observability metrics (incl. join metrics) -> `crates/gc-service/src/observability/metrics.rs`; dashboard -> `infra/grafana/dashboards/gc-overview.json`
 
 ## Client telemetry proxy (OTLP ingest -> collector)
 - Routes `/api/v1/telemetry/v1/{metrics,traces}` -> `crates/gc-service/src/routes/mod.rs:build_routes()`
@@ -66,7 +66,7 @@
 ## Tests
 - Meeting creation + the three refusal causes -> `crates/gc-service/tests/meeting_create_tests.rs`
 - Meeting join/guest/settings tests -> `crates/gc-service/tests/meeting_tests.rs`
-- MC/MH assignment tests -> `crates/gc-service/tests/mc_assignment_rpc_tests.rs`, `crates/gc-service/tests/meeting_assignment_tests.rs`; HTTP join stickiness -> `crates/gc-service/tests/meeting_tests.rs` (`test_join_sticky_*`); auth (incl. R-15 media_dial pin `r15_*`) -> `crates/gc-service/tests/auth_tests.rs`; AcquireMediaHandler gates -> `tests/mh_replacement_tests.rs`, label shape `tests/mh_replacement_metrics_integration.rs`, fixtures `tests/common/{mc_grpc,event_capture}.rs`
+- MC/MH assignment tests (liveness table, fence, budget incl. 57014 path) -> `crates/gc-service/tests/mc_assignment_rpc_tests.rs`, `crates/gc-service/tests/meeting_assignment_tests.rs`; NotifyMeetingEnded handler -> `crates/gc-service/tests/meeting_end_notify_tests.rs`; HTTP join stickiness -> `crates/gc-service/tests/meeting_tests.rs` (`test_join_sticky_*`); auth (incl. R-15 media_dial pin `r15_*`) -> `crates/gc-service/tests/auth_tests.rs`; AcquireMediaHandler gates -> `tests/mh_replacement_tests.rs`, label shape `tests/mh_replacement_metrics_integration.rs`, fixtures `tests/common/{mc_grpc,event_capture}.rs`
 - Per-metric-cluster integration tests (ADR-0032) -> `crates/gc-service/tests/*_metrics_integration.rs`
 - `error_type` label coverage -> `crates/gc-service/tests/meeting_creation_metrics_integration.rs`, `crates/gc-service/tests/errors_metric_integration.rs`
 - Telemetry proxy tests -> `crates/gc-service/tests/telemetry_proxy_tests.rs`, `crates/gc-service/tests/telemetry_metrics_integration.rs`

@@ -26,9 +26,7 @@ use common::media_rig::LoopbackRig;
 
 use ::common::observability::testing::MetricAssertion;
 use media_protocol::codec::ALL_REJECT_REASONS;
-use mh_service::config::{
-    DEFAULT_MEDIA_LATENCY_SAMPLE_RATIO, EGRESS_QUEUE_FRAMES, INGRESS_QUEUE_FRAMES,
-};
+use mh_service::config::{EGRESS_QUEUE_FRAMES, INGRESS_QUEUE_FRAMES};
 use mh_service::media::forward::{forward_one, EgressQueue, IngressFrame};
 use mh_service::media::queue::SharedQueue;
 use mh_service::observability::metrics::{
@@ -38,6 +36,10 @@ use mh_service::observability::metrics::{
 use mh_service::routing::RoutingTable;
 use mh_service::session::LocalSubscribers;
 use mh_test_utils::media_policy::loopback_egress;
+
+/// The base `config.env` value of `MH_MEDIA_LATENCY_SAMPLE_RATIO` (required;
+/// no code default exists).
+const BASE_MEDIA_LATENCY_SAMPLE_RATIO: f64 = 0.01;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -200,12 +202,12 @@ async fn the_egress_loop_observes_the_transmit_buffer_and_total_phases() {
 #[tokio::test]
 async fn the_sample_ratio_gauge_publishes_the_value_the_sampler_uses() {
     let snapshot = MetricAssertion::snapshot();
-    let _queue = forward_one_loopback_frame(DEFAULT_MEDIA_LATENCY_SAMPLE_RATIO);
+    let _queue = forward_one_loopback_frame(BASE_MEDIA_LATENCY_SAMPLE_RATIO);
 
     snapshot
         .gauge("mh_media_latency_sample_ratio")
         .with_labels(&[("key_custody", "operator")])
-        .assert_value(DEFAULT_MEDIA_LATENCY_SAMPLE_RATIO);
+        .assert_value(BASE_MEDIA_LATENCY_SAMPLE_RATIO);
 }
 
 /// The egress-queue-depth gauge tracks MH's own application queue.

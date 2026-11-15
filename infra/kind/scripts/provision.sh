@@ -436,6 +436,13 @@ create_ac_secrets() {
 
     # Use consistent dev master key (same as local dev scripts)
     local MASTER_KEY="AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+    # Dev HMAC key for correlation hashing (ADR-0011); REQUIRED by AC — it no
+    # longer falls back to 32 zero bytes. DISTINCT from MASTER_KEY (key
+    # separation: never one value as both the key-encryption key and the HMAC
+    # key); bytes 32..63. Same value as iterate.sh's local run. It keys only
+    # log-field correlation HMACs, so nothing persisted depends on it.
+    # Existing clusters must re-run this provisioning before deploying AC.
+    local HASH_SECRET="ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8="
     local pg_user pg_pass pg_db DB_URL
     pg_user="$(pg_secret_value POSTGRES_USER "$(provision_input "${PG_SECRET_REL}")")" || return 1
     pg_pass="$(pg_secret_value POSTGRES_PASSWORD "$(provision_input "${PG_SECRET_REL}")")" || return 1
@@ -451,6 +458,7 @@ create_ac_secrets() {
     ${KUBECTL} create secret generic ac-service-secrets \
         --from-literal=DATABASE_URL="${DB_URL}" \
         --from-literal=AC_MASTER_KEY="${MASTER_KEY}" \
+        --from-literal=AC_HASH_SECRET="${HASH_SECRET}" \
         -n dark-tower \
         --dry-run=client -o yaml | ${KUBECTL} apply -f -
 

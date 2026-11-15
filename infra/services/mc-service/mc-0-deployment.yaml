@@ -259,9 +259,11 @@ spec:
         # for one more deploy, so a rollback to the pre-MC-A image (which
         # reads all four as REQUIRED) still starts. A later deploy deletes
         # keys and refs together (docs/TODO.md §Media Path Obligations,
-        # "Delete the story-3 retired config keys"). Why `optional: true`
-        # here does not contradict the "DO NOT flip them" rule is stated once,
-        # in infra/services/mh-service/deployment.yaml at
+        # "Delete the story-3 retired config keys" — ready to execute: the
+        # operator ruled rollback compatibility out, 2026-11-15). Why
+        # `optional: true` is right for a key NOTHING reads (and wrong for any
+        # key MC reads) is stated once, in
+        # infra/services/mh-service/deployment.yaml above
         # MH_MEDIA_LATENCY_SAMPLE_RATIO.
         - name: MC_MAX_RECEIVE_SLOTS
           valueFrom:
@@ -378,21 +380,33 @@ spec:
             configMapKeyRef:
               name: mc-service-config
               key: MC_MAX_PARTICIPANTS
-        # ---- Meeting lifetime (join-window devloop, 2026-11-12) ----
-        # The base sets the value (config.env); the Kind overlay re-values it
-        # (configmap-join-window-patch.yaml). `optional: true` so a
-        # ConfigMap without the key (e.g. a rollback to a generation from
-        # before it existed) starts the pod on MC's DERIVED default instead of
-        # failing CreateContainerConfigError. Without THIS ref the value
-        # reaches the ConfigMap and nothing reads it (the Gate-2 L7 defect).
-        # Keep in lockstep with the other mc-N-deployment.yaml (guarded:
-        # `dt-guard env-config` checks every workload consuming the map).
+        # ---- Meeting lifetime + session timers (REQUIRED, hard refs) ----
+        # MC refuses boot without any of these (no Rust default; meeting-end
+        # safety P2). The base sets the values (config.env); the Kind overlay
+        # re-values the join window (configmap-join-window-patch.yaml). Keep in
+        # lockstep with the other mc-N-deployment.yaml (guarded:
+        # `dt-guard env-config` checks every workload consuming the map, and
+        # refuses an `optional: true` ref to a key MC requires).
         - name: MC_MEETING_JOIN_WINDOW_SECONDS
           valueFrom:
             configMapKeyRef:
               name: mc-service-config
               key: MC_MEETING_JOIN_WINDOW_SECONDS
-              optional: true
+        - name: MC_DISCONNECT_GRACE_PERIOD_SECONDS
+          valueFrom:
+            configMapKeyRef:
+              name: mc-service-config
+              key: MC_DISCONNECT_GRACE_PERIOD_SECONDS
+        - name: MC_CLOCK_SKEW_SECONDS
+          valueFrom:
+            configMapKeyRef:
+              name: mc-service-config
+              key: MC_CLOCK_SKEW_SECONDS
+        - name: MC_QUIC_MAX_IDLE_TIMEOUT_SECONDS
+          valueFrom:
+            configMapKeyRef:
+              name: mc-service-config
+              key: MC_QUIC_MAX_IDLE_TIMEOUT_SECONDS
         # Pod IP for gRPC advertise address (downward API)
         - name: POD_IP
           valueFrom:

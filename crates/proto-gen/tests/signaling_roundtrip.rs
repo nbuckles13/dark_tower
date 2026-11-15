@@ -1793,3 +1793,29 @@ fn vacated_mh_connect_request_tag_1_is_unknown() {
     // Control on `media_dial_token = 2`: a string on tag 1 must not land there.
     assert_vacated_tag_is_unknown::<MhConnectRequest>(1, (2, WireField::Len(VACATED_PAYLOAD)));
 }
+
+// ---------------------------------------------------------------------------
+// Explicit leave (meeting-end safety, 2026-11-15)
+// ---------------------------------------------------------------------------
+
+/// The EMPTY `LeaveRequest` still round-trips as a SET oneof arm: an empty
+/// message is encoded as tag 13 with a zero-length body, never omitted, so MC
+/// can tell "the client asked to leave" from "no message".
+#[test]
+fn empty_leave_request_roundtrips_as_a_set_oneof_arm() {
+    let msg = ClientMessage {
+        message: Some(client_message::Message::LeaveRequest(LeaveRequest {})),
+        ..Default::default()
+    };
+    let bytes = msg.encode_to_vec();
+    assert_eq!(top_level_field_numbers(&bytes), vec![13]);
+    let decoded = ClientMessage::decode(bytes.as_slice()).expect("decode");
+    assert!(
+        matches!(
+            decoded.message,
+            Some(client_message::Message::LeaveRequest(_))
+        ),
+        "an empty LeaveRequest must decode as the set arm, got {:?}",
+        decoded.message
+    );
+}

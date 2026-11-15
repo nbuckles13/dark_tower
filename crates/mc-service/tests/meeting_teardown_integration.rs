@@ -27,7 +27,7 @@ use mc_service::redis::MhEndpointInfo;
 use mc_test_utils::mock_mh::{MediaHandlerStub, MediaHandlerStubHandle, StubEvent};
 use proto_gen::dark_tower::internal::v1::ReleaseCause;
 use test_common::accept_loop_rig::AcceptLoopRig;
-use test_common::media_session::{audio_slots, capability_frame, join_as};
+use test_common::media_session::{audio_slots, capability_frame, join_as, leave_frame};
 use test_common::{
     build_test_stack_with_timers, client_media_config, seed_meeting_with_handlers,
     RecordingMeetingEnded, TestStackHandles,
@@ -35,7 +35,7 @@ use test_common::{
 
 /// The rig and stack, with a real `MhClient` and a recording GC notifier.
 async fn stack(label: &str) -> (TestStackHandles, AcceptLoopRig, Arc<RecordingMeetingEnded>) {
-    stack_with_timers(label, MeetingTimers::default()).await
+    stack_with_timers(label, MeetingTimers::for_tests()).await
 }
 
 /// [`stack`] with explicit meeting lifetime timers (the join window), handed
@@ -488,7 +488,11 @@ async fn a_create_during_teardown_waits_for_the_release_then_succeeds() {
     }
     stack
         .controller_handle
-        .create_meeting("td-fence".to_string(), test_common::default_handler_set())
+        .create_meeting(
+            "td-fence".to_string(),
+            ::common::meeting_lifecycle::AssignmentId::new_v4(),
+            test_common::default_handler_set(),
+        )
         .await
         .expect("the parked create succeeds once the release is out");
     assert!(
@@ -512,7 +516,7 @@ const TEST_JOIN_WINDOW: Duration = Duration::from_secs(3);
 fn join_window_timers() -> MeetingTimers {
     MeetingTimers {
         join_window: TEST_JOIN_WINDOW,
-        ..MeetingTimers::default()
+        ..MeetingTimers::for_tests()
     }
 }
 
@@ -685,5 +689,66 @@ async fn a_clean_last_leave_still_ends_immediately_as_a_leave() {
         .assert_delta(1);
     snap.counter("mc_meetings_ended_total")
         .with_labels(&[("cause", "empty"), ("reason", "join_window_expired")])
+        .assert_delta(0);
+}
+
+/// The deliberate leave over a REAL session (P4): `LeaveRequest` removes the
+/// sender at once — the other participant sees `ParticipantLeft{Voluntary}` —
+/// and MC closes the leaver's session itself (the client's acknowledgement).
+/// The last leaver's `LeaveRequest` ends the meeting immediately, with the
+/// leaver never closing its own transport: nothing waits on a close.
+#[tokio::test]
+async fn a_leave_request_removes_at_once_and_the_last_one_ends_the_meeting() {
+    use proto_gen::dark_tower::signaling::v1::{server_message, LeaveReason};
+
+    let stub = MediaHandlerStub::builder()
+        .programs_successfully("mh-leave-req")
+        .spawn()
+        .await;
+    let (stack, rig, notifier) = stack("leave-request").await;
+    let assignment_id =
+        seed_meeting_with_handlers(&stack, "lr", vec![endpoint("mh-leave-req", &stub)]).await;
+    let snap = MetricAssertion::snapshot();
+    let mut a = join_as(&rig, &stack, "lr", "user-a").await;
+    let mut b = join_as(&rig, &stack, "lr", "user-b").await;
+    let a_id = a.participant_id.clone();
+
+    a.write(leave_frame()).await;
+    assert!(
+        a.closed_by_mc_within(Duration::from_secs(5)).await,
+        "MC closes the leaver's session after the LeaveRequest"
+    );
+    let mut left = None;
+    while let Some(m) = b.next_server_message().await {
+        if let Some(server_message::Message::ParticipantLeft(l)) = m.message {
+            left = Some(l);
+            break;
+        }
+    }
+    let left = left.expect("B sees A leave");
+    assert_eq!(left.participant_id, a_id);
+    assert_eq!(left.reason, LeaveReason::Voluntary as i32);
+
+    b.write(leave_frame()).await;
+    assert_eq!(
+        notifier.wait_for(1, Duration::from_secs(5)).await,
+        vec!["lr".to_string()],
+        "the last leaver's LeaveRequest ends the meeting at once"
+    );
+    // The end notify names the incarnation the meeting was CREATED with (the
+    // MC half of GC's fence; the duplicate-refused and parked-create cases are
+    // pinned in `actors::controller` unit tests).
+    assert_eq!(
+        notifier.ended_with_ids(),
+        vec![("lr".to_string(), assignment_id)]
+    );
+    snap.counter("mc_meetings_ended_total")
+        .with_labels(&[("cause", "empty"), ("reason", "last_participant_left")])
+        .assert_delta(1);
+    snap.counter("mc_participant_leaves_total")
+        .with_labels(&[("reason", "voluntary")])
+        .assert_delta(2);
+    snap.counter("mc_participant_leaves_total")
+        .with_labels(&[("reason", "timeout")])
         .assert_delta(0);
 }

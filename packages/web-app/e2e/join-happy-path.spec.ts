@@ -46,6 +46,7 @@ import {
   waitForMcConnectedStatusAbove,
   waitForMcParticipantLeavesAbove,
 } from './mcMetrics.js';
+import { waitForLeaveAcknowledged } from './cohortContexts.js';
 
 test.describe('join happy path (R-40/R-44/R-46)', () => {
   test('token-based join with active/active media (assertions a/b/d/e)', async ({ page }) => {
@@ -181,8 +182,8 @@ test.describe('join happy path (R-40/R-44/R-46)', () => {
 
       // Drive the demo's OWN teardown for a DETERMINISTIC clean close: navigating
       // away from the join view unmounts JoinMeeting → onDestroy →
-      // session.disconnect() → a clean CONNECTION_CLOSE (MC classifies ClientClosed
-      // → voluntary → immediate leave, no grace). Waiting for the create view
+      // session.disconnect() → an explicit LeaveRequest (MC removes the
+      // participant at once → voluntary, no grace). Waiting for the create view
       // confirms the unmount fired. Then close the context (still the task's
       // "close the second context"; the disconnect makes it fast + deterministic).
       await leaverPage.getByTestId('nav-create').click();
@@ -190,12 +191,14 @@ test.describe('join happy path (R-40/R-44/R-46)', () => {
         leaverPage.getByTestId('meeting-title'),
         'leaver: create view must render (JoinMeeting unmounted → disconnect fired)',
       ).toBeVisible();
+      // The LeaveRequest is acknowledged before the context goes away.
+      await waitForLeaveAcknowledged(leaverPage);
       await leaverContext.close();
 
       // Context A observes the departure three ways: the bus event, the roster
       // DOM removal, and MC's server-side leave counter (all-reasons monotonic
-      // sum — see mcMetrics.ts; 90s ceiling is grace-path insurance, common path
-      // ~1 scrape interval given the clean close).
+      // sum — see mcMetrics.ts; common path ~1 scrape interval since the leave
+      // is immediate; its ceiling is liveness insurance only).
       await waitForParticipantLeft(page, departedId);
       await expectRosterMissing(page, departedId);
       await waitForMcParticipantLeavesAbove(leavesBaseline);

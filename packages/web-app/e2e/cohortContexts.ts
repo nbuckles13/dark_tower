@@ -9,16 +9,11 @@
 //     makes the meeting's creator host — `crates/gc-service/src/handlers/
 //     meetings.rs`), never shared across tests;
 //   * every context left GRACEFULLY — the demo's own teardown (`nav-create`
-//     unmounts the join view -> `session.disconnect()` -> the MH transports and
-//     then signalling close cleanly) — and then closed, in a `finally`, on
-//     failure too. That is the user's path, and it drops the participant's MH
-//     connections (so its edges) at once. RESIDUAL, recorded in main.md and
-//     docs/TODO.md: MC today classifies this clean close as `server_initiated`
-//     and still holds the participant through its disconnect grace (30 s) before
-//     removing it from the roster, so a previous meeting's participant can
-//     outlive the test that made it; the S1 diagnostic's budget verdict is the
-//     backstop if that ever reaches MH admission. Becomes a no-op once MC
-//     classifies the close as `ClientClosed`;
+//     unmounts the join view -> `session.disconnect()` -> an explicit
+//     LeaveRequest on signalling, then the transports close) — and then closed,
+//     in a `finally`, on failure too. That is the user's path: MC removes the
+//     participant from the roster at once (no disconnect grace; meeting-end
+//     safety devloop) and its MH connections (so its edges) drop at once;
 //   * peak concurrent contexts = the cohort size (4 at N=3), never stacked: a
 //     test closes its own before the next opens;
 //   * per-context test levers (`src/lib/testLevers.ts`) arrive by init script,
@@ -182,8 +177,8 @@ async function recordedJoin<T>(
 
 /**
  * Leave the meeting the way a user does — the demo's own teardown — and wait
- * for the SDK to report it disconnecting, so the clean close is on its way
- * before the context goes. A page that never joined just navigates; a page that
+ * for the SDK to report the leave ACKNOWLEDGED by MC (see
+ * {@link waitForLeaveAcknowledged}), so the leave has landed before the context goes. A page that never joined just navigates; a page that
  * joined and fails to tear down THROWS.
  */
 export async function leaveGracefully(page: Page): Promise<void> {
@@ -196,19 +191,38 @@ export async function leaveGracefully(page: Page): Promise<void> {
   );
   await page.getByTestId('nav-create').click({ timeout: 5_000 });
   if (!joined) return;
+  await waitForLeaveAcknowledged(page);
+}
+
+/**
+ * Wait for the SDK's leave OUTCOME after a `disconnect()` and ASSERT it is
+ * `acknowledged` — MC closed the session after the LeaveRequest, so it removed
+ * the participant at once. `disconnected` alone is not enough: the SDK also
+ * reaches it at the 1 s leave bound or on a failed write, after which MC holds
+ * the participant through its disconnect grace (a lost leave), and a spec whose
+ * budget is near that grace would then pass slowly instead of failing. LOUD on
+ * any other outcome, and on timeout. Must run before the context closes.
+ */
+export async function waitForLeaveAcknowledged(page: Page): Promise<void> {
+  let outcome: unknown;
   try {
-    await page.waitForFunction(
-      () =>
-        window.__darktower_test__?.events.some(
-          (e) => e['type'] === 'stateChange' && e['state'] === 'disconnecting',
-        ) ?? false,
+    const handle = await page.waitForFunction(
+      () => window.__darktower_test__?.events.find((e) => e['type'] === 'left')?.['outcome'],
       undefined,
-      { timeout: 5_000 },
+      { timeout: 10_000 },
     );
+    outcome = await handle.jsonValue();
   } catch {
     throw new Error(
-      'graceful leave: the page joined but the SDK never reported disconnecting within 5 s ' +
+      'graceful leave: the page joined but the SDK reported no leave outcome within 10 s ' +
         'after the join view unmounted — its session may still be live',
+    );
+  }
+  if (outcome !== 'acknowledged') {
+    throw new Error(
+      `graceful leave: the leave was NOT acknowledged by MC (outcome ${String(outcome)}): MC ` +
+        'did not close the session after the LeaveRequest, so it is holding the participant ' +
+        'through its disconnect grace (a lost leave)',
     );
   }
 }

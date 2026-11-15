@@ -4,7 +4,8 @@
 //! fields are redacted in Debug output.
 
 use crate::mh_endpoint_policy::MhEndpointAllowlist;
-use common::jwt::{DEFAULT_CLOCK_SKEW, MAX_CLOCK_SKEW};
+use axum::http::HeaderValue;
+use common::jwt::MAX_CLOCK_SKEW;
 use common::secret::SecretString;
 use std::collections::HashMap;
 use std::env;
@@ -12,54 +13,174 @@ use std::fmt;
 use std::time::Duration;
 use thiserror::Error;
 
-/// Default rate limit in requests per minute.
-pub const DEFAULT_RATE_LIMIT_RPM: u32 = 100;
-
-/// Default gRPC bind address.
-pub const DEFAULT_GRPC_BIND_ADDRESS: &str = "0.0.0.0:50051";
-
-/// Default MC staleness threshold in seconds.
-pub const DEFAULT_MC_STALENESS_THRESHOLD_SECONDS: u64 = 30;
-
 /// Default GC instance ID prefix.
 pub const DEFAULT_GC_ID_PREFIX: &str = "gc";
 
-/// Default in-cluster OTel collector endpoint for the telemetry proxy (R-2).
-///
-/// This is the **bare base** (scheme + host + port, no path, no trailing slash).
-/// The telemetry forwarder appends the per-signal suffix `/v1/metrics` or
-/// `/v1/traces` itself, so this value must NOT include a `/v1/...` path.
-/// (Contract with R-59/INFRA-OTEL: the env var holds the bare base; GC owns the
-/// suffix. Distinct from R-55's `otel_endpoint`, which is the gRPC `:4317`
-/// endpoint for GC's own span export — this is the HTTP `:4318` endpoint the
-/// `/api/v1/telemetry` proxy forwards to.)
-///
-/// Namespace corrected 2026-07-03 (task #26, `dark-tower` not `default` — every
-/// service in this cluster lives in `dark-tower`; see `docs/TODO.md`
-/// §Observability Debt, deferred from task #28 to land alongside this file's
-/// other R-55 edits). The GC ConfigMap always sets `OTEL_COLLECTOR_ENDPOINT`
-/// explicitly (to the correct value), so this constant is the unused
-/// compiled-in fallback in Kind — this fix closes a latent footgun, not a live bug.
-pub const DEFAULT_OTEL_COLLECTOR_ENDPOINT: &str =
-    "http://otel-collector.dark-tower.svc.cluster.local:4318";
-
-/// Default maximum telemetry proxy payload size in bytes (256 KiB).
-pub const DEFAULT_TELEMETRY_PROXY_MAX_BYTES: usize = 256 * 1024;
-
-/// Default per-user telemetry proxy rate limit (requests per minute).
-pub const DEFAULT_TELEMETRY_PROXY_RATE_LIMIT_PER_MINUTE: u32 = 60;
-
 // =============================================================================
-// OpenTelemetry Configuration Defaults & Bounds (R-55)
+// MC liveness and assignment commit budget (ADR-0010 §3)
 // =============================================================================
 
-/// Default head-sampling ratio when `OTEL_SAMPLE_RATE` is unset (1.0 = sample all).
-/// The `[0.0, 1.0]` range is owned + enforced by `init_otel` (common), not here —
-/// config parsing is parse-only (single owner for the bound; mirrors AC's task
-/// #25 frozen decision).
-pub const DEFAULT_OTEL_SAMPLE_RATE: f64 = 1.0;
-/// Default deployment environment when `DEPLOYMENT_ENVIRONMENT` is unset.
-pub const DEFAULT_DEPLOYMENT_ENVIRONMENT: &str = "development";
+/// Upper bound on `GC_ASSIGN_COMMIT_BUDGET_MS`: half of MC's shortest join
+/// window. The other half is margin for what the budget cannot police
+/// (rationale at [`common::meeting_lifecycle::MIN_MEETING_JOIN_WINDOW`]).
+pub const MAX_ASSIGN_COMMIT_BUDGET: Duration = Duration::from_millis(
+    common::meeting_lifecycle::MIN_MEETING_JOIN_WINDOW.as_millis() as u64 / 2,
+);
+
+/// MC liveness and the assignment write budget. Both REQUIRED.
+///
+/// - `MC_STALENESS_THRESHOLD_SECONDS` (> the MC fast-heartbeat interval GC
+///   pushes, 10 s): THE MC liveness threshold. The
+///   health checker marks MCs stale with it, and every assignment-row
+///   decision (join reuse, failover, cleanup backstop) asks "is this MC's
+///   heartbeat younger than it?" — one value, so they cannot disagree.
+/// - `GC_ASSIGN_COMMIT_BUDGET_MS` (1 ..= [`MAX_ASSIGN_COMMIT_BUDGET`]): how
+///   long after GC SENDS `AssignMeetingWithMh` the assignment row may still
+///   commit. Past it the row is not written and the next MC is tried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct McAssignmentConfig {
+    mc_staleness: Duration,
+    commit_budget: Duration,
+}
+
+impl McAssignmentConfig {
+    /// Build from explicit values (tests, and [`Self::from_vars`]).
+    ///
+    /// # Errors
+    ///
+    /// `InvalidMcAssignmentConfig` / `InvalidMcStalenessThreshold` naming the
+    /// out-of-range value.
+    pub fn new(mc_staleness: Duration, commit_budget: Duration) -> Result<Self, ConfigError> {
+        if mc_staleness < Duration::from_secs(1) {
+            return Err(ConfigError::InvalidMcStalenessThreshold(
+                "MC_STALENESS_THRESHOLD_SECONDS must be greater than 0".to_string(),
+            ));
+        }
+        // A threshold at or below the heartbeat cadence GC pushes to MCs
+        // would mark every live MC stale between beats, and liveness-keyed
+        // failover would then split live meetings.
+        let heartbeat =
+            Duration::from_millis(crate::grpc::mc_service::DEFAULT_FAST_HEARTBEAT_INTERVAL_MS);
+        if mc_staleness <= heartbeat {
+            return Err(ConfigError::InvalidMcStalenessThreshold(format!(
+                "MC_STALENESS_THRESHOLD_SECONDS must exceed the MC fast-heartbeat interval ({} s), got {}",
+                heartbeat.as_secs(),
+                mc_staleness.as_secs()
+            )));
+        }
+        if commit_budget.is_zero() || commit_budget > MAX_ASSIGN_COMMIT_BUDGET {
+            return Err(ConfigError::InvalidMcAssignmentConfig(format!(
+                "GC_ASSIGN_COMMIT_BUDGET_MS must be in [1, {}], got {}",
+                MAX_ASSIGN_COMMIT_BUDGET.as_millis(),
+                commit_budget.as_millis()
+            )));
+        }
+        Ok(Self {
+            mc_staleness,
+            commit_budget,
+        })
+    }
+
+    /// Parse the two REQUIRED keys.
+    ///
+    /// # Errors
+    ///
+    /// `MissingEnvVar` for an absent key; the typed variants for a value that
+    /// does not parse or is out of range.
+    pub fn from_vars(vars: &HashMap<String, String>) -> Result<Self, ConfigError> {
+        let staleness_raw = vars.get("MC_STALENESS_THRESHOLD_SECONDS").ok_or_else(|| {
+            ConfigError::MissingEnvVar("MC_STALENESS_THRESHOLD_SECONDS".to_string())
+        })?;
+        let staleness_secs: u64 = parse_positive(
+            "MC_STALENESS_THRESHOLD_SECONDS",
+            staleness_raw,
+            ConfigError::InvalidMcStalenessThreshold,
+        )?;
+        let budget_raw = vars
+            .get("GC_ASSIGN_COMMIT_BUDGET_MS")
+            .ok_or_else(|| ConfigError::MissingEnvVar("GC_ASSIGN_COMMIT_BUDGET_MS".to_string()))?;
+        let budget_ms: u64 = parse_positive(
+            "GC_ASSIGN_COMMIT_BUDGET_MS",
+            budget_raw,
+            ConfigError::InvalidMcAssignmentConfig,
+        )?;
+        Self::new(
+            Duration::from_secs(staleness_secs),
+            Duration::from_millis(budget_ms),
+        )
+    }
+
+    /// The MC liveness threshold.
+    #[must_use]
+    pub fn mc_staleness(&self) -> Duration {
+        self.mc_staleness
+    }
+
+    /// The accept->commit budget.
+    #[must_use]
+    pub fn commit_budget(&self) -> Duration {
+        self.commit_budget
+    }
+}
+
+// =============================================================================
+// Assignment cleanup (ADR-0010 §3 item 3)
+// =============================================================================
+
+/// Assignment cleanup job settings. All three REQUIRED.
+///
+/// - `GC_CLEANUP_INTERVAL_SECONDS` (>= 1): check interval (0 would panic
+///   `tokio::time::interval`).
+/// - `GC_INACTIVITY_HOURS` (>= 1): age floor before the backstop may end a
+///   row whose MC is no longer alive. Not an inactivity timer: GC has no
+///   participant data, and the backstop's safety property is MC liveness.
+/// - `GC_RETENTION_DAYS` (>= 1): retention before ended rows are hard-deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AssignmentCleanupConfig {
+    /// Cleanup check interval in seconds.
+    pub check_interval_seconds: u64,
+    /// Minimum assignment age (hours) before the backstop may end it.
+    pub inactivity_hours: i32,
+    /// Days to retain ended assignments before hard-deleting.
+    pub retention_days: i32,
+}
+
+impl AssignmentCleanupConfig {
+    /// Parse the three REQUIRED keys.
+    ///
+    /// # Errors
+    ///
+    /// `MissingEnvVar` for an absent key; `InvalidAssignmentCleanupConfig`
+    /// naming the key for a value that does not parse or is below 1.
+    pub fn from_vars(vars: &HashMap<String, String>) -> Result<Self, ConfigError> {
+        let interval_raw = vars
+            .get("GC_CLEANUP_INTERVAL_SECONDS")
+            .ok_or_else(|| ConfigError::MissingEnvVar("GC_CLEANUP_INTERVAL_SECONDS".to_string()))?;
+        let inactivity_raw = vars
+            .get("GC_INACTIVITY_HOURS")
+            .ok_or_else(|| ConfigError::MissingEnvVar("GC_INACTIVITY_HOURS".to_string()))?;
+        let retention_raw = vars
+            .get("GC_RETENTION_DAYS")
+            .ok_or_else(|| ConfigError::MissingEnvVar("GC_RETENTION_DAYS".to_string()))?;
+        Ok(Self {
+            check_interval_seconds: parse_positive(
+                "GC_CLEANUP_INTERVAL_SECONDS",
+                interval_raw,
+                ConfigError::InvalidAssignmentCleanupConfig,
+            )?,
+            inactivity_hours: parse_positive(
+                "GC_INACTIVITY_HOURS",
+                inactivity_raw,
+                ConfigError::InvalidAssignmentCleanupConfig,
+            )?,
+            retention_days: parse_positive(
+                "GC_RETENTION_DAYS",
+                retention_raw,
+                ConfigError::InvalidAssignmentCleanupConfig,
+            )?,
+        })
+    }
+}
 
 // =============================================================================
 // MH registry freshness and sizing (ADR-0039 §3, §10; R-23, R-24, R-26)
@@ -432,12 +553,18 @@ pub struct Config {
     /// Rate limit in requests per minute per client.
     pub rate_limit_rpm: u32,
 
-    /// gRPC server bind address (default: "0.0.0.0:50051").
+    /// gRPC server bind address.
     pub grpc_bind_address: String,
 
-    /// MC staleness threshold in seconds (default: 30).
-    /// Controllers that haven't sent a heartbeat within this time are marked unhealthy.
-    pub mc_staleness_threshold_seconds: u64,
+    /// MC liveness threshold and the accept->commit budget for assignment.
+    pub mc_assignment: McAssignmentConfig,
+
+    /// Assignment cleanup job (backstop + retention).
+    pub assignment_cleanup: AssignmentCleanupConfig,
+
+    /// Graceful-shutdown drain after SIGTERM, before exit (`GC_DRAIN_SECONDS`,
+    /// [0, [`MAX_DRAIN`]]; 0 skips the drain).
+    pub drain: Duration,
 
     /// Unique identifier for this GC instance.
     /// Used for assignment tracking and debugging.
@@ -454,15 +581,14 @@ pub struct Config {
     /// **Bare base** (scheme + host + port, no path, no trailing slash). The
     /// forwarder appends `/v1/metrics` or `/v1/traces` per signal. An empty
     /// string disables the proxy (the route returns 503 rather than forwarding).
-    /// See [`DEFAULT_OTEL_COLLECTOR_ENDPOINT`].
     pub otel_collector_endpoint: String,
 
-    /// Maximum accepted telemetry proxy payload size in bytes (default 256 KiB).
+    /// Maximum accepted telemetry proxy payload size in bytes.
     /// Enforced on real body bytes (oversize → 413).
     pub telemetry_proxy_max_bytes: usize,
 
     /// Per-user (JWT `sub`) telemetry proxy rate limit, requests per minute
-    /// (default 60). Exceeding it → 429.
+    /// Exceeding it → 429.
     pub telemetry_proxy_rate_limit_per_minute: u32,
 
     /// Whether to initialize the OpenTelemetry SDK (R-55). Default `false`.
@@ -473,7 +599,7 @@ pub struct Config {
     pub otel_enabled: bool,
     /// OTLP-gRPC collector endpoint (env `OTLP_ENDPOINT`). Only consumed when
     /// `otel_enabled` is `true`; must be a parseable `http(s)://host:port` URL.
-    /// Distinct from [`DEFAULT_OTEL_COLLECTOR_ENDPOINT`] (the `:4318`
+    /// Distinct from `otel_collector_endpoint` (the `:4318`
     /// OTLP-HTTP endpoint the `/api/v1/telemetry` proxy forwards to) — this is
     /// the `:4317` OTLP-gRPC endpoint for GC's own span export.
     pub otel_endpoint: String,
@@ -481,17 +607,17 @@ pub struct Config {
     /// is the authoritative validator and re-checks this bound at startup.
     pub otel_sample_rate: f64,
     /// Deployment environment for the `deployment.environment` OTel resource
-    /// attribute (env `DEPLOYMENT_ENVIRONMENT`, ADR-0011). Default `development`.
+    /// attribute (env `DEPLOYMENT_ENVIRONMENT`, ADR-0011).
     pub environment: String,
 
     /// CORS allowlist for the browser SDK / Vite demo (R-1/R-3). Loaded from
-    /// `CORS_ALLOWED_ORIGINS` (comma-separated). Explicit origins only — the
-    /// router's `CorsLayer` NEVER uses `*`. An EMPTY vec (the default) is
-    /// fail-closed: no origin is allowed, so no `Access-Control-Allow-Origin`
-    /// is ever emitted. Individual entries that fail to parse as a
-    /// `HeaderValue` are dropped (with a warn) at `CorsLayer` build time, never
-    /// widening the allowlist. Not secret — shown in Debug output.
-    pub cors_allowed_origins: Vec<String>,
+    /// `CORS_ALLOWED_ORIGINS` (comma-separated) and parsed ONCE here into
+    /// header values. Explicit origins only — the router's `CorsLayer` NEVER
+    /// uses `*`. Unset or EMPTY is fail-closed: no origin is allowed, so no
+    /// `Access-Control-Allow-Origin` is ever emitted. An entry that is not a
+    /// valid header value fails startup (never silently dropped). Not secret —
+    /// shown in Debug output.
+    pub cors_allowed_origins: Vec<HeaderValue>,
 
     /// MH registry timing and sizing (ADR-0039 §10). Not secret.
     pub mh_registry: MhRegistryConfig,
@@ -512,10 +638,9 @@ impl fmt::Debug for Config {
             .field("jwt_clock_skew_seconds", &self.jwt_clock_skew_seconds)
             .field("rate_limit_rpm", &self.rate_limit_rpm)
             .field("grpc_bind_address", &self.grpc_bind_address)
-            .field(
-                "mc_staleness_threshold_seconds",
-                &self.mc_staleness_threshold_seconds,
-            )
+            .field("mc_assignment", &self.mc_assignment)
+            .field("assignment_cleanup", &self.assignment_cleanup)
+            .field("drain", &self.drain)
             .field("gc_id", &self.gc_id)
             .field("gc_client_id", &self.gc_client_id)
             .field("gc_client_secret", &"[REDACTED]")
@@ -567,6 +692,84 @@ pub enum ConfigError {
 
     #[error("Invalid assignment cleanup configuration: {0}")]
     InvalidAssignmentCleanupConfig(String),
+
+    #[error("Invalid MC assignment configuration: {0}")]
+    InvalidMcAssignmentConfig(String),
+
+    #[error("Invalid CORS configuration: {0}")]
+    InvalidCorsConfig(String),
+
+    #[error("Invalid drain configuration: {0}")]
+    InvalidDrainConfig(String),
+}
+
+/// Parse `CORS_ALLOWED_ORIGINS`: comma-separated, trimmed, empty segments
+/// dropped; unset or empty = the fail-closed empty allowlist (a mode, not a
+/// substituted value). An entry that does not parse as a header value is a
+/// startup error naming it: dropping it would let a typo silently narrow
+/// the allowlist.
+fn cors_allowed_origins_from_vars(
+    vars: &HashMap<String, String>,
+) -> Result<Vec<HeaderValue>, ConfigError> {
+    let Some(raw) = vars.get("CORS_ALLOWED_ORIGINS") else {
+        return Ok(Vec::new());
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|o| !o.is_empty())
+        .map(|o| {
+            o.parse::<HeaderValue>().map_err(|e| {
+                ConfigError::InvalidCorsConfig(format!(
+                    "CORS_ALLOWED_ORIGINS entry {o:?} is not a valid header value: {e}"
+                ))
+            })
+        })
+        .collect()
+}
+
+/// Upper bound on `GC_DRAIN_SECONDS`. The drain runs after SIGTERM and must
+/// end before Kubernetes' SIGKILL at the Deployment's
+/// `terminationGracePeriodSeconds` (35), leaving room to exit;
+/// `gc-test-utils` asserts the shipped manifest keeps that margin.
+pub const MAX_DRAIN: Duration = Duration::from_secs(30);
+
+/// Parse the REQUIRED `GC_DRAIN_SECONDS` (0 = skip the drain). A value that
+/// does not parse or exceeds [`MAX_DRAIN`] fails startup naming the key,
+/// never silently becoming a default.
+fn drain_from_vars(vars: &HashMap<String, String>) -> Result<Duration, ConfigError> {
+    let raw = vars
+        .get("GC_DRAIN_SECONDS")
+        .ok_or_else(|| ConfigError::MissingEnvVar("GC_DRAIN_SECONDS".to_string()))?;
+    let secs: u64 = raw.trim().parse().map_err(|e| {
+        ConfigError::InvalidDrainConfig(format!(
+            "GC_DRAIN_SECONDS must be an integer in [0, {}], got '{raw}': {e}",
+            MAX_DRAIN.as_secs()
+        ))
+    })?;
+    if secs > MAX_DRAIN.as_secs() {
+        return Err(ConfigError::InvalidDrainConfig(format!(
+            "GC_DRAIN_SECONDS must be at most {}, got {secs}",
+            MAX_DRAIN.as_secs()
+        )));
+    }
+    Ok(Duration::from_secs(secs))
+}
+
+/// Parse a REQUIRED integer that must be `> 0`; errors name the key.
+fn parse_positive<T>(key: &str, raw: &str, err: fn(String) -> ConfigError) -> Result<T, ConfigError>
+where
+    T: std::str::FromStr + PartialOrd + Default,
+    T::Err: std::fmt::Display,
+{
+    let value: T = raw.trim().parse().map_err(|e| {
+        err(format!(
+            "{key} must be a valid positive integer, got '{raw}': {e}"
+        ))
+    })?;
+    if value <= T::default() {
+        return Err(err(format!("{key} must be greater than 0")));
+    }
+    Ok(value)
 }
 
 impl Config {
@@ -582,103 +785,72 @@ impl Config {
             .ok_or_else(|| ConfigError::MissingEnvVar("DATABASE_URL".to_string()))?
             .clone();
 
+        // Every behaviour/topology key below is REQUIRED: missing =
+        // `MissingEnvVar`, no Rust default, value in config.env, hard ref in
+        // deployment.yaml. A default would silently substitute a value the
+        // operator never chose (CLAUDE.md "fail loudly"). One-line
+        // `MissingEnvVar(` + literal per key for `dt-guard env-config`.
         let bind_address = vars
             .get("BIND_ADDRESS")
-            .cloned()
-            .unwrap_or_else(|| "0.0.0.0:8080".to_string());
+            .ok_or_else(|| ConfigError::MissingEnvVar("BIND_ADDRESS".to_string()))?
+            .clone();
 
         let region = vars
             .get("GC_REGION")
-            .cloned()
-            .unwrap_or_else(|| "us-east-1".to_string());
+            .ok_or_else(|| ConfigError::MissingEnvVar("GC_REGION".to_string()))?
+            .clone();
 
         let ac_jwks_url = vars
             .get("AC_JWKS_URL")
-            .cloned()
-            .unwrap_or_else(|| "http://localhost:8082/.well-known/jwks.json".to_string());
+            .ok_or_else(|| ConfigError::MissingEnvVar("AC_JWKS_URL".to_string()))?
+            .clone();
 
         let ac_internal_url = vars
             .get("AC_INTERNAL_URL")
-            .cloned()
-            .unwrap_or_else(|| "http://localhost:8082".to_string());
+            .ok_or_else(|| ConfigError::MissingEnvVar("AC_INTERNAL_URL".to_string()))?
+            .clone();
 
-        // Parse JWT clock skew tolerance with validation
-        let jwt_clock_skew_seconds = if let Some(value_str) = vars.get("JWT_CLOCK_SKEW_SECONDS") {
-            let value: i64 = value_str.parse().map_err(|e| {
-                ConfigError::InvalidJwtClockSkew(format!(
-                    "JWT_CLOCK_SKEW_SECONDS must be a valid integer, got '{}': {}",
-                    value_str, e
-                ))
-            })?;
+        // JWT clock skew tolerance: (0, MAX_CLOCK_SKEW].
+        let jwt_clock_skew_raw = vars
+            .get("JWT_CLOCK_SKEW_SECONDS")
+            .ok_or_else(|| ConfigError::MissingEnvVar("JWT_CLOCK_SKEW_SECONDS".to_string()))?;
+        let jwt_clock_skew_seconds: i64 = jwt_clock_skew_raw.parse().map_err(|e| {
+            ConfigError::InvalidJwtClockSkew(format!(
+                "JWT_CLOCK_SKEW_SECONDS must be a valid integer, got '{jwt_clock_skew_raw}': {e}"
+            ))
+        })?;
+        if jwt_clock_skew_seconds <= 0 {
+            return Err(ConfigError::InvalidJwtClockSkew(format!(
+                "JWT_CLOCK_SKEW_SECONDS must be positive, got {jwt_clock_skew_seconds}"
+            )));
+        }
+        if jwt_clock_skew_seconds > MAX_CLOCK_SKEW.as_secs() as i64 {
+            return Err(ConfigError::InvalidJwtClockSkew(format!(
+                "JWT_CLOCK_SKEW_SECONDS must not exceed {} seconds, got {jwt_clock_skew_seconds}",
+                MAX_CLOCK_SKEW.as_secs()
+            )));
+        }
 
-            if value <= 0 {
-                return Err(ConfigError::InvalidJwtClockSkew(format!(
-                    "JWT_CLOCK_SKEW_SECONDS must be positive, got {}",
-                    value
-                )));
-            }
+        let rate_limit_raw = vars
+            .get("RATE_LIMIT_RPM")
+            .ok_or_else(|| ConfigError::MissingEnvVar("RATE_LIMIT_RPM".to_string()))?;
+        let rate_limit_rpm: u32 = parse_positive(
+            "RATE_LIMIT_RPM",
+            rate_limit_raw,
+            ConfigError::InvalidRateLimit,
+        )?;
 
-            if value > MAX_CLOCK_SKEW.as_secs() as i64 {
-                return Err(ConfigError::InvalidJwtClockSkew(format!(
-                    "JWT_CLOCK_SKEW_SECONDS must not exceed {} seconds, got {}",
-                    MAX_CLOCK_SKEW.as_secs(),
-                    value
-                )));
-            }
-
-            value
-        } else {
-            DEFAULT_CLOCK_SKEW.as_secs() as i64
-        };
-
-        // Parse rate limit with validation
-        let rate_limit_rpm = if let Some(value_str) = vars.get("RATE_LIMIT_RPM") {
-            let value: u32 = value_str.parse().map_err(|e| {
-                ConfigError::InvalidRateLimit(format!(
-                    "RATE_LIMIT_RPM must be a valid positive integer, got '{}': {}",
-                    value_str, e
-                ))
-            })?;
-
-            if value == 0 {
-                return Err(ConfigError::InvalidRateLimit(
-                    "RATE_LIMIT_RPM must be greater than 0".to_string(),
-                ));
-            }
-
-            value
-        } else {
-            DEFAULT_RATE_LIMIT_RPM
-        };
-
-        // Parse gRPC bind address
         let grpc_bind_address = vars
             .get("GC_GRPC_BIND_ADDRESS")
-            .cloned()
-            .unwrap_or_else(|| DEFAULT_GRPC_BIND_ADDRESS.to_string());
+            .ok_or_else(|| ConfigError::MissingEnvVar("GC_GRPC_BIND_ADDRESS".to_string()))?
+            .clone();
 
-        // Parse MC staleness threshold with validation
-        let mc_staleness_threshold_seconds =
-            if let Some(value_str) = vars.get("MC_STALENESS_THRESHOLD_SECONDS") {
-                let value: u64 = value_str.parse().map_err(|e| {
-                    ConfigError::InvalidMcStalenessThreshold(format!(
-                    "MC_STALENESS_THRESHOLD_SECONDS must be a valid positive integer, got '{}': {}",
-                    value_str, e
-                ))
-                })?;
+        let mc_assignment = McAssignmentConfig::from_vars(vars)?;
+        let assignment_cleanup = AssignmentCleanupConfig::from_vars(vars)?;
+        let drain = drain_from_vars(vars)?;
 
-                if value == 0 {
-                    return Err(ConfigError::InvalidMcStalenessThreshold(
-                        "MC_STALENESS_THRESHOLD_SECONDS must be greater than 0".to_string(),
-                    ));
-                }
-
-                value
-            } else {
-                DEFAULT_MC_STALENESS_THRESHOLD_SECONDS
-            };
-
-        // Generate GC instance ID
+        // Generate GC instance ID (an identity derivation, not a substituted
+        // value: unset means "derive a unique one").
         let gc_id = vars.get("GC_ID").cloned().unwrap_or_else(|| {
             // Generate a unique ID based on hostname and UUID suffix
             let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string());
@@ -699,66 +871,45 @@ impl Config {
             .ok_or_else(|| ConfigError::MissingEnvVar("GC_CLIENT_SECRET".to_string()))?
             .clone();
 
-        // Telemetry proxy: in-cluster OTel collector endpoint (R-2).
-        // Bare base — forwarder appends the per-signal suffix. Empty string is
-        // permitted and disables the proxy (route returns 503).
+        // Telemetry proxy: in-cluster OTel collector endpoint (R-2). Bare
+        // base — the forwarder appends the per-signal suffix. REQUIRED; an
+        // explicitly EMPTY value is the stated "proxy disabled" mode (the
+        // route returns 503).
         let otel_collector_endpoint = vars
             .get("OTEL_COLLECTOR_ENDPOINT")
-            .cloned()
-            .unwrap_or_else(|| DEFAULT_OTEL_COLLECTOR_ENDPOINT.to_string());
+            .ok_or_else(|| ConfigError::MissingEnvVar("OTEL_COLLECTOR_ENDPOINT".to_string()))?
+            .clone();
 
-        // Telemetry proxy max payload size with validation (must be > 0).
-        let telemetry_proxy_max_bytes =
-            if let Some(value_str) = vars.get("TELEMETRY_PROXY_MAX_BYTES") {
-                let value: usize = value_str.parse().map_err(|e| {
-                    ConfigError::InvalidTelemetryProxyMaxBytes(format!(
-                        "TELEMETRY_PROXY_MAX_BYTES must be a valid positive integer, got '{}': {}",
-                        value_str, e
-                    ))
-                })?;
+        let telemetry_max_bytes_raw = vars
+            .get("TELEMETRY_PROXY_MAX_BYTES")
+            .ok_or_else(|| ConfigError::MissingEnvVar("TELEMETRY_PROXY_MAX_BYTES".to_string()))?;
+        let telemetry_proxy_max_bytes: usize = parse_positive(
+            "TELEMETRY_PROXY_MAX_BYTES",
+            telemetry_max_bytes_raw,
+            ConfigError::InvalidTelemetryProxyMaxBytes,
+        )?;
 
-                if value == 0 {
-                    return Err(ConfigError::InvalidTelemetryProxyMaxBytes(
-                        "TELEMETRY_PROXY_MAX_BYTES must be greater than 0".to_string(),
-                    ));
-                }
-
-                value
-            } else {
-                DEFAULT_TELEMETRY_PROXY_MAX_BYTES
-            };
-
-        // Telemetry proxy per-user rate limit with validation (must be > 0:
-        // governor's Quota is built from a NonZeroU32, and a zero quota would
-        // deny all telemetry).
-        let telemetry_proxy_rate_limit_per_minute = if let Some(value_str) =
-            vars.get("TELEMETRY_PROXY_RATE_LIMIT_PER_MINUTE")
-        {
-            let value: u32 = value_str.parse().map_err(|e| {
-                    ConfigError::InvalidTelemetryProxyRateLimit(format!(
-                        "TELEMETRY_PROXY_RATE_LIMIT_PER_MINUTE must be a valid positive integer, got '{}': {}",
-                        value_str, e
-                    ))
-                })?;
-
-            if value == 0 {
-                return Err(ConfigError::InvalidTelemetryProxyRateLimit(
-                    "TELEMETRY_PROXY_RATE_LIMIT_PER_MINUTE must be greater than 0".to_string(),
-                ));
-            }
-
-            value
-        } else {
-            DEFAULT_TELEMETRY_PROXY_RATE_LIMIT_PER_MINUTE
-        };
+        // Must be > 0: governor's Quota is built from a NonZeroU32, and a
+        // zero quota would deny all telemetry.
+        let telemetry_rate_raw = vars
+            .get("TELEMETRY_PROXY_RATE_LIMIT_PER_MINUTE")
+            .ok_or_else(|| {
+                ConfigError::MissingEnvVar("TELEMETRY_PROXY_RATE_LIMIT_PER_MINUTE".to_string())
+            })?;
+        let telemetry_proxy_rate_limit_per_minute: u32 = parse_positive(
+            "TELEMETRY_PROXY_RATE_LIMIT_PER_MINUTE",
+            telemetry_rate_raw,
+            ConfigError::InvalidTelemetryProxyRateLimit,
+        )?;
 
         // ADR-0011 / R-55: OpenTelemetry SDK configuration (GC's own span
         // export — distinct from `otel_collector_endpoint` above, which is
         // the telemetry-proxy's OTLP-HTTP forward target). Enablement is an
         // explicit boolean (OTEL_ENABLED), NOT presence of the endpoint — so
         // a populated OTLP_ENDPOINT with OTEL_ENABLED unset/false stays OFF
-        // (init_otel is never called and no layer is composed). Mirrors AC's
-        // task #25 frozen decisions verbatim.
+        // (init_otel is never called and no layer is composed). OTEL_ENABLED
+        // and OTLP_ENDPOINT are MODES (unset = export off), not substituted
+        // values, so they stay optional (2026-11-15 Lead ruling).
         let otel_enabled = if let Some(value_str) = vars.get("OTEL_ENABLED") {
             match value_str.trim().to_ascii_lowercase().as_str() {
                 "true" => true,
@@ -777,43 +928,30 @@ impl Config {
         // Endpoint reuses the `OTLP_ENDPOINT` key (mirrors AC / task #28 ruling).
         let otel_endpoint = vars.get("OTLP_ENDPOINT").cloned().unwrap_or_default();
 
-        // Sample rate: PARSE-ONLY. The `[0.0, 1.0]` bound has a SINGLE owner —
-        // `init_otel` (common/observability/otel.rs) — which re-validates it at
-        // startup on the enabled path (fail-hard at init). We do NOT duplicate
-        // the range check here (mirrors AC's frozen decision; avoids a
-        // duplicated bound). Non-numeric still fails fast at load. An
-        // out-of-range value is accepted at config load and only hard-fails at
-        // `init_otel` when `otel_enabled=true`.
-        let otel_sample_rate = if let Some(value_str) = vars.get("OTEL_SAMPLE_RATE") {
-            value_str.parse::<f64>().map_err(|e| {
-                ConfigError::InvalidOtelConfig(format!(
-                    "OTEL_SAMPLE_RATE must be a number, got '{}': {}",
-                    value_str, e
-                ))
-            })?
-        } else {
-            DEFAULT_OTEL_SAMPLE_RATE
-        };
+        // Sample rate: REQUIRED, PARSE-ONLY. The `[0.0, 1.0]` bound has a
+        // SINGLE owner — `init_otel` (common/observability/otel.rs) — which
+        // re-validates it at startup on the enabled path. Non-numeric fails
+        // fast at load.
+        let otel_sample_rate_raw = vars
+            .get("OTEL_SAMPLE_RATE")
+            .ok_or_else(|| ConfigError::MissingEnvVar("OTEL_SAMPLE_RATE".to_string()))?;
+        let otel_sample_rate = otel_sample_rate_raw.parse::<f64>().map_err(|e| {
+            ConfigError::InvalidOtelConfig(format!(
+                "OTEL_SAMPLE_RATE must be a number, got '{otel_sample_rate_raw}': {e}"
+            ))
+        })?;
 
         let environment = vars
             .get("DEPLOYMENT_ENVIRONMENT")
-            .cloned()
-            .unwrap_or_else(|| DEFAULT_DEPLOYMENT_ENVIRONMENT.to_string());
+            .ok_or_else(|| ConfigError::MissingEnvVar("DEPLOYMENT_ENVIRONMENT".to_string()))?
+            .clone();
 
         // CORS allowlist (R-1/R-3): comma-separated origins, trimmed, empty
-        // segments dropped. Parse-only (cannot fail — unparseable-as-HeaderValue
-        // is handled with warn+drop at CorsLayer build time). Default empty vec =
-        // fail-closed (never allows any origin, never `*`).
-        let cors_allowed_origins = vars
-            .get("CORS_ALLOWED_ORIGINS")
-            .map(|s| {
-                s.split(',')
-                    .map(str::trim)
-                    .filter(|o| !o.is_empty())
-                    .map(String::from)
-                    .collect()
-            })
-            .unwrap_or_default();
+        // segments dropped. Unset or empty = fail-closed (never allows any
+        // origin, never `*`) — a mode, not a substituted value. An entry that
+        // is not a valid header value FAILS STARTUP: dropping it would let an
+        // operator's typo silently narrow the allowlist.
+        let cors_allowed_origins = cors_allowed_origins_from_vars(vars)?;
 
         let mh_registry = MhRegistryConfig::from_vars(vars)?;
         let mh_endpoint_allowlist = mh_endpoint_allowlist_from_vars(vars)?;
@@ -835,7 +973,9 @@ impl Config {
             jwt_clock_skew_seconds,
             rate_limit_rpm,
             grpc_bind_address,
-            mc_staleness_threshold_seconds,
+            mc_assignment,
+            assignment_cleanup,
+            drain,
             gc_id,
             gc_client_id,
             gc_client_secret: SecretString::from(gc_client_secret),
@@ -882,6 +1022,50 @@ mod tests {
             ),
             ("GC_CLIENT_ID".to_string(), "test-gc-client".to_string()),
             ("GC_CLIENT_SECRET".to_string(), "test-gc-secret".to_string()),
+            // Test-local values for every REQUIRED behaviour/topology key
+            // (the shipped values are config.env's).
+            ("BIND_ADDRESS".to_string(), "0.0.0.0:8080".to_string()),
+            (
+                "GC_GRPC_BIND_ADDRESS".to_string(),
+                "0.0.0.0:50051".to_string(),
+            ),
+            ("GC_REGION".to_string(), "us-east-1".to_string()),
+            (
+                "AC_JWKS_URL".to_string(),
+                "http://localhost:8082/.well-known/jwks.json".to_string(),
+            ),
+            (
+                "AC_INTERNAL_URL".to_string(),
+                "http://localhost:8082".to_string(),
+            ),
+            ("JWT_CLOCK_SKEW_SECONDS".to_string(), "300".to_string()),
+            ("RATE_LIMIT_RPM".to_string(), "100".to_string()),
+            (
+                "MC_STALENESS_THRESHOLD_SECONDS".to_string(),
+                "30".to_string(),
+            ),
+            ("GC_ASSIGN_COMMIT_BUDGET_MS".to_string(), "2000".to_string()),
+            (
+                "GC_CLEANUP_INTERVAL_SECONDS".to_string(),
+                "3600".to_string(),
+            ),
+            ("GC_INACTIVITY_HOURS".to_string(), "1".to_string()),
+            ("GC_RETENTION_DAYS".to_string(), "7".to_string()),
+            ("GC_DRAIN_SECONDS".to_string(), "30".to_string()),
+            (
+                "OTEL_COLLECTOR_ENDPOINT".to_string(),
+                "http://otel-collector.test:4318".to_string(),
+            ),
+            (
+                "TELEMETRY_PROXY_MAX_BYTES".to_string(),
+                "262144".to_string(),
+            ),
+            (
+                "TELEMETRY_PROXY_RATE_LIMIT_PER_MINUTE".to_string(),
+                "60".to_string(),
+            ),
+            ("OTEL_SAMPLE_RATE".to_string(), "1.0".to_string()),
+            ("DEPLOYMENT_ENVIRONMENT".to_string(), "test".to_string()),
             // Test-local MH registry values (validation is what these tests
             // exercise; the shipped values are config.env's).
             (
@@ -1137,11 +1321,50 @@ mod tests {
         assert_eq!(config.mh_registry.retention(), Duration::from_secs(3));
     }
 
-    #[test]
-    fn test_from_vars_success_with_defaults() {
-        let vars = base_vars();
+    /// Every behaviour/topology key that may not be defaulted. Missing any
+    /// one fails startup with `MissingEnvVar` naming it.
+    const REQUIRED_KEYS: &[&str] = &[
+        "DATABASE_URL",
+        "GC_CLIENT_ID",
+        "GC_CLIENT_SECRET",
+        "BIND_ADDRESS",
+        "GC_GRPC_BIND_ADDRESS",
+        "GC_REGION",
+        "AC_JWKS_URL",
+        "AC_INTERNAL_URL",
+        "JWT_CLOCK_SKEW_SECONDS",
+        "RATE_LIMIT_RPM",
+        "MC_STALENESS_THRESHOLD_SECONDS",
+        "GC_ASSIGN_COMMIT_BUDGET_MS",
+        "GC_CLEANUP_INTERVAL_SECONDS",
+        "GC_INACTIVITY_HOURS",
+        "GC_RETENTION_DAYS",
+        "GC_DRAIN_SECONDS",
+        "OTEL_COLLECTOR_ENDPOINT",
+        "TELEMETRY_PROXY_MAX_BYTES",
+        "TELEMETRY_PROXY_RATE_LIMIT_PER_MINUTE",
+        "OTEL_SAMPLE_RATE",
+        "DEPLOYMENT_ENVIRONMENT",
+    ];
 
-        let config = Config::from_vars(&vars).expect("Config should load successfully");
+    #[test]
+    fn test_each_required_key_missing_fails_naming_key() {
+        // Positive control: the full set loads.
+        Config::from_vars(&base_vars()).expect("base vars must load");
+        for key in REQUIRED_KEYS {
+            let mut vars = base_vars();
+            assert!(vars.remove(*key).is_some(), "{key} must be in base_vars");
+            let err = Config::from_vars(&vars).expect_err("missing required key must fail");
+            assert!(
+                matches!(&err, ConfigError::MissingEnvVar(k) if k == key),
+                "{key} missing: expected MissingEnvVar naming it, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_from_vars_loads_given_values() {
+        let config = Config::from_vars(&base_vars()).expect("Config should load successfully");
 
         assert_eq!(config.database_url, "postgresql://localhost/gc_test");
         assert_eq!(config.bind_address, "0.0.0.0:8080");
@@ -1151,36 +1374,112 @@ mod tests {
             "http://localhost:8082/.well-known/jwks.json"
         );
         assert_eq!(config.ac_internal_url, "http://localhost:8082");
+        assert_eq!(config.jwt_clock_skew_seconds, 300);
+        assert_eq!(config.rate_limit_rpm, 100);
+        assert_eq!(config.grpc_bind_address, "0.0.0.0:50051");
+        assert_eq!(config.mc_assignment.mc_staleness(), Duration::from_secs(30));
         assert_eq!(
-            config.jwt_clock_skew_seconds,
-            DEFAULT_CLOCK_SKEW.as_secs() as i64
+            config.mc_assignment.commit_budget(),
+            Duration::from_millis(2000)
         );
-        assert_eq!(config.rate_limit_rpm, DEFAULT_RATE_LIMIT_RPM);
-        assert_eq!(config.grpc_bind_address, DEFAULT_GRPC_BIND_ADDRESS);
         assert_eq!(
-            config.mc_staleness_threshold_seconds,
-            DEFAULT_MC_STALENESS_THRESHOLD_SECONDS
+            config.assignment_cleanup,
+            AssignmentCleanupConfig {
+                check_interval_seconds: 3600,
+                inactivity_hours: 1,
+                retention_days: 7,
+            }
         );
         // GC ID should be auto-generated
         assert!(config.gc_id.starts_with("gc-"));
         // OAuth client credentials should be loaded
         assert_eq!(config.gc_client_id, "test-gc-client");
         assert_eq!(config.gc_client_secret.expose_secret(), "test-gc-secret");
-        // Telemetry proxy defaults
         assert_eq!(
             config.otel_collector_endpoint,
-            DEFAULT_OTEL_COLLECTOR_ENDPOINT
-        );
-        assert_eq!(
-            config.telemetry_proxy_max_bytes,
-            DEFAULT_TELEMETRY_PROXY_MAX_BYTES
+            "http://otel-collector.test:4318"
         );
         assert_eq!(config.telemetry_proxy_max_bytes, 262144);
-        assert_eq!(
-            config.telemetry_proxy_rate_limit_per_minute,
-            DEFAULT_TELEMETRY_PROXY_RATE_LIMIT_PER_MINUTE
-        );
         assert_eq!(config.telemetry_proxy_rate_limit_per_minute, 60);
+        assert_eq!(config.environment, "test");
+    }
+
+    /// The commit budget must leave half of MC's shortest join window as
+    /// margin: (0, MIN_MEETING_JOIN_WINDOW / 2].
+    #[test]
+    fn test_assign_commit_budget_bounds() {
+        let max_ms = MAX_ASSIGN_COMMIT_BUDGET.as_millis();
+        assert_eq!(
+            MAX_ASSIGN_COMMIT_BUDGET * 2,
+            common::meeting_lifecycle::MIN_MEETING_JOIN_WINDOW
+        );
+        for (value, accepted) in [
+            ("1".to_string(), true),
+            (max_ms.to_string(), true),
+            ((max_ms + 1).to_string(), false),
+            ("0".to_string(), false),
+            ("soon".to_string(), false),
+        ] {
+            let mut vars = base_vars();
+            vars.insert("GC_ASSIGN_COMMIT_BUDGET_MS".to_string(), value.clone());
+            let result = Config::from_vars(&vars);
+            if accepted {
+                assert!(result.is_ok(), "{value} must be accepted: {result:?}");
+            } else {
+                assert!(
+                    matches!(&result, Err(ConfigError::InvalidMcAssignmentConfig(msg))
+                        if msg.contains("GC_ASSIGN_COMMIT_BUDGET_MS")),
+                    "{value} must be refused naming the key: {result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_drain_bounds() {
+        for (value, want) in [
+            ("0", Some(Duration::ZERO)),
+            ("30", Some(MAX_DRAIN)),
+            ("31", None),
+            ("-1", None),
+            ("", None),
+            ("soon", None),
+        ] {
+            let mut vars = base_vars();
+            vars.insert("GC_DRAIN_SECONDS".to_string(), value.to_string());
+            let result = Config::from_vars(&vars);
+            match want {
+                Some(d) => assert_eq!(
+                    result.as_ref().map(|c| c.drain).ok(),
+                    Some(d),
+                    "{value:?}: {result:?}"
+                ),
+                None => assert!(
+                    matches!(&result, Err(ConfigError::InvalidDrainConfig(msg))
+                        if msg.contains("GC_DRAIN_SECONDS")),
+                    "{value:?} must be refused naming the key: {result:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn test_assignment_cleanup_rejects_below_one_and_unparseable() {
+        for key in [
+            "GC_CLEANUP_INTERVAL_SECONDS",
+            "GC_INACTIVITY_HOURS",
+            "GC_RETENTION_DAYS",
+        ] {
+            for bad in ["0", "-1", "", "x"] {
+                let mut vars = base_vars();
+                vars.insert(key.to_string(), bad.to_string());
+                let err = Config::from_vars(&vars).expect_err("invalid value must be refused");
+                assert!(
+                    matches!(&err, ConfigError::InvalidAssignmentCleanupConfig(msg) if msg.contains(key)),
+                    "{key}={bad:?}: expected InvalidAssignmentCleanupConfig naming it, got {err:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1306,7 +1605,7 @@ mod tests {
         assert_eq!(config.jwt_clock_skew_seconds, 120);
         assert_eq!(config.rate_limit_rpm, 500);
         assert_eq!(config.grpc_bind_address, "127.0.0.1:50052");
-        assert_eq!(config.mc_staleness_threshold_seconds, 60);
+        assert_eq!(config.mc_assignment.mc_staleness(), Duration::from_secs(60));
     }
 
     #[test]
@@ -1503,14 +1802,13 @@ mod tests {
     }
 
     #[test]
-    fn test_otel_defaults() {
-        // No OTel env vars: disabled, empty endpoint, full sampling, dev environment.
+    fn test_otel_mode_keys_unset_mean_off() {
+        // OTEL_ENABLED / OTLP_ENDPOINT are MODES: unset = export off.
         let config = Config::from_vars(&otel_vars(&[])).expect("Config should load");
-        assert!(!config.otel_enabled, "OTel disabled by default");
+        assert!(!config.otel_enabled, "OTel off when OTEL_ENABLED is unset");
         assert_eq!(config.otel_endpoint, "");
-        assert_eq!(config.otel_sample_rate, DEFAULT_OTEL_SAMPLE_RATE);
         assert_eq!(config.otel_sample_rate, 1.0);
-        assert_eq!(config.environment, "development");
+        assert_eq!(config.environment, "test");
         // Disabled → no OtelConfig produced.
         assert!(config.otel_config().is_none());
     }
@@ -1650,12 +1948,31 @@ mod tests {
     // ============================================================================
 
     #[test]
-    fn test_cors_allowed_origins_defaults_empty() {
-        // No CORS_ALLOWED_ORIGINS → empty vec (fail-closed).
-        let config = Config::from_vars(&base_vars()).expect("Config should load");
+    fn test_cors_allowed_origins_unset_is_fail_closed() {
+        // No CORS_ALLOWED_ORIGINS → empty allowlist (fail-closed mode).
+        let mut vars = base_vars();
+        vars.remove("CORS_ALLOWED_ORIGINS");
+        let config = Config::from_vars(&vars).expect("Config should load");
         assert!(
             config.cors_allowed_origins.is_empty(),
-            "CORS allowlist must default to empty (fail-closed)"
+            "unset CORS allowlist must be empty (fail-closed)"
+        );
+    }
+
+    #[test]
+    fn test_cors_allowed_origins_invalid_entry_fails_startup() {
+        // A typo must not silently narrow the allowlist: the whole load fails,
+        // naming the entry.
+        let mut vars = base_vars();
+        // DEL (0x7f) is not a valid header-value byte.
+        vars.insert(
+            "CORS_ALLOWED_ORIGINS".to_string(),
+            "http://localhost:5173,http://bad\u{7f}origin".to_string(),
+        );
+        let err = Config::from_vars(&vars).expect_err("invalid origin must fail startup");
+        assert!(
+            matches!(&err, ConfigError::InvalidCorsConfig(msg) if msg.contains("CORS_ALLOWED_ORIGINS")),
+            "expected InvalidCorsConfig naming the key, got {err:?}"
         );
     }
 

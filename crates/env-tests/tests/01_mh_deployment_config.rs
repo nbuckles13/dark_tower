@@ -362,6 +362,12 @@ fn shared_configmap() -> String {
 /// needed because the profile keys come from a DIFFERENT ConfigMap (resolved
 /// per pod and base).
 const WIRED_KEYS: &[(&str, &str, ValueShape)] = &[
+    // Required since meeting-end safety P2 (2026-11-15): no Rust default.
+    (
+        "MH_MEDIA_LATENCY_SAMPLE_RATIO",
+        SHARED_CONFIGMAP,
+        ValueShape::UnitRatio,
+    ),
     // Egress-budget chain (story 2 R-19, R-23).
     (
         "MH_EGRESS_BUDGET_BPS",

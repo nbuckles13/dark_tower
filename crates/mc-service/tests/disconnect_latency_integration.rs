@@ -259,3 +259,225 @@ async fn abrupt_loss_keeps_grace_emits_connection_lost_then_timeout_left_after_g
 
     handle.cancel();
 }
+
+// ============================================================================
+// Deliberate leave (`LeaveRequest`, meeting-end safety P4): the explicit,
+// authenticated signal removes at once; nothing else is read as a leave.
+// ============================================================================
+
+async fn join(handle: &MeetingActorHandle, p: &str, tx: Option<mpsc::Sender<bytes::Bytes>>) {
+    join_on(handle, p, &format!("conn-{p}"), tx).await;
+}
+
+async fn join_on(
+    handle: &MeetingActorHandle,
+    p: &str,
+    conn: &str,
+    tx: Option<mpsc::Sender<bytes::Bytes>>,
+) -> mc_service::actors::JoinResult {
+    handle
+        .connection_join(
+            conn.to_string(),
+            format!("user-{p}"),
+            format!("part-{p}"),
+            String::new(),
+            false,
+            test_identity_key(),
+            tx,
+            test_common::standalone_join_media(),
+        )
+        .await
+        .unwrap()
+}
+
+fn drain_kek_updates(rx: &mut mpsc::Receiver<bytes::Bytes>) -> usize {
+    let mut n = 0;
+    while let Ok(bytes) = rx.try_recv() {
+        let msg = ServerMessage::decode(bytes.as_ref()).expect("decodable ServerMessage");
+        if matches!(
+            msg.message,
+            Some(server_message::Message::MeetingKekUpdate(_))
+        ) {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// The leave removes the sender AT ONCE (no time advanced), broadcasts
+/// `ParticipantLeft{Voluntary}`, counts `leaves{voluntary}` and NO disconnect;
+/// the transport close that follows (MC closes the session after a leave)
+/// finds the participant gone: removed once, Left once, no grace timer.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_leave_removes_at_once_and_the_close_that_follows_counts_nothing() {
+    let snap = MetricAssertion::snapshot();
+    let (handle, _task) = spawn_meeting("m-leave");
+    let (b_tx, mut b_rx) = mpsc::channel::<bytes::Bytes>(64);
+    join(&handle, "b", Some(b_tx)).await;
+    join(&handle, "a", None).await;
+    let _ = drain_for_left(&mut b_rx);
+
+    handle
+        .participant_leave("part-a".to_string(), "conn-a".to_string())
+        .await
+        .unwrap();
+    let state = handle.get_state().await.unwrap();
+    assert_eq!(state.participants.len(), 1, "removed with no time advanced");
+    let left = drain_for_left(&mut b_rx).expect("B must receive a ParticipantLeft frame");
+    assert_eq!(left.participant_id, "part-a");
+    assert_eq!(left.reason, v1::LeaveReason::Voluntary as i32);
+
+    // The close that follows the leave.
+    handle
+        .connection_disconnected(
+            "conn-a".to_string(),
+            "part-a".to_string(),
+            DisconnectCause::ServerInitiated,
+        )
+        .await
+        .unwrap();
+    tokio::time::advance(Duration::from_secs(36)).await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let state = handle.get_state().await.unwrap();
+    assert_eq!(state.participants.len(), 1);
+    assert!(
+        drain_for_left(&mut b_rx).is_none(),
+        "Left is broadcast once"
+    );
+
+    snap.counter("mc_participant_leaves_total")
+        .with_labels(&[("reason", "voluntary")])
+        .assert_delta(1);
+    snap.counter("mc_participant_leaves_total")
+        .with_labels(&[("reason", "timeout")])
+        .assert_delta(0);
+    for cause in ["client_closed", "connection_lost", "server_initiated"] {
+        snap.counter("mc_participant_disconnects_total")
+            .with_labels(&[("cause", cause)])
+            .assert_delta(0);
+    }
+    handle.cancel();
+}
+
+/// Negative control: a server-initiated close WITHOUT a prior leave keeps the
+/// grace (close order is never read as a leave).
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_server_initiated_close_without_a_leave_keeps_the_grace() {
+    let (handle, _task) = spawn_meeting("m-server-close");
+    join(&handle, "b", None).await;
+    join(&handle, "a", None).await;
+    handle
+        .connection_disconnected(
+            "conn-a".to_string(),
+            "part-a".to_string(),
+            DisconnectCause::ServerInitiated,
+        )
+        .await
+        .unwrap();
+    let state = handle.get_state().await.unwrap();
+    let a = state
+        .participants
+        .iter()
+        .find(|p| p.participant_id == "part-a")
+        .expect("still rostered: grace running");
+    assert_eq!(a.status, ParticipantStatus::Disconnected);
+    handle.cancel();
+}
+
+/// Security C1: a leave or close reported by a connection that is NOT the
+/// participant's live one (superseded by a reconnect) removes nobody and
+/// starts no grace; the live connection's leave does.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_stale_connections_leave_or_close_does_not_touch_the_live_presence() {
+    let (handle, _task) = spawn_meeting("m-stale");
+    join(&handle, "b", None).await;
+    let joined = join_on(&handle, "a", "conn-a1", None).await;
+    handle
+        .connection_disconnected(
+            "conn-a1".to_string(),
+            "part-a".to_string(),
+            DisconnectCause::ConnectionLost,
+        )
+        .await
+        .unwrap();
+    handle
+        .connection_reconnect(
+            "conn-a2".to_string(),
+            joined.correlation_id.clone(),
+            joined.binding_token.clone(),
+            test_common::standalone_join_media().declared,
+            None,
+        )
+        .await
+        .expect("reconnect within grace");
+
+    handle
+        .participant_leave("part-a".to_string(), "conn-a1".to_string())
+        .await
+        .unwrap();
+    for cause in [
+        DisconnectCause::ClientClosed,
+        DisconnectCause::ConnectionLost,
+    ] {
+        handle
+            .connection_disconnected("conn-a1".to_string(), "part-a".to_string(), cause)
+            .await
+            .unwrap();
+    }
+    let state = handle.get_state().await.unwrap();
+    let a = state
+        .participants
+        .iter()
+        .find(|p| p.participant_id == "part-a")
+        .expect("the live presence on conn-a2 survives the stale connection");
+    assert_eq!(a.status, ParticipantStatus::Connected);
+
+    // A leave cannot name anyone else: it acts on the participant id the
+    // connection was bound to, and B's connection is not A's.
+    handle
+        .participant_leave("part-a".to_string(), "conn-b".to_string())
+        .await
+        .unwrap();
+    assert_eq!(handle.get_state().await.unwrap().participants.len(), 2);
+
+    handle
+        .participant_leave("part-a".to_string(), "conn-a2".to_string())
+        .await
+        .unwrap();
+    assert_eq!(handle.get_state().await.unwrap().participants.len(), 1);
+    handle.cancel();
+}
+
+/// The leave-triggered KEK rotation's debounce starts AT THE LEAVE, not at a
+/// grace expiry: the remaining participant installs a new KEK within W of the
+/// leave (W = 60 s here, longer than the 30 s grace — so a grace-path removal
+/// could not rotate before ~W + grace).
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn the_leave_rotation_debounce_starts_at_the_leave() {
+    let (handle, _task) = spawn_meeting("m-leave-kek");
+    let (b_tx, mut b_rx) = mpsc::channel::<bytes::Bytes>(256);
+    join(&handle, "b", Some(b_tx)).await;
+    join(&handle, "a", None).await;
+    let _ = drain_kek_updates(&mut b_rx);
+
+    handle
+        .participant_leave("part-a".to_string(), "conn-a".to_string())
+        .await
+        .unwrap();
+    let w = Duration::from_secs(u64::from(
+        mc_test_utils::kek::TEST_KEK_ROTATION_WINDOW_SECONDS,
+    ));
+    tokio::time::advance(w - Duration::from_secs(1)).await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let _ = handle.get_state().await.unwrap();
+    assert_eq!(drain_kek_updates(&mut b_rx), 0, "no rotation before W");
+
+    tokio::time::advance(Duration::from_secs(2)).await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let _ = handle.get_state().await.unwrap();
+    assert!(
+        drain_kek_updates(&mut b_rx) >= 1,
+        "the leave rotation must land within W of the leave"
+    );
+    handle.cancel();
+}

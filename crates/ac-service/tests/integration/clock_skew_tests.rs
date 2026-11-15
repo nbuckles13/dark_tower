@@ -3,7 +3,7 @@
 //! These tests validate the configurable JWT_CLOCK_SKEW_SECONDS feature,
 //! ensuring the entire pipeline works correctly with custom clock skew values.
 
-use ac_service::config::DEFAULT_JWT_CLOCK_SKEW;
+use ac_service::config::RECOMMENDED_JWT_CLOCK_SKEW;
 use ac_service::crypto;
 use ac_service::models::SigningKey;
 use ac_service::repositories::signing_keys;
@@ -154,7 +154,7 @@ async fn test_default_clock_skew_behavior_unchanged(pool: PgPool) -> Result<(), 
     let token = crypto::sign_jwt(&claims, &private_key, &signing_key.key_id)?;
 
     // Act: Verify with DEFAULT clock skew
-    let result = crypto::verify_jwt(&token, &signing_key.public_key, DEFAULT_JWT_CLOCK_SKEW);
+    let result = crypto::verify_jwt(&token, &signing_key.public_key, RECOMMENDED_JWT_CLOCK_SKEW);
 
     // Assert: Token should be accepted with default clock skew
     assert!(

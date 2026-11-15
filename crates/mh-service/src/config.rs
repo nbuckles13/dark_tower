@@ -18,14 +18,10 @@ use std::fmt;
 use std::time::Duration;
 use thiserror::Error;
 
-/// Default gRPC bind address for MC→MH communication.
-pub const DEFAULT_GRPC_BIND_ADDRESS: &str = "0.0.0.0:50053";
-
-/// Default health endpoint bind address.
-pub const DEFAULT_HEALTH_BIND_ADDRESS: &str = "0.0.0.0:8083";
-
-/// Default WebTransport bind address.
-pub const DEFAULT_WEBTRANSPORT_BIND_ADDRESS: &str = "0.0.0.0:4434";
+// Bind addresses, region and the GC URL are REQUIRED (meeting-end safety P2,
+// uniform across services): no Rust default, a base `config.env` value and a
+// hard ref, so a missing key refuses boot instead of a pod that starts, passes
+// readiness and talks to nothing.
 
 // `MH_MAX_STREAMS` is RETIRED (story 2 R-19). There is no read, no default and
 // no `Config` field: the value MH advertises to GC in `RegisterMhRequest
@@ -719,14 +715,6 @@ pub const EGRESS_QUEUE_FRAMES: usize = 8;
 /// latency ceiling rather than a buffer.
 pub const INGRESS_QUEUE_FRAMES: usize = 16;
 
-/// Default fraction of forwarded frames whose latency is observed into
-/// `mh_media_forward_latency_seconds`.
-///
-/// One in a hundred. ADR-0036 §11: "timestamp always, observe one in N" — the
-/// clock read is a ~25 ns vDSO call and is taken on every frame; the histogram
-/// observation is the expensive part.
-pub const DEFAULT_MEDIA_LATENCY_SAMPLE_RATIO: f64 = 0.01;
-
 /// Upper bound on the random delay inserted before closing a connection whose
 /// media session was declined because **MC was unreachable**, in milliseconds.
 ///
@@ -1252,17 +1240,6 @@ pub const SHUTDOWN_MARGIN_SECONDS: u64 = 5;
 // `CLOSE_SESSION_LINGER`).
 const _: () = assert!(CLOSE_SESSION_LINGER.as_secs() < SHUTDOWN_MARGIN_SECONDS);
 
-// =============================================================================
-// OpenTelemetry Configuration Defaults (R-55)
-// =============================================================================
-
-/// Default head-sampling ratio when `OTEL_SAMPLE_RATE` is unset (1.0 = sample all).
-/// The `[0.0, 1.0]` range is owned + enforced by `init_otel` (common), not here —
-/// config parsing is parse-only (single owner for the bound; team-lead FREEZE 2026-06-25).
-pub const DEFAULT_OTEL_SAMPLE_RATE: f64 = 1.0;
-/// Default deployment environment when `DEPLOYMENT_ENVIRONMENT` is unset.
-pub const DEFAULT_DEPLOYMENT_ENVIRONMENT: &str = "development";
-
 /// Forwarding-policy bounds applied to `RegisterMeeting` (ADR-0036 §8).
 ///
 /// Grouped rather than loose on [`Config`] so the whole set threads into the
@@ -1689,29 +1666,12 @@ fn parse_in_range(
     Ok(parsed)
 }
 
-/// Where an optional configuration value came from, for the startup log.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ValueSource {
-    /// Read from the environment (the `ConfigMap`, in a cluster).
-    Env,
-    /// The code default — the key was absent.
-    Default,
-}
-
-impl ValueSource {
-    /// Stable, bounded string form for the structured startup log line.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Env => "env",
-            Self::Default => "default",
-        }
-    }
-}
-
 /// Media Handler configuration.
 ///
-/// Loaded from environment variables with sensible defaults.
+/// Loaded from environment variables. Every behaviour and topology key is
+/// REQUIRED (no code defaults); only identity (`MH_HANDLER_ID`) and the
+/// telemetry export switch (`OTEL_ENABLED`, `OTLP_ENDPOINT`) have an unset
+/// meaning.
 /// Sensitive fields are redacted in Debug output.
 #[derive(Clone)]
 pub struct Config {
@@ -1855,8 +1815,10 @@ pub struct Config {
 
     /// Fraction of forwarded frames whose latency is observed into
     /// `mh_media_forward_latency_seconds` (env
-    /// `MH_MEDIA_LATENCY_SAMPLE_RATIO`, optional, default
-    /// [`DEFAULT_MEDIA_LATENCY_SAMPLE_RATIO`], ceiling-checked to `0.0..=1.0`).
+    /// `MH_MEDIA_LATENCY_SAMPLE_RATIO`, REQUIRED, checked to `0.0..=1.0`;
+    /// the base value is 0.01 — ADR-0036 §11 "timestamp always, observe one
+    /// in N": the clock read is taken on every frame, the histogram
+    /// observation is the expensive part).
     ///
     /// **ONE field, TWO readers, and that is the point.** The sampler
     /// ([`crate::media::sampler`]) draws against it, and
@@ -1871,17 +1833,10 @@ pub struct Config {
     /// and collapsing them would put the media path's leak posture behind a
     /// tracing knob.
     ///
-    /// Optional-with-default rather than required — a REASONED carve-out, not
-    /// a missed instance of story 2's "required keys" flip: the MH template
-    /// declares this the one deliberately `optional:` ref, so the image may roll
-    /// back alone (`infra/services/mh-service/deployment.yaml`). Its
-    /// provenance is reported by [`Self::media_latency_sample_ratio_source`].
+    /// REQUIRED since meeting-end safety P2 (2026-11-15): its former
+    /// optional-with-default carve-out existed only so the image could roll
+    /// back alone, and rollback compatibility is not protected.
     pub media_latency_sample_ratio: f64,
-
-    /// Whether [`Self::media_latency_sample_ratio`] came from the environment
-    /// or the code default — logged at startup so an operator can tell a
-    /// chosen value from an unchosen one without reading source.
-    pub media_latency_sample_ratio_source: ValueSource,
 
     /// Whether to initialize the OpenTelemetry SDK (R-55). Default `false`.
     /// When `true`, `main` calls `init_otel` (eager collector probe, fail-hard
@@ -1892,11 +1847,11 @@ pub struct Config {
     /// OTLP-gRPC collector endpoint (env `OTLP_ENDPOINT`). Only consumed when
     /// `otel_enabled` is `true`; must be a parseable `http(s)://host:port` URL.
     pub otel_endpoint: String,
-    /// Head-sampling ratio in `[0.0, 1.0]` (env `OTEL_SAMPLE_RATE`). `init_otel`
+    /// Head-sampling ratio in `[0.0, 1.0]` (env `OTEL_SAMPLE_RATE`, REQUIRED). `init_otel`
     /// is the authoritative validator and re-checks this bound at startup.
     pub otel_sample_rate: f64,
     /// Deployment environment for the `deployment.environment` `OTel` resource
-    /// attribute (env `DEPLOYMENT_ENVIRONMENT`, ADR-0011). Default `development`.
+    /// attribute (env `DEPLOYMENT_ENVIRONMENT`, ADR-0011). REQUIRED (no default).
     pub environment: String,
 }
 
@@ -1946,10 +1901,6 @@ impl fmt::Debug for Config {
             .field(
                 "media_latency_sample_ratio",
                 &self.media_latency_sample_ratio,
-            )
-            .field(
-                "media_latency_sample_ratio_source",
-                &self.media_latency_sample_ratio_source,
             )
             .field("otel_enabled", &self.otel_enabled)
             .field("otel_endpoint", &self.otel_endpoint)
@@ -2347,28 +2298,24 @@ impl Config {
 
         let grpc_bind_address = vars
             .get("MH_GRPC_BIND_ADDRESS")
-            .cloned()
-            .unwrap_or_else(|| DEFAULT_GRPC_BIND_ADDRESS.to_string());
-
+            .ok_or_else(|| ConfigError::MissingEnvVar("MH_GRPC_BIND_ADDRESS".to_string()))?
+            .clone();
         let health_bind_address = vars
             .get("MH_HEALTH_BIND_ADDRESS")
-            .cloned()
-            .unwrap_or_else(|| DEFAULT_HEALTH_BIND_ADDRESS.to_string());
-
+            .ok_or_else(|| ConfigError::MissingEnvVar("MH_HEALTH_BIND_ADDRESS".to_string()))?
+            .clone();
         let webtransport_bind_address = vars
             .get("MH_WEBTRANSPORT_BIND_ADDRESS")
-            .cloned()
-            .unwrap_or_else(|| DEFAULT_WEBTRANSPORT_BIND_ADDRESS.to_string());
-
+            .ok_or_else(|| ConfigError::MissingEnvVar("MH_WEBTRANSPORT_BIND_ADDRESS".to_string()))?
+            .clone();
         let region = vars
             .get("MH_REGION")
-            .cloned()
-            .unwrap_or_else(|| "us-east-1".to_string());
-
+            .ok_or_else(|| ConfigError::MissingEnvVar("MH_REGION".to_string()))?
+            .clone();
         let gc_grpc_url = vars
             .get("GC_GRPC_URL")
-            .cloned()
-            .unwrap_or_else(|| "http://localhost:50051".to_string());
+            .ok_or_else(|| ConfigError::MissingEnvVar("GC_GRPC_URL".to_string()))?
+            .clone();
 
         let ac_jwks_url = vars
             .get("AC_JWKS_URL")
@@ -2838,23 +2785,18 @@ impl Config {
             pod_memory_limit_bytes,
         )?;
 
-        // ADR-0036 §11 media latency sampling. Optional-with-default (a
-        // reasoned carve-out; see the field doc) plus a hard range check: above
-        // 1 silently means "observe everything" (a per-frame histogram write on
-        // the hot path), below 0 silently means "observe nothing".
-        let (media_latency_sample_ratio, media_latency_sample_ratio_source) =
-            match vars.get("MH_MEDIA_LATENCY_SAMPLE_RATIO") {
-                None => (DEFAULT_MEDIA_LATENCY_SAMPLE_RATIO, ValueSource::Default),
-                Some(raw) => (
-                    parse_unit_ratio(
-                        "MH_MEDIA_LATENCY_SAMPLE_RATIO",
-                        raw,
-                        "above 1.0 observes every frame on the per-frame path and below 0.0 \
-                         observes none, which reads as a healthy quiet path",
-                    )?,
-                    ValueSource::Env,
-                ),
-            };
+        // ADR-0036 §11 media latency sampling. REQUIRED plus a hard range
+        // check: above 1 silently means "observe everything" (a per-frame
+        // histogram write on the hot path), below 0 silently means "observe
+        // nothing".
+        let media_latency_sample_ratio = parse_unit_ratio(
+            "MH_MEDIA_LATENCY_SAMPLE_RATIO",
+            vars.get("MH_MEDIA_LATENCY_SAMPLE_RATIO").ok_or_else(|| {
+                ConfigError::MissingEnvVar("MH_MEDIA_LATENCY_SAMPLE_RATIO".to_string())
+            })?,
+            "above 1.0 observes every frame on the per-frame path and below 0.0 \
+             observes none, which reads as a healthy quiet path",
+        )?;
 
         // R-55: OpenTelemetry SDK configuration.
         // Enablement is an explicit boolean (OTEL_ENABLED), NOT presence of the
@@ -2884,20 +2826,21 @@ impl Config {
         // check here. Non-numeric still fails fast at load. An out-of-range
         // value is accepted at config load and only hard-fails at `init_otel`
         // when `otel_enabled=true` — intended.
-        let otel_sample_rate = if let Some(value_str) = vars.get("OTEL_SAMPLE_RATE") {
+        let otel_sample_rate = {
+            let value_str = vars
+                .get("OTEL_SAMPLE_RATE")
+                .ok_or_else(|| ConfigError::MissingEnvVar("OTEL_SAMPLE_RATE".to_string()))?;
             value_str.parse::<f64>().map_err(|e| {
                 ConfigError::InvalidOtelConfig(format!(
                     "OTEL_SAMPLE_RATE must be a number, got '{value_str}': {e}"
                 ))
             })?
-        } else {
-            DEFAULT_OTEL_SAMPLE_RATE
         };
 
         let environment = vars
             .get("DEPLOYMENT_ENVIRONMENT")
-            .cloned()
-            .unwrap_or_else(|| DEFAULT_DEPLOYMENT_ENVIRONMENT.to_string());
+            .ok_or_else(|| ConfigError::MissingEnvVar("DEPLOYMENT_ENVIRONMENT".to_string()))?
+            .clone();
 
         // When OTel is enabled the endpoint is required: fail fast with a clear
         // message rather than letting init_otel reject an empty/unparseable URL.
@@ -2948,7 +2891,6 @@ impl Config {
             policy_limits,
             egress_admission,
             media_latency_sample_ratio,
-            media_latency_sample_ratio_source,
             otel_enabled,
             otel_endpoint,
             otel_sample_rate,
@@ -2979,8 +2921,8 @@ impl Config {
     clippy::expect_used,
     clippy::panic,
     // OTel sample-rate assertions compare a parsed f64 against the exact
-    // literal it was parsed from (or the exact DEFAULT_OTEL_SAMPLE_RATE
-    // const) — not a computed/accumulated float where precision loss could
+    // literal it was parsed from (the `OTEL_SAMPLE_RATE` value in the test
+    // var set, mirroring config.env) — not a computed/accumulated float where precision loss could
     // hide a bug, so exact equality is the correct check here.
     clippy::float_cmp
 )]
@@ -2988,6 +2930,10 @@ mod tests {
     use super::*;
     use common::secret::ExposeSecret;
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one literal row per required key; splitting would hide the complete set"
+    )]
     fn base_vars() -> HashMap<String, String> {
         HashMap::from([
             (
@@ -3012,6 +2958,34 @@ mod tests {
             (
                 "AC_JWKS_URL".to_string(),
                 "http://localhost:8082/.well-known/jwks.json".to_string(),
+            ),
+            // meeting-end-safety P2: REQUIRED topology/behaviour keys (no
+            // Rust default); the base config.env's values.
+            (
+                "MH_GRPC_BIND_ADDRESS".to_string(),
+                "0.0.0.0:50053".to_string(),
+            ),
+            (
+                "MH_HEALTH_BIND_ADDRESS".to_string(),
+                "0.0.0.0:8083".to_string(),
+            ),
+            (
+                "MH_WEBTRANSPORT_BIND_ADDRESS".to_string(),
+                "0.0.0.0:4434".to_string(),
+            ),
+            ("MH_REGION".to_string(), "us-east-1".to_string()),
+            (
+                "GC_GRPC_URL".to_string(),
+                "http://localhost:50051".to_string(),
+            ),
+            (
+                "MH_MEDIA_LATENCY_SAMPLE_RATIO".to_string(),
+                "0.01".to_string(),
+            ),
+            ("OTEL_SAMPLE_RATE".to_string(), "1.0".to_string()),
+            (
+                "DEPLOYMENT_ENVIRONMENT".to_string(),
+                "development".to_string(),
             ),
             // ADR-0036 §1 transport parameters, all REQUIRED. Values are the
             // DEPLOYED ones from `infra/services/mh-service/config.env`, so
@@ -3773,12 +3747,9 @@ mod tests {
 
         let config = Config::from_vars(&vars).expect("Config should load successfully");
 
-        assert_eq!(config.grpc_bind_address, DEFAULT_GRPC_BIND_ADDRESS);
-        assert_eq!(config.health_bind_address, DEFAULT_HEALTH_BIND_ADDRESS);
-        assert_eq!(
-            config.webtransport_bind_address,
-            DEFAULT_WEBTRANSPORT_BIND_ADDRESS
-        );
+        assert_eq!(config.grpc_bind_address, "0.0.0.0:50053");
+        assert_eq!(config.health_bind_address, "0.0.0.0:8083");
+        assert_eq!(config.webtransport_bind_address, "0.0.0.0:4434");
         assert_eq!(config.region, "us-east-1");
         assert_eq!(config.gc_grpc_url, "http://localhost:50051");
         assert!(config.handler_id.starts_with("mh-"));
@@ -4515,20 +4486,37 @@ mod tests {
     }
 
     #[test]
-    fn the_latency_ratio_reports_its_provenance() {
-        let config = Config::from_vars(&base_vars()).unwrap();
-        assert_eq!(
-            config.media_latency_sample_ratio_source,
-            ValueSource::Default
-        );
+    fn the_latency_ratio_is_taken_verbatim() {
         let mut vars = base_vars();
         vars.insert(
             "MH_MEDIA_LATENCY_SAMPLE_RATIO".to_string(),
             "0.5".to_string(),
         );
         let config = Config::from_vars(&vars).unwrap();
-        assert_eq!(config.media_latency_sample_ratio_source, ValueSource::Env);
         assert_eq!(config.media_latency_sample_ratio, 0.5);
+    }
+
+    /// meeting-end-safety P2: every behaviour/topology key is REQUIRED. Unset
+    /// refuses boot naming THE key — never a code default.
+    #[test]
+    fn every_behaviour_and_topology_key_is_required() {
+        for key in [
+            "MH_GRPC_BIND_ADDRESS",
+            "MH_HEALTH_BIND_ADDRESS",
+            "MH_WEBTRANSPORT_BIND_ADDRESS",
+            "MH_REGION",
+            "GC_GRPC_URL",
+            "MH_MEDIA_LATENCY_SAMPLE_RATIO",
+            "OTEL_SAMPLE_RATE",
+            "DEPLOYMENT_ENVIRONMENT",
+        ] {
+            let mut vars = base_vars();
+            vars.remove(key);
+            match Config::from_vars(&vars) {
+                Err(ConfigError::MissingEnvVar(k)) => assert_eq!(k, key),
+                other => panic!("{key} unset must refuse boot naming it, got {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -4755,7 +4743,6 @@ mod tests {
         let config = Config::from_vars(&otel_vars(&[])).expect("Config should load");
         assert!(!config.otel_enabled, "OTel disabled by default");
         assert_eq!(config.otel_endpoint, "");
-        assert_eq!(config.otel_sample_rate, DEFAULT_OTEL_SAMPLE_RATE);
         assert_eq!(config.otel_sample_rate, 1.0);
         assert_eq!(config.environment, "development");
         // Disabled → no OtelConfig produced.

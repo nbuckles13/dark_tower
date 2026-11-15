@@ -49,26 +49,16 @@ pub struct AppState {
 
 /// Build the CORS layer from the configured allowlist (R-1).
 ///
-/// Explicit origins ONLY — never `Any`/`*`. Each configured origin is parsed as
-/// a [`HeaderValue`]; an entry that fails to parse is dropped with a `warn`
-/// (never widening the allowlist). An EMPTY allowlist is fail-closed: no origin
-/// is allowed, so no `Access-Control-Allow-Origin` is ever emitted.
+/// Explicit origins ONLY — never `Any`/`*`. The origins were parsed and
+/// validated once by `Config` (an invalid entry fails startup, never dropped
+/// here). An EMPTY allowlist is fail-closed: no origin is allowed, so no
+/// `Access-Control-Allow-Origin` is ever emitted.
 ///
 /// Methods `GET, POST, PATCH, OPTIONS`; headers
 /// `authorization, content-type, traceparent, tracestate`;
 /// `allow_credentials(false)`; `max_age` 600s.
-fn build_cors_layer(allowed_origins: &[String]) -> CorsLayer {
-    let mut origins: Vec<HeaderValue> = Vec::with_capacity(allowed_origins.len());
-    for origin in allowed_origins {
-        match origin.parse::<HeaderValue>() {
-            Ok(value) => origins.push(value),
-            Err(e) => tracing::warn!(
-                origin = %origin,
-                error = %e,
-                "dropping unparseable CORS allowed origin"
-            ),
-        }
-    }
+fn build_cors_layer(allowed_origins: &[HeaderValue]) -> CorsLayer {
+    let origins: Vec<HeaderValue> = allowed_origins.to_vec();
 
     CorsLayer::new()
         .allow_origin(AllowOrigin::list(origins))

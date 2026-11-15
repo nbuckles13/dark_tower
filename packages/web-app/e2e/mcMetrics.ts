@@ -139,10 +139,10 @@ const CONNECTED_SUM_PROMQL =
 // attribution is proven separately by the bus `participantLeft(participantId)`
 // event; this counter is the SERVER-SIDE proof MC actually recorded the leave
 // (a dead/unreachable MC cannot increment its own counter — same false-pass
-// killer as the join-failure helper above). The spec ALSO drives the demo's own
-// teardown (unmount → session.disconnect() → clean voluntary close), so the
-// common path settles in ~1 scrape interval; the wide budget below is grace-path
-// insurance, not the expected latency.
+// killer as the join-failure helper above). The spec drives the demo's own
+// teardown (unmount → session.disconnect() → LeaveRequest) and PROVES MC
+// acknowledged it (`waitForLeaveAcknowledged`) before this wait, so the removal
+// has already happened and only the scrape remains.
 const LEAVES_SUM_PROMQL = 'sum by (instance) (mc_participant_leaves_total)';
 
 /**
@@ -289,17 +289,12 @@ export async function mcParticipantLeavesByInstance(): Promise<InstanceCounters>
  * server-side proof that MC recorded a roster departure (gap (2)). Throws with
  * the last observed value on timeout.
  *
- * BUDGET (config-derived, NOT a fixed rationale — @observability): the ceiling
- * must cover MC's worst-case roster-remove latency, catalogued in
- * `docs/observability/metrics/mc-service.md` §"Worst-case roster-remove latency"
- * as `MC_QUIC_MAX_IDLE_TIMEOUT_SECONDS + MC_DISCONNECT_GRACE_PERIOD_SECONDS +
- * 5s grace-check` (defaults 10 + 30 + 5 = 45s), PLUS one scrape of the
- * `mc-service` job this counter is read through (its per-job `scrape_interval`,
- * no coarser than the global one) — under 60s, so the 90s default is that worst case
- * with margin (and stays under the 120s/test ceiling). This is LARGER than the
- * join-side 60s helper precisely because a departure's worst case includes the
- * disconnect grace path. In practice the spec drives a clean close, so this
- * resolves in ~1 scrape interval; 90s is the grace-path safety net, not the norm.
+ * BUDGET: the caller has already proven the leave ACKNOWLEDGED by MC
+ * (`waitForLeaveAcknowledged`: MC removed the participant at once — a deliberate
+ * leave never enters the disconnect grace), so the ceiling covers only the
+ * scrape SLA of the `mc-service` job plus margin: the same 60 s default as the
+ * join-side helper (`pollUntilAnyInstanceAbove`). No grace term: a lost leave
+ * already failed loudly in `waitForLeaveAcknowledged`.
  */
 export async function waitForMcParticipantLeavesAbove(
   baseline: InstanceCounters,
@@ -308,15 +303,14 @@ export async function waitForMcParticipantLeavesAbove(
   await pollUntilAnyInstanceAbove(
     LEAVES_SUM_PROMQL,
     baseline,
-    { timeoutMs: 90_000, ...options },
+    options,
     (lastObserved, timeoutMs) =>
       `mc_participant_leaves_total (all reasons) did not rise above baseline ` +
       `${formatInstanceMap(baseline)} on any instance within ${timeoutMs}ms (last observed: ` +
       `${lastObserved}). MC never recorded the participant departure — either the ParticipantLeft ` +
       `broadcast did not fire (roster-removal choke-point crates/mc-service/src/actors/meeting.rs ` +
-      `remove_and_broadcast_left) or it exceeded the config-derived worst-case ` +
-      `(idle_timeout + grace_period + grace-check + scrape SLA; see ` +
-      `docs/observability/metrics/mc-service.md).`,
+      `remove_and_broadcast_left) or the scrape did not pick it up within the scrape-SLA ` +
+      `budget (the leave was acknowledged, so no grace path applies).`,
   );
 }
 
@@ -721,7 +715,6 @@ const GC_SELECTABLE_PROMQL = `sum by (instance) (${GC_SETTLE_HEALTHY_SERIES}{sta
 const GC_RECOMPUTE_PROMQL = `sum by (instance) (${GC_SETTLE_RECOMPUTE_SERIES}{operation="${GC_SETTLE_RECOMPUTE_OPERATION}",${GC_SETTLE_RECOMPUTE_SUCCESS}})`;
 const MC_REPLACEMENT_RETRY_BUDGET_PROMQL =
   'max by (instance) (mc_media_handler_replacement_retry_budget_seconds)';
-const MC_DISCONNECT_GRACE_PROMQL = 'max by (instance) (mc_meeting_disconnect_grace_seconds)';
 
 const MH_UP_TIMESTAMP_PROMQL = `max by (instance) (timestamp(up{job="${MH_SCRAPE_JOB}"}))`;
 
@@ -823,14 +816,4 @@ async function mcConfigGaugeMaxMs(promql: string, what: string): Promise<number>
  */
 export async function mcReplacementRetryBudgetMs(): Promise<number> {
   return mcConfigGaugeMaxMs(MC_REPLACEMENT_RETRY_BUDGET_PROMQL, 'replacement retry budget');
-}
-
-/**
- * MC's published disconnect grace (`mc_meeting_disconnect_grace_seconds`, the
- * config echo of the `MeetingTimers` every meeting actor enforces), in ms. The
- * twin of Rust `metrics::mc_disconnect_grace`; the meeting-end proof's ceiling
- * derives from it (`mcLoki.ts`).
- */
-export async function mcDisconnectGraceMs(): Promise<number> {
-  return mcConfigGaugeMaxMs(MC_DISCONNECT_GRACE_PROMQL, 'disconnect grace');
 }

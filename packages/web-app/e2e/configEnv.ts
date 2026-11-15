@@ -121,17 +121,6 @@ export function serviceConfigEnvPath(service: string): string {
 
 /** MC's KEK rotation debounce W, the ConfigMap's REQUIRED key (story 2 R-12). */
 export const MC_KEK_ROTATION_DEBOUNCE_KEY = 'MC_KEK_ROTATION_DEBOUNCE_SECONDS';
-/** MC's disconnect grace; OPTIONAL in the ConfigMap, code-defaulted when absent. */
-export const MC_DISCONNECT_GRACE_KEY = 'MC_DISCONNECT_GRACE_PERIOD_SECONDS';
-
-/**
- * The code default of MC's disconnect grace, read from its one home
- * (`crates/mc-service/src/config.rs:DEFAULT_DISCONNECT_GRACE_PERIOD_SECONDS`) —
- * never restated here. Throws if the constant cannot be found.
- */
-export function parseMcDefaultGraceSeconds(configRsText: string, source: string): number {
-  return readRustU64Const(configRsText, 'DEFAULT_DISCONNECT_GRACE_PERIOD_SECONDS', source);
-}
 
 /**
  * THE reader of a Rust `pub const NAME: u64 = N;` (or `const`) from a source
@@ -152,16 +141,16 @@ export function readRustU64Const(sourceText: string, name: string, source: strin
 export interface McRotationTimings {
   /** W: rotation happens at most once per W after the OLDEST un-rotated removal. */
   readonly debounceSeconds: number;
-  /** Disconnect grace before a departed participant's removal (and so the rotation) starts. */
-  readonly graceSeconds: number;
 }
 
-/** Read W (required) and the grace (ConfigMap value, else the code default). */
+/**
+ * Read W (required). The disconnect grace is NOT part of the budget: the SDK's
+ * `disconnect()` sends a LeaveRequest and MC removes the leaver at once, so the
+ * leave rotation's debounce starts at the leave.
+ */
 export function readMcRotationTimings(
   configEnvText: string,
   configEnvSource: string,
-  configRsText: string,
-  configRsSource: string,
 ): McRotationTimings {
   const values = parseConfigEnv(configEnvText);
   const debounceSeconds = requirePositiveInt(
@@ -170,15 +159,7 @@ export function readMcRotationTimings(
     configEnvSource,
     'cannot budget the KEK rotation scenario (S6)',
   );
-  const graceSeconds = values.has(MC_DISCONNECT_GRACE_KEY)
-    ? requirePositiveInt(values, MC_DISCONNECT_GRACE_KEY, configEnvSource, '')
-    : parseMcDefaultGraceSeconds(configRsText, configRsSource);
-  return { debounceSeconds, graceSeconds };
-}
-
-/** `crates/mc-service/src/config.rs`, as an absolute path. */
-export function mcConfigRsPath(): string {
-  return fileURLToPath(new URL('../../../crates/mc-service/src/config.rs', import.meta.url));
+  return { debounceSeconds };
 }
 
 // ---------------------------------------------------------------------------
@@ -277,21 +258,15 @@ export function vp8ProbeProfileDefine(
 }
 
 /**
- * MC's rotation timings read from their homes (MC's ConfigMap source and its
- * config.rs default), and the worst-case LEAVE -> ROTATION budget grace + W in
- * ms — the ONE home both KEK-rotation specs budget against. A liveness bound,
- * never a latency gate.
+ * MC's rotation timing read from its home (MC's ConfigMap source), and the
+ * LEAVE -> ROTATION budget W in ms (a deliberate leave removes at once) — the
+ * ONE home both KEK-rotation specs budget against. A liveness bound, never a
+ * latency gate.
  */
 export function mcRotationBudget(): McRotationTimings & { readonly budgetMs: number } {
   const env = serviceConfigEnvPath('mc-service');
-  const rs = mcConfigRsPath();
-  const timings = readMcRotationTimings(
-    readFileSync(env, 'utf8'),
-    env,
-    readFileSync(rs, 'utf8'),
-    rs,
-  );
-  return { ...timings, budgetMs: (timings.graceSeconds + timings.debounceSeconds) * 1000 };
+  const timings = readMcRotationTimings(readFileSync(env, 'utf8'), env);
+  return { ...timings, budgetMs: timings.debounceSeconds * 1000 };
 }
 
 /**

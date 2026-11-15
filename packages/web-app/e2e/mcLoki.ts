@@ -9,15 +9,14 @@
 // replacement for it.
 //
 // THE PROOF, per meeting, in order (pure verdicts below, node-tested):
-//   1. DEPARTURE (positive control): ONE departure line per participant id the
-//      page received (bus `joined`), where MC's "Clean transport close" OR its
-//      "Disconnect grace period expired" counts, each naming THIS meeting id.
-//      Either counts because MC today classifies the SDK's leave as
-//      `server_initiated` and holds it through the grace (docs/TODO.md, "MC
-//      classifies the browser SDK's CLEAN disconnect as `server_initiated`",
-//      owner meeting-controller). Accepting either fails CLOSED on an ingest
-//      gap and survives that product fix (the wait then shrinks by itself);
-//      requiring the grace line would assert the bug.
+//   1. DEPARTURE (positive control): ONE "Participant left (LeaveRequest)"
+//      line per participant id the page received (bus `joined`), naming THIS
+//      meeting id. ONLY that line counts: the SDK's `disconnect()` sends an
+//      explicit LeaveRequest and MC removes the participant at once
+//      (signaling.proto `LeaveRequest`; meeting-end-safety devloop). A
+//      departure proven only by "Clean transport close" or "Disconnect grace
+//      period expired" means the leave never arrived — a P4 regression — and
+//      FAILS here rather than passing one grace slower.
 //   2. ANCHOR: max(scope start, newest "Meeting actor created" for the id) —
 //      a join retry can end and recreate a meeting under the same id. No
 //      created line is its own failure, never "accept any".
@@ -59,13 +58,22 @@ export const MC_MEETING_RELEASED: LogLine = {
   target: 'mc.teardown',
   message: 'Meeting released on its media handlers',
 };
-/** `loki.rs` MC_CLEAN_CLOSE. */
+/** `loki.rs` MC_CLEAN_CLOSE. Pinned, NEVER accepted as a browser departure (step 1). */
 export const MC_CLEAN_CLOSE: LogLine = {
   app: 'mc-service',
   target: 'mc.actor.meeting',
   message: 'Clean transport close — removing participant immediately (grace skipped)',
 };
-/** `loki.rs` MC_GRACE_EXPIRED. */
+/** `loki.rs` MC_LEAVE_REQUEST: THE browser departure line (step 1 accepts only this). */
+export const MC_LEAVE_REQUEST: LogLine = {
+  app: 'mc-service',
+  target: 'mc.actor.meeting',
+  message: 'Participant left (LeaveRequest) — removing immediately',
+};
+/**
+ * `loki.rs` MC_GRACE_EXPIRED. Pinned, NEVER accepted as a browser departure
+ * (see step 1).
+ */
 export const MC_GRACE_EXPIRED: LogLine = {
   app: 'mc-service',
   target: 'mc.actor.meeting',
@@ -259,6 +267,15 @@ export function classifyMember(
   return { label, meetingIds: [...meetingIds], participantIds: [...new Set(participantIds)] };
 }
 
+/**
+ * PURE: the departure entries step 1 accepts for `meetingId` out of `raw` —
+ * {@link MC_LEAVE_REQUEST} lines ONLY. A clean-close or grace-expiry line is
+ * not a deliberate leave and is never counted.
+ */
+export function departureEntries(meetingId: string, raw: RawEntry[]): Entry[] {
+  return matchingEntries(MC_LEAVE_REQUEST, meetingId, raw);
+}
+
 /** PURE: the labels of members with a participant id no departure line names. */
 export function missingDepartures(
   members: readonly MemberDeparture[],
@@ -392,8 +409,8 @@ async function lokiUrl(): Promise<string> {
   return url;
 }
 
-/** Every `line` entry for `meetingId` since `sinceNs` (throws {@link LOKI_QUERY_FAILED}). */
-async function entries(line: LogLine, meetingId: string, sinceNs: bigint): Promise<Entry[]> {
+/** The raw entries of `line`'s LogQL for `meetingId` since `sinceNs` (throws {@link LOKI_QUERY_FAILED}). */
+async function rawEntries(line: LogLine, meetingId: string, sinceNs: bigint): Promise<RawEntry[]> {
   const query = meetingLogql(line, meetingId);
   const params = new URLSearchParams({
     query,
@@ -413,8 +430,12 @@ async function entries(line: LogLine, meetingId: string, sinceNs: bigint): Promi
       cause: e,
     });
   }
-  const raw = classifyQueryRange(response.status, await response.text(), query);
-  return matchingEntries(line, meetingId, raw);
+  return classifyQueryRange(response.status, await response.text(), query);
+}
+
+/** Every `line` entry for `meetingId` since `sinceNs` (throws {@link LOKI_QUERY_FAILED}). */
+async function entries(line: LogLine, meetingId: string, sinceNs: bigint): Promise<Entry[]> {
+  return matchingEntries(line, meetingId, await rawEntries(line, meetingId, sinceNs));
 }
 
 /** Poll `read` until `decide` returns a value, or throw `timeout()` at the `deadline` (epoch ms). */
@@ -437,7 +458,7 @@ async function poll<T>(
  * meeting id), the four steps in the header.
  *
  * BUDGET (the same shape as Rust `meeting_end`): ONE deadline, `ceilingMs`
- * (MC's published disconnect grace + the log-ingest ceiling) from the call,
+ * (the log-ingest ceiling: a deliberate leave removes at once) from the call,
  * shared by the departure, created and end steps of EVERY meeting (they ended
  * concurrently on MC); then ONE release deadline, `ceilingMs` after that,
  * shared by every meeting's release (each still gets at least `ceilingMs` from
@@ -463,19 +484,18 @@ export async function proveMeetingsEnded(
     byMeeting.set(id, [...(byMeeting.get(id) ?? []), m]);
   }
   for (const [meetingId, ms] of byMeeting) {
-    // 1. Departure positive control: clean close OR grace expiry, per participant.
+    // 1. Departure positive control: the deliberate-leave line, per participant.
     const departures = await poll(
-      async () => [
-        ...(await entries(MC_CLEAN_CLOSE, meetingId, sinceNs)),
-        ...(await entries(MC_GRACE_EXPIRED, meetingId, sinceNs)),
-      ],
+      async () =>
+        departureEntries(meetingId, await rawEntries(MC_LEAVE_REQUEST, meetingId, sinceNs)),
       (ds) => (missingDepartures(ms, ds).length === 0 ? ds : undefined),
       deadline,
       () =>
-        `${DEPARTURE_NEVER_SEEN}: meeting ${meetingId}: no "${MC_CLEAN_CLOSE.message}" nor ` +
-        `"${MC_GRACE_EXPIRED.message}" line for member(s) ${ms.map((m) => m.label).join(', ')} ` +
-        `within ${ceilingMs} ms (LogQL \`${meetingLogql(MC_CLEAN_CLOSE, meetingId)}\`). MC never ` +
-        'removed them, or Loki is not ingesting mc-service.',
+        `${DEPARTURE_NEVER_SEEN}: meeting ${meetingId}: no "${MC_LEAVE_REQUEST.message}" line ` +
+        `for member(s) ${ms.map((m) => m.label).join(', ')} within ${ceilingMs} ms (LogQL ` +
+        `\`${meetingLogql(MC_LEAVE_REQUEST, meetingId)}\`). The SDK's LeaveRequest never reached ` +
+        'MC (a grace-expiry or clean-close departure does NOT count), or Loki is not ingesting ' +
+        'mc-service.',
     );
     // 2. Anchor this incarnation.
     const created = await poll(

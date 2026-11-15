@@ -12,7 +12,7 @@
 //! Tests that assert the production bcrypt cost factor itself (e.g.,
 //! `tests/bcrypt_metrics_integration.rs` asserting `ac_bcrypt_duration_seconds`
 //! buckets) call `crypto::hash_client_secret` directly with
-//! `DEFAULT_BCRYPT_COST` (12) — they don't need an `AppState` because they
+//! `RECOMMENDED_MIN_BCRYPT_COST` (12) — they don't need an `AppState` because they
 //! drive the crypto wrapper directly. The in-test direct-call form is the
 //! @operations + @dry-reviewer reconciled approach: no parallel
 //! `make_app_state_with_default_cost` factory needed.
@@ -44,16 +44,18 @@ pub fn make_app_state(pool: PgPool) -> Arc<AppState> {
         hash_secret: SecretBox::new(Box::new(master_key)),
         otel_enabled: false,
         otel_endpoint: String::new(),
-        otel_sample_rate: ac_service::config::DEFAULT_OTEL_SAMPLE_RATE,
-        environment: ac_service::config::DEFAULT_DEPLOYMENT_ENVIRONMENT.to_string(),
-        jwt_clock_skew_seconds: ac_service::config::DEFAULT_JWT_CLOCK_SKEW.as_secs() as i64,
+        otel_sample_rate: 1.0,
+        environment: "development".to_string(),
+        jwt_clock_skew_seconds: ac_service::config::RECOMMENDED_JWT_CLOCK_SKEW.as_secs() as i64,
         bcrypt_cost: MIN_BCRYPT_COST,
-        rate_limit_window_minutes: ac_service::config::DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-        rate_limit_max_attempts: ac_service::config::DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+        rate_limit_window_minutes: ac_service::config::RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+        rate_limit_max_attempts: ac_service::config::RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
         registration_rate_limit_window_minutes:
-            ac_service::config::DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
+            ac_service::config::RECOMMENDED_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
         registration_rate_limit_max_attempts:
-            ac_service::config::DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
+            ac_service::config::RECOMMENDED_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
+        cluster_name: "test-cluster".to_string(),
+        drain_seconds: 0,
     };
     Arc::new(AppState { pool, config })
 }
@@ -71,7 +73,7 @@ pub async fn seed_signing_key(pool: &PgPool) -> Result<(), anyhow::Error> {
 /// Seed a service credential in the test DB. Uses `MIN_BCRYPT_COST` because
 /// every caller treats bcrypt as incidental scaffolding (not the test's
 /// invariant). Bcrypt-bucket-fidelity tests drive `crypto::hash_client_secret`
-/// directly with `DEFAULT_BCRYPT_COST`.
+/// directly with `RECOMMENDED_MIN_BCRYPT_COST`.
 pub async fn seed_service_credential(
     pool: &PgPool,
     client_id: &str,

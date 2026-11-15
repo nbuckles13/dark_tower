@@ -1,5 +1,5 @@
 #[cfg(test)]
-use crate::config::DEFAULT_BCRYPT_COST;
+use crate::config::RECOMMENDED_MIN_BCRYPT_COST;
 use crate::crypto;
 use crate::errors::AcError;
 use crate::models::{AuthEventType, RegisterServiceResponse, ServiceCredential, ServiceType};
@@ -374,8 +374,13 @@ mod tests {
         let malicious_service_type = "global-controller'; DROP TABLE service_credentials; --";
 
         // This should either fail validation OR be safely escaped
-        let result =
-            register_service(&pool, malicious_service_type, None, DEFAULT_BCRYPT_COST).await;
+        let result = register_service(
+            &pool,
+            malicious_service_type,
+            None,
+            RECOMMENDED_MIN_BCRYPT_COST,
+        )
+        .await;
 
         // Should fail due to invalid service_type (doesn't match enum)
         assert!(
@@ -410,7 +415,7 @@ mod tests {
             &pool,
             "global-controller",
             Some(malicious_region.to_string()),
-            DEFAULT_BCRYPT_COST,
+            RECOMMENDED_MIN_BCRYPT_COST,
         )
         .await;
 
@@ -457,7 +462,7 @@ mod tests {
         ];
 
         let client_id = "test-sql-scopes";
-        let secret_hash = crypto::hash_client_secret("test-secret", DEFAULT_BCRYPT_COST)?;
+        let secret_hash = crypto::hash_client_secret("test-secret", RECOMMENDED_MIN_BCRYPT_COST)?;
 
         // SQLx should safely parameterize array values
         let credential = service_credentials::create_service_credential(
@@ -510,7 +515,8 @@ mod tests {
         ];
 
         for (client_id, region_value) in test_cases {
-            let secret_hash = crypto::hash_client_secret("test-secret", DEFAULT_BCRYPT_COST)?;
+            let secret_hash =
+                crypto::hash_client_secret("test-secret", RECOMMENDED_MIN_BCRYPT_COST)?;
 
             let credential = service_credentials::create_service_credential(
                 &pool,
@@ -552,7 +558,7 @@ mod tests {
     async fn test_oversized_input_handling(pool: PgPool) -> Result<(), AcError> {
         // Create an extremely long client_id (reasonable limit is ~255 chars)
         let long_client_id = "a".repeat(1000);
-        let secret_hash = crypto::hash_client_secret("test-secret", DEFAULT_BCRYPT_COST)?;
+        let secret_hash = crypto::hash_client_secret("test-secret", RECOMMENDED_MIN_BCRYPT_COST)?;
 
         // This should either succeed (if DB allows it) or fail gracefully
         let result = service_credentials::create_service_credential(
@@ -600,7 +606,8 @@ mod tests {
         ];
 
         for client_id in comment_attacks {
-            let secret_hash = crypto::hash_client_secret("test-secret", DEFAULT_BCRYPT_COST)?;
+            let secret_hash =
+                crypto::hash_client_secret("test-secret", RECOMMENDED_MIN_BCRYPT_COST)?;
 
             // Should succeed - comments are just part of the string value
             let credential = service_credentials::create_service_credential(
@@ -641,7 +648,8 @@ mod tests {
         ];
 
         for malicious_id in boolean_attacks {
-            let secret_hash = crypto::hash_client_secret("test-secret", DEFAULT_BCRYPT_COST)?;
+            let secret_hash =
+                crypto::hash_client_secret("test-secret", RECOMMENDED_MIN_BCRYPT_COST)?;
 
             // Create with malicious client_id
             service_credentials::create_service_credential(
@@ -694,7 +702,8 @@ mod tests {
         ];
 
         for malicious_id in union_attacks {
-            let secret_hash = crypto::hash_client_secret("test-secret", DEFAULT_BCRYPT_COST)?;
+            let secret_hash =
+                crypto::hash_client_secret("test-secret", RECOMMENDED_MIN_BCRYPT_COST)?;
 
             // SQLx should safely parameterize, treating this as a literal string
             let credential = service_credentials::create_service_credential(
@@ -748,7 +757,7 @@ mod tests {
         // Step 1: Store malicious data in a scope
         let malicious_scope = "admin:all'; DROP TABLE service_credentials; --";
         let client_id = "second-order-test";
-        let secret_hash = crypto::hash_client_secret("test-secret", DEFAULT_BCRYPT_COST)?;
+        let secret_hash = crypto::hash_client_secret("test-secret", RECOMMENDED_MIN_BCRYPT_COST)?;
 
         service_credentials::create_service_credential(
             &pool,
@@ -928,7 +937,7 @@ mod tests {
         ];
 
         let client_id = "time-based-test";
-        let secret_hash = crypto::hash_client_secret("test-secret", DEFAULT_BCRYPT_COST)?;
+        let secret_hash = crypto::hash_client_secret("test-secret", RECOMMENDED_MIN_BCRYPT_COST)?;
 
         let start_time = Instant::now();
 
@@ -989,7 +998,7 @@ mod tests {
                 &pool,
                 service_type,
                 Some("us-west-2".to_string()),
-                DEFAULT_BCRYPT_COST,
+                RECOMMENDED_MIN_BCRYPT_COST,
             )
             .await;
 
@@ -1030,8 +1039,13 @@ mod tests {
     /// Test service registration without region
     #[sqlx::test(migrations = "../../migrations")]
     async fn test_register_service_no_region(pool: PgPool) -> Result<(), AcError> {
-        let result =
-            register_service(&pool, "global-controller", None, DEFAULT_BCRYPT_COST).await?;
+        let result = register_service(
+            &pool,
+            "global-controller",
+            None,
+            RECOMMENDED_MIN_BCRYPT_COST,
+        )
+        .await?;
 
         let credential = service_credentials::get_by_client_id(&pool, &result.client_id)
             .await?
@@ -1046,8 +1060,13 @@ mod tests {
     /// and leaves `is_active` alone.
     #[sqlx::test(migrations = "../../migrations")]
     async fn test_update_service_scopes(pool: PgPool) -> Result<(), AcError> {
-        let response =
-            register_service(&pool, "meeting-controller", None, DEFAULT_BCRYPT_COST).await?;
+        let response = register_service(
+            &pool,
+            "meeting-controller",
+            None,
+            RECOMMENDED_MIN_BCRYPT_COST,
+        )
+        .await?;
         let credential = service_credentials::get_by_client_id(&pool, &response.client_id)
             .await?
             .expect("Credential should exist");
@@ -1130,7 +1149,8 @@ mod tests {
     /// Deactivation flips `is_active`, and repeating it is a no-op `Ok`.
     #[sqlx::test(migrations = "../../migrations")]
     async fn test_deactivate_service(pool: PgPool) -> Result<(), AcError> {
-        let response = register_service(&pool, "media-handler", None, DEFAULT_BCRYPT_COST).await?;
+        let response =
+            register_service(&pool, "media-handler", None, RECOMMENDED_MIN_BCRYPT_COST).await?;
         let credential = service_credentials::get_by_client_id(&pool, &response.client_id)
             .await?
             .expect("Credential should exist");
@@ -1168,7 +1188,8 @@ mod tests {
     /// Test registration with invalid service type
     #[sqlx::test(migrations = "../../migrations")]
     async fn test_register_invalid_service_type(pool: PgPool) -> Result<(), AcError> {
-        let result = register_service(&pool, "invalid-service", None, DEFAULT_BCRYPT_COST).await;
+        let result =
+            register_service(&pool, "invalid-service", None, RECOMMENDED_MIN_BCRYPT_COST).await;
 
         // A fixed message: the caller's input is never echoed into the body.
         assert!(

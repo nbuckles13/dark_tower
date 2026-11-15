@@ -157,7 +157,20 @@ async fn handle_meeting_join(meeting_id: &str, region: &str, gc_id: &str) -> Res
 }
 ```
 
-**Key design points**:
+*Amended 2026-11-15 (meeting-end-safety): the sketch above predates the
+shipped flow, and its `status = 'healthy'` test on an EXISTING assignment is
+superseded.* The shipped flow (`McAssignmentService::assign_meeting_with_mh`,
+`MeetingAssignmentsRepository::atomic_assign`) keys every decision about an
+existing row on **MC liveness — heartbeat younger than
+`MC_STALENESS_THRESHOLD_SECONDS` — never on `health_status`**: Step 1 reuses
+the row of any live MC (healthy, degraded, draining or re-registered — it still
+holds the meeting, and sending a joiner elsewhere would split it), and the
+atomic write re-points a row only when it has ENDED or its MC is no longer
+alive. Only Step 2 (placing a NEW meeting) also requires `healthy`. GC calls
+MC's `AssignMeetingWithMh` BEFORE the write, with a fresh `assignment_id` per
+attempt, and the write must commit within the accept->commit budget (§3).
+
+**Key design points** (original; read with the amendment above):
 - Step 1 only returns assignments with **healthy** MCs (status + recent heartbeat)
 - Step 3 uses a CTE to atomically end unhealthy assignments AND insert the new one
 - The `NOT EXISTS` check prevents inserting if another GC already assigned a healthy MC
@@ -227,12 +240,14 @@ Assignments are marked ended (soft delete) when:
      `last_participant_left`.
    - no participant has joined within the **join window**, measured from the
      moment GC's assignment created the meeting — `MC_MEETING_JOIN_WINDOW_SECONDS`,
-     a short configured window (production 30 s; fail-loud on an invalid
-     value, floor one MC lifetime tick). Unset, it falls back to a derived
-     value that is also its CEILING: the longest lifetime AC gives any
-     meeting/guest token, plus JWT expiry leeway, plus the SDK's join
-     deadline — past that, no credential issued at assignment can still
-     produce a participant, so no configuration can re-open the leak. MC ends
+     a short configured window (production 30 s). *Amended 2026-11-15:*
+     `MC_MEETING_JOIN_WINDOW_SECONDS` is REQUIRED (bounds [the floor
+     `common::meeting_lifecycle::MIN_MEETING_JOIN_WINDOW`, derived ceiling]);
+     there is no fallback value. The derived ceiling — the longest lifetime AC
+     gives any meeting/guest token, plus JWT expiry leeway, plus the SDK's join
+     deadline — is a ceiling, never a value MC runs: past it no credential
+     issued at assignment can still produce a participant, so no
+     configuration can re-open the leak. MC ends
      the meeting AT the window — an exact deadline, not a polled check. An
      observer (test, operator) should allow up to one lifetime tick past it
      as tolerance (`window ≤ age ≤ window + one lifetime tick`); that term is
@@ -245,6 +260,40 @@ Assignments are marked ended (soft delete) when:
    The notify carries no cause; GC treats both alike. A join after the end
    finds the row ended and is a NEW incarnation: GC re-selects MC and MHs and
    sends a fresh `AssignMeetingWithMh` (`atomic_assign` revives the row).
+
+   **The notify is fenced by incarnation** (*amended 2026-11-15*; wire rules
+   at `NotifyMeetingEndedRequest` in `internal.proto`). GC mints a random
+   `assignment_id` for every `AssignMeetingWithMh` attempt and writes it on
+   the row (insert, revive, re-point) only for the attempt MC accepted. The
+   notify carries MC's `controller_id` and the `assignment_id` GC sent with
+   the assignment; GC ends ONLY the live row naming both, in one statement,
+   and answers `ENDED` or `NOT_CURRENT` (both success). A notify can therefore
+   end nothing but the incarnation it names — not a later incarnation revived
+   after it, not a row a join failed over to another MC, not the winner's row
+   of an assignment race whose loser left an orphan meeting on this MC — so MC
+   retries every failure except `INVALID_ARGUMENT`, with capped backoff, until
+   answered or shutdown. GC counts each answer in
+   `gc_meeting_end_notifications_total{outcome=ended|already_ended|fenced}`.
+   `controller_id` is a narrowing match, not authorization: it is
+   self-asserted under the MC service credential shared by every MC.
+
+   **Fence invariant**: a live row (MC X, `assignment_id` i) implies X
+   accepted i. GC writes a row only after MC accepted that id, and MC holds
+   at most one `assignment_id` per live meeting (a second
+   `AssignMeetingWithMh` for a meeting it holds is refused, leaving the held
+   meeting untouched). The write follows the MC call, so it must COMMIT
+   within the **accept->commit budget** (`GC_ASSIGN_COMMIT_BUDGET_MS`,
+   measured from GC's send, at most half of
+   `MIN_MEETING_JOIN_WINDOW`): otherwise MC could end the unjoined meeting at
+   its join window before the row exists, its notify would find nothing, and
+   the row would name a live MC that no longer holds the meeting. GC acquires
+   a connection and begins the transaction within the remaining budget,
+   re-checks it, sets `statement_timeout` to what remains, and writes; on any
+   miss no row is written and the next MC is tried with a new id, leaving the
+   accepting MC a fenced orphan that ends at its join window. Calling MC
+   first (rather than claiming the row first) is deliberate: a GC killed
+   between a claim and the MC call would leave a live row on a healthy MC that
+   never received the meeting, stranded with no backstop.
 
    **Late joiners.** GC's sticky-join reuse path does not contact MC, so a GC
    join never extends the window, and the row stays live from the window's end
@@ -270,28 +319,41 @@ Assignments are marked ended (soft delete) when:
    ends a meeting for inactivity; the job this item named was never that.
 3. **MC failure (backstop)**: GC's assignment cleanup job
    (`crates/gc-service/src/tasks/assignment_cleanup.rs`) ends active rows
-   whose MC is no longer healthy (heartbeat stale) and that are older than
-   `GC_INACTIVITY_HOURS` — rows MC never reported because it died first. Its
-   safety property is MC liveness, not row age: a row whose MC still
-   heartbeats is never ended by the job, so it cannot hand a live meeting to a
-   second MC. Joins fail such rows over sooner anyway (`atomic_assign`'s
-   unhealthy/stale-MC arm). The same job hard-deletes ended rows after
-   `GC_RETENTION_DAYS` (below). Invalid values for its settings refuse startup.
+   whose MC is **no longer alive** — heartbeat older than
+   `MC_STALENESS_THRESHOLD_SECONDS` — and that are older than
+   `GC_INACTIVITY_HOURS`: rows MC never reported because it died first.
+   *Corrected 2026-11-15:* liveness is heartbeat freshness, NEVER
+   `health_status`. A `degraded`, `draining` or re-registered (`pending`) MC
+   still heartbeats and still holds its meetings, so the job never ends its
+   rows (the job previously selected `health_status != 'healthy'`, which
+   ended a draining MC's live meetings and split them across two MCs); and a
+   draining MC that dies is ended even though the stale sweeper never
+   re-marks `draining` as `unhealthy`. The same single liveness predicate
+   governs join reuse and the join failover arm (§1 amendment), so the three
+   cannot disagree. The same job hard-deletes ended rows after
+   `GC_RETENTION_DAYS` (below). All of its settings, and the liveness
+   threshold, are REQUIRED: a missing or invalid value refuses startup.
 
-   **Residuals the backstop does NOT cover**, alongside item 1's slow-MH
-   residual (docs/TODO.md, "`NotifyMeetingEnded` is not incarnation-safe"): (1) a notify that fails
-   ambiguously, uncommitted, while MC stays healthy leaves a live row for a
-   meeting MC no longer holds — joins get `meeting_not_found` until MC
-   restarts or is marked unhealthy; item 1's join-window ends raise notify
-   volume, and with it exposure to this residual, in proportion. (2) a join's
-   failover re-pointing a row to another MC can race the old MC's in-flight
-   notify and end the new MC's live row.
+   **What remains outside the fence and the backstop**, alongside item 1's
+   slow-MH residual:
+   (1) a notify MC cannot deliver at all (GC unreachable from MC) leaves the
+   row live while MC retries; MC's heartbeats fail over the same path, so the
+   row goes stale and the next join fails it over. An MC process that dies
+   with a notify still pending is the backstop's case.
+   (2) an accept->commit budget breach that `statement_timeout` cannot stop —
+   a COMMIT already being written, or network time — can still land a row
+   after MC ended the meeting. The other half of `MIN_MEETING_JOIN_WINDOW` is
+   the margin for it; a breach shows as a sustained
+   `gc_meeting_end_notifications_total{outcome="fenced"}` and joins to that id
+   fail with `meeting_not_found` until that MC stops heartbeating.
 
 ```sql
--- Soft delete: mark ended_at instead of DELETE
+-- Soft delete, fenced to one incarnation (NotifyMeetingEnded)
 UPDATE meeting_assignments
 SET ended_at = NOW()
-WHERE meeting_id = $1 AND ended_at IS NULL;
+WHERE meeting_id = $1 AND region = $2
+  AND meeting_controller_id = $3 AND assignment_id = $4
+  AND ended_at IS NULL;
 
 -- Hard delete: background job removes old assignments (configurable, default 7 days)
 DELETE FROM meeting_assignments
@@ -1130,7 +1192,7 @@ CREATE INDEX idx_denylist_expires ON token_denylist(expires_at);
 | Fast | 10s | Lightweight capacity snapshot |
 | Comprehensive | 30s | Full health metrics (CPU, memory, per-meeting stats) |
 
-**Failure Detection**: MC marked unhealthy after 30s without heartbeat.
+**Failure Detection**: MC marked unhealthy after `MC_STALENESS_THRESHOLD_SECONDS` (shipped 30 s; must exceed the 10 s fast-heartbeat interval) without heartbeat. That same threshold is GC's one definition of MC liveness for assignment rows (§1 amendment, §3 item 3).
 
 ### 10. Performance SLOs
 

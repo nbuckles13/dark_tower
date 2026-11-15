@@ -54,6 +54,37 @@ spec:
             secretKeyRef:
               name: ac-service-secrets
               key: AC_MASTER_KEY
+        # REQUIRED (meeting-end safety P2): AC used to fall back to 32 ZERO
+        # bytes — a publicly known HMAC key — when this was unset, and this
+        # manifest never set it. Provisioned beside AC_MASTER_KEY
+        # (infra/kind/scripts/provision.sh).
+        - name: AC_HASH_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: ac-service-secrets
+              key: AC_HASH_SECRET
+        # REQUIRED behaviour/topology keys (meeting-end safety P2): no Rust
+        # default; base values in config.env.
+        - name: BIND_ADDRESS
+          valueFrom:
+            configMapKeyRef:
+              name: ac-service-config
+              key: BIND_ADDRESS
+        - name: JWT_CLOCK_SKEW_SECONDS
+          valueFrom:
+            configMapKeyRef:
+              name: ac-service-config
+              key: JWT_CLOCK_SKEW_SECONDS
+        - name: BCRYPT_COST
+          valueFrom:
+            configMapKeyRef:
+              name: ac-service-config
+              key: BCRYPT_COST
+        - name: AC_DRAIN_SECONDS
+          valueFrom:
+            configMapKeyRef:
+              name: ac-service-config
+              key: AC_DRAIN_SECONDS
         - name: AC_RATE_LIMIT_WINDOW_MINUTES
           valueFrom:
             configMapKeyRef:

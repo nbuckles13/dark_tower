@@ -770,6 +770,11 @@ pub async fn handle_connection(
 ///   cause is resolved via [`resolve_close_cause`]
 /// - The outbound channel closes (ParticipantActor stopped) →
 ///   [`DisconnectCause::ServerInitiated`]
+/// - The client sends `LeaveRequest` → the participant is removed at once by
+///   the meeting actor, MC closes the session, and the loop returns
+///   [`DisconnectCause::ServerInitiated`] (the close that follows no-ops: the
+///   participant is already gone, so nothing is counted). This is the ONLY
+///   way a deliberate leave is recognised: close ORDER is never read as one.
 ///
 /// Each arm cleanly `return`s or `break`s — no busy-loop. A FRESH
 /// `connection.closed()` future is created each iteration (cancellation-safe to
@@ -848,13 +853,23 @@ async fn run_bridge_loop(
             result = read_framed_message(recv_stream) => {
                 match result {
                     Ok(data) => {
-                        handle_client_message(
+                        let next = handle_client_message(
                             &data,
                             connection_id,
                             participant_handle,
                             media,
                         )
                         .await;
+                        if next == AfterClientMessage::Left {
+                            // TERMINAL (signaling.proto `LeaveRequest` (f)):
+                            // nothing buffered behind the leave is processed.
+                            // The participant is already removed; MC closes
+                            // the session itself — the client's acknowledgement
+                            // — and the close that follows no-ops in the actor
+                            // (participant gone), so nothing counts twice.
+                            connection.close(LEAVE_CLOSE_CODE, b"");
+                            return DisconnectCause::ServerInitiated;
+                        }
                     }
                     Err(e) => {
                         // The client's recv stream ended. Resolve the authoritative
@@ -909,14 +924,14 @@ async fn handle_client_message(
     connection_id: &str,
     participant_handle: &ParticipantActorHandle,
     media: &mut MediaSignalingContext,
-) {
+) -> AfterClientMessage {
     let Ok(client_message) = ClientMessage::decode(data) else {
         debug!(
             target: "mc.webtransport.connection",
             connection_id = %connection_id,
             "Failed to decode post-join client message, ignoring"
         );
-        return;
+        return AfterClientMessage::Continue;
     };
 
     // Read the trace fields off the envelope before the `match` moves `.message`.
@@ -954,6 +969,26 @@ async fn handle_client_message(
         Some(client_message::Message::UnmuteRequest(request)) => {
             handle_unmute_request(&request, connection_id, participant_handle, media).await;
         }
+        Some(client_message::Message::LeaveRequest(_)) => {
+            // The deliberate leave. Its authority is THIS bound, authenticated
+            // stream: the participant id is the server-stamped one from the
+            // join, never anything the client sent, and the actor honours it
+            // only while this connection is the participant's live one.
+            if let Err(e) = media
+                .meeting_handle
+                .participant_leave(media.participant_id.clone(), connection_id.to_string())
+                .await
+            {
+                // The actor is gone (meeting ending): the session ends anyway.
+                debug!(
+                    target: "mc.webtransport.connection",
+                    connection_id = %connection_id,
+                    error = %e,
+                    "LeaveRequest could not reach the meeting actor"
+                );
+            }
+            return AfterClientMessage::Left;
+        }
         Some(_) => {
             debug!(
                 target: "mc.webtransport.connection",
@@ -969,7 +1004,21 @@ async fn handle_client_message(
             );
         }
     }
+    AfterClientMessage::Continue
 }
+
+/// What the bridge loop does after one client message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AfterClientMessage {
+    /// Keep reading.
+    Continue,
+    /// The client sent `LeaveRequest`: the session is over.
+    Left,
+}
+
+/// The application close code MC sends when it closes a session after the
+/// client's `LeaveRequest` (0 = no error: the close is the acknowledgement).
+const LEAVE_CLOSE_CODE: wtransport::VarInt = wtransport::VarInt::from_u32(0);
 
 /// Handle a post-join `MediaConnectionUpdate` (R-60): count each status by
 /// state, then forward the ref-keyed reports to the meeting actor.

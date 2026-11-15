@@ -148,12 +148,27 @@ run_local_service() {
     log_info "============================================"
     echo ""
 
+    # The service's BASE config.env first: every behaviour/topology key is
+    # REQUIRED in code (no Rust defaults since the meeting-end-safety devloop),
+    # so a local run takes the same values the cluster does; the local
+    # overrides below win. A missing file is fatal, never skipped.
+    local base_env="${PROJECT_ROOT}/infra/services/${BINARY}/config.env"
+    if [[ ! -f "${base_env}" ]]; then
+        log_error "missing ${base_env}: cannot supply ${BINARY}'s required configuration"
+        exit 1
+    fi
+    set -a
+    # shellcheck disable=SC1090
+    source "${base_env}"
+    set +a
+
     # Export environment variables that the service needs
     local pg_secret="${PROJECT_ROOT}/infra/services/postgres/secret.yaml"
     export DATABASE_URL
     DATABASE_URL="postgresql://$(pg_secret_value POSTGRES_USER "${pg_secret}"):$(pg_secret_value POSTGRES_PASSWORD "${pg_secret}")@localhost:5432/$(pg_secret_value POSTGRES_DB "${pg_secret}")"
     export AC_MASTER_KEY="AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
-    export AC_HASH_SECRET="AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+    # Distinct from AC_MASTER_KEY (key separation); same value as provision.sh.
+    export AC_HASH_SECRET="ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8="
     export RUST_LOG="info,${BINARY//-/_}=debug"
     export BIND_ADDRESS="0.0.0.0:${PORT}"
     # Disable drain period for fast local shutdown (production uses 30s)

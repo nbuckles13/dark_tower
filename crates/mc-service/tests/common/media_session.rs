@@ -96,6 +96,17 @@ pub fn capability_frame(slots: Vec<ReceiveSlot>) -> bytes::BytesMut {
     })
 }
 
+/// A framed `LeaveRequest` (the deliberate leave; empty by design).
+pub fn leave_frame() -> bytes::BytesMut {
+    encode_framed(&ClientMessage {
+        trace_parent: String::new(),
+        trace_state: String::new(),
+        message: Some(client_message::Message::LeaveRequest(
+            proto_gen::dark_tower::signaling::v1::LeaveRequest {},
+        )),
+    })
+}
+
 /// A framed `MuteRequest` naming BOTH kinds explicitly.
 pub fn mute_frame(audio_muted: bool, video_muted: bool) -> bytes::BytesMut {
     mute_kinds_frame(Some(audio_muted), Some(video_muted))
@@ -244,6 +255,14 @@ impl Session {
     /// `ClientClosed` and removes the participant immediately, skipping grace.
     pub fn close(self) {
         self.conn.close(wtransport::VarInt::from_u32(0), b"leave");
+    }
+
+    /// Whether MC closed this session within `bound` (MC closes it itself
+    /// after a `LeaveRequest`: that close is the client's acknowledgement).
+    pub async fn closed_by_mc_within(&self, bound: Duration) -> bool {
+        tokio::time::timeout(bound, self.conn.closed())
+            .await
+            .is_ok()
     }
 
     /// Write a framed client message.

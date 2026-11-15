@@ -12,7 +12,9 @@
 
 use crate::auth::Claims;
 use crate::observability::metrics::{self, GcView, ReplacementTrigger};
-use crate::repositories::{HealthStatus, MeetingControllersRepository};
+use crate::repositories::{
+    AssignmentId, EndAssignmentOutcome, HealthStatus, MeetingControllersRepository,
+};
 use crate::routes::AppState;
 use crate::services::mh_replacement::{self, Rejection, Report, Validated};
 use crate::services::weighted_pick::{SelectionRng, SystemSelectionRng};
@@ -21,15 +23,18 @@ use proto_gen::dark_tower::internal::v1::global_controller_service_server::Globa
 use proto_gen::dark_tower::internal::v1::{
     AcquireMediaHandlerRequest, AcquireMediaHandlerResponse, ComprehensiveHeartbeatRequest,
     ComprehensiveHeartbeatResponse, FastHeartbeatRequest, FastHeartbeatResponse, MhAssignment,
-    NotifyMeetingEndedRequest, NotifyMeetingEndedResponse, RegisterMcRequest, RegisterMcResponse,
+    NotifyMeetingEndedOutcome, NotifyMeetingEndedRequest, NotifyMeetingEndedResponse,
+    RegisterMcRequest, RegisterMcResponse,
 };
 use std::sync::Arc;
 use std::time::Instant;
 use tonic::{Request, Response, Status};
 use tracing::instrument;
 
-/// Default fast heartbeat interval in milliseconds (10 seconds).
-const DEFAULT_FAST_HEARTBEAT_INTERVAL_MS: u64 = 10_000;
+/// Default fast heartbeat interval in milliseconds (10 seconds), pushed to
+/// every MC in `RegisterMcResponse`. `McAssignmentConfig` refuses an MC
+/// staleness threshold that does not exceed it.
+pub(crate) const DEFAULT_FAST_HEARTBEAT_INTERVAL_MS: u64 = 10_000;
 
 /// Default comprehensive heartbeat interval in milliseconds (30 seconds).
 const DEFAULT_COMPREHENSIVE_HEARTBEAT_INTERVAL_MS: u64 = 30_000;
@@ -491,27 +496,37 @@ impl GlobalControllerService for McService {
     ///
     /// Called when a meeting ends on MC: the last participant left, or no
     /// participant connected within MC's join window (ADR-0010 §3). The notify
-    /// carries no cause; GC handles both the same way. Marks the assignment as
-    /// ended (soft delete) for audit trail; the next join revives the row as a
-    /// new incarnation (`atomic_assign`).
+    /// carries no cause; GC handles both the same way.
+    ///
+    /// FENCED (rules at `NotifyMeetingEndedRequest` in `internal.proto`): GC
+    /// ends ONLY the live row naming both `controller_id` and `assignment_id`,
+    /// so a notify ends nothing but the incarnation it names, and MC may
+    /// re-send it. Every field is REQUIRED (`INVALID_ARGUMENT` otherwise).
+    /// `ENDED` and `NOT_CURRENT` are both success: MC stops retrying on either.
     #[instrument(skip_all, name = "gc.grpc.notify_meeting_ended")]
     async fn notify_meeting_ended(
         &self,
         request: Request<NotifyMeetingEndedRequest>,
     ) -> Result<Response<NotifyMeetingEndedResponse>, Status> {
+        // Validated service subject from the auth layer (absent only in test
+        // rigs without it): logged on a fenced notify for attribution.
+        let caller_sub = request.extensions().get::<Claims>().map(|c| c.sub.clone());
         let req = request.into_inner();
 
-        // Validate meeting_id (including character validation)
         Self::validate_meeting_id(&req.meeting_id)?;
-
-        // Validate region
         super::validate_region(&req.region)?;
+        Self::validate_controller_id(&req.controller_id)?;
+        // One definition of a valid id, shared with MC. The error names the
+        // rule broken, never echoes the input.
+        let assignment_id = AssignmentId::parse(&req.assignment_id)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
-        // End the assignment
-        let count = McAssignmentService::end_assignment(
+        let outcome = McAssignmentService::end_assignment(
             &self.state.pool,
             &req.meeting_id,
-            Some(&req.region),
+            &req.region,
+            &req.controller_id,
+            assignment_id,
         )
         .await
         .map_err(|e| {
@@ -525,19 +540,44 @@ impl GlobalControllerService for McService {
             Status::internal("Failed to end meeting assignment")
         })?;
 
-        // Note: Service layer logs with count, so we only log here for debug-level
-        // when no assignment was found.
-        if count == 0 {
-            tracing::debug!(
-                target: "gc.grpc.notify_meeting_ended",
-                meeting_id = %req.meeting_id,
-                region = %req.region,
-                "No active assignment found to end (may already be ended)"
-            );
-        }
+        metrics::record_meeting_end_notification(outcome);
+
+        // `Ended` is logged at INFO by the service layer (the single record
+        // of an end).
+        let wire = match outcome {
+            EndAssignmentOutcome::Ended => NotifyMeetingEndedOutcome::Ended,
+            EndAssignmentOutcome::AlreadyEnded => {
+                tracing::debug!(
+                    target: "gc.grpc.notify_meeting_ended",
+                    meeting_id = %req.meeting_id,
+                    region = %req.region,
+                    mc_id = %req.controller_id,
+                    caller_sub = caller_sub.as_deref().unwrap_or("-"),
+                    "No live assignment to end (already ended)"
+                );
+                NotifyMeetingEndedOutcome::NotCurrent
+            }
+            EndAssignmentOutcome::Fenced => {
+                // No row of THIS incarnation exists: this notify is late (a
+                // revive / failover re-point replaced its row) or from an
+                // orphan whose row never committed (lost assignment race, or a
+                // missed accept->commit budget).
+                // Ids are not secrets; logged for correlation with MC's lines.
+                tracing::warn!(
+                    target: "gc.grpc.notify_meeting_ended",
+                    meeting_id = %req.meeting_id,
+                    region = %req.region,
+                    mc_id = %req.controller_id,
+                    assignment_id = %assignment_id,
+                    caller_sub = caller_sub.as_deref().unwrap_or("-"),
+                    "Meeting-ended notify fenced: no row of this incarnation exists; nothing ended"
+                );
+                NotifyMeetingEndedOutcome::NotCurrent
+            }
+        };
 
         Ok(Response::new(NotifyMeetingEndedResponse {
-            acknowledged: true,
+            outcome: wire.into(),
         }))
     }
 }

@@ -69,7 +69,7 @@ async fn minimal_app_state(pool: PgPool) -> Arc<AppState> {
         ("GC_CLIENT_ID".to_string(), "test-gc-client".to_string()),
         ("GC_CLIENT_SECRET".to_string(), "test-gc-secret".to_string()),
     ]);
-    vars.extend(gc_test_utils::mh_config_vars());
+    gc_test_utils::fill_required_config(&mut vars);
     let config = Config::from_vars(&vars).expect("config should load");
     let (_tx, rx) = watch::channel(SecretString::from("test-token"));
     let token_receiver = TokenReceiver::from_watch_receiver(rx);

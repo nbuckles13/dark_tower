@@ -90,6 +90,7 @@ async fn test_assign_meeting_with_mh_success(pool: PgPool) {
         "us-east-1",
         "gc-test",
         &gc_test_utils::reference_mh_registry(),
+        &gc_test_utils::reference_mc_assignment(),
     )
     .await;
 
@@ -134,6 +135,7 @@ async fn test_assign_meeting_with_mh_retries_on_rejection(pool: PgPool) {
         "us-east-1",
         "gc-test",
         &gc_test_utils::reference_mh_registry(),
+        &gc_test_utils::reference_mc_assignment(),
     )
     .await;
 
@@ -161,6 +163,7 @@ async fn test_assign_meeting_with_mh_fails_after_max_retries(pool: PgPool) {
         "us-east-1",
         "gc-test",
         &gc_test_utils::reference_mh_registry(),
+        &gc_test_utils::reference_mc_assignment(),
     )
     .await;
 
@@ -224,6 +227,7 @@ async fn test_assign_meeting_with_mh_invalid_request_fails_fast(pool: PgPool) {
         "us-east-1",
         "gc-test",
         &gc_test_utils::reference_mh_registry(),
+        &gc_test_utils::reference_mc_assignment(),
     )
     .await;
 
@@ -265,9 +269,14 @@ async fn test_assign_meeting_with_mh_invalid_request_fails_fast(pool: PgPool) {
     );
 
     // No assignment row was written — fail-fast returns before the DB write.
-    let existing = McAssignmentService::get_assignment(&pool, "meeting-invalid-001", "us-east-1")
-        .await
-        .expect("assignment lookup should succeed");
+    let existing = McAssignmentService::get_assignment(
+        &pool,
+        "meeting-invalid-001",
+        "us-east-1",
+        gc_test_utils::reference_mc_assignment().mc_staleness(),
+    )
+    .await
+    .expect("assignment lookup should succeed");
     assert!(
         existing.is_none(),
         "fail-fast must not persist an assignment row"
@@ -295,6 +304,7 @@ async fn test_invalid_request_claim_on_wellformed_request_preserves_failover(poo
         "us-east-1",
         "gc-test",
         &gc_test_utils::reference_mh_registry(),
+        &gc_test_utils::reference_mc_assignment(),
     )
     .await;
 
@@ -338,6 +348,7 @@ async fn test_assign_meeting_with_mh_no_mcs(pool: PgPool) {
         "us-east-1",
         "gc-test",
         &gc_test_utils::reference_mh_registry(),
+        &gc_test_utils::reference_mc_assignment(),
     )
     .await;
 
@@ -367,6 +378,7 @@ async fn test_assign_meeting_with_mh_no_mhs(pool: PgPool) {
         "us-east-1",
         "gc-test",
         &gc_test_utils::reference_mh_registry(),
+        &gc_test_utils::reference_mc_assignment(),
     )
     .await;
 
@@ -404,6 +416,7 @@ async fn test_assign_meeting_with_mh_returns_existing(pool: PgPool) {
         "us-east-1",
         "gc-test",
         &gc_test_utils::reference_mh_registry(),
+        &gc_test_utils::reference_mc_assignment(),
     )
     .await
     .expect("first assignment should succeed");
@@ -420,6 +433,7 @@ async fn test_assign_meeting_with_mh_returns_existing(pool: PgPool) {
         "us-east-1",
         "gc-test",
         &gc_test_utils::reference_mh_registry(),
+        &gc_test_utils::reference_mc_assignment(),
     )
     .await
     .expect("reuse should succeed");
@@ -479,6 +493,7 @@ async fn test_reuse_path_skips_mh_selection_on_empty_pool(pool: PgPool) {
         "us-east-1",
         "gc-test",
         &gc_test_utils::reference_mh_registry(),
+        &gc_test_utils::reference_mc_assignment(),
     )
     .await
     .expect("new assignment should succeed with a healthy MH pool");
@@ -500,6 +515,7 @@ async fn test_reuse_path_skips_mh_selection_on_empty_pool(pool: PgPool) {
         "us-east-1",
         "gc-test",
         &gc_test_utils::reference_mh_registry(),
+        &gc_test_utils::reference_mc_assignment(),
     )
     .await
     .expect("reuse must not depend on a live MH pool");
@@ -532,6 +548,7 @@ async fn test_reuse_path_skips_mh_selection_on_empty_pool(pool: PgPool) {
         "us-east-1",
         "gc-test",
         &gc_test_utils::reference_mh_registry(),
+        &gc_test_utils::reference_mc_assignment(),
     )
     .await
     .expect_err("a new assignment must fail with an empty MH pool");
@@ -572,6 +589,7 @@ async fn test_assign_meeting_with_mh_retries_on_rpc_error(pool: PgPool) {
         "us-east-1",
         "gc-test",
         &gc_test_utils::reference_mh_registry(),
+        &gc_test_utils::reference_mc_assignment(),
     )
     .await;
 
@@ -602,6 +620,7 @@ async fn test_assign_meeting_with_mh_mixed_rejection_then_accept(pool: PgPool) {
         "us-east-1",
         "gc-test",
         &gc_test_utils::reference_mh_registry(),
+        &gc_test_utils::reference_mc_assignment(),
     )
     .await;
 
@@ -647,6 +666,7 @@ async fn test_mh_selection_includes_multiple_handlers(pool: PgPool) {
             )
             .expect("valid registry")
         },
+        &gc_test_utils::reference_mc_assignment(),
     )
     .await;
 
@@ -687,6 +707,7 @@ async fn test_mh_selection_single_mh_one_handler(pool: PgPool) {
         "us-east-1",
         "gc-test",
         &gc_test_utils::reference_mh_registry(),
+        &gc_test_utils::reference_mc_assignment(),
     )
     .await;
 
@@ -742,6 +763,7 @@ async fn test_concurrent_assignment_same_meeting(pool: PgPool) {
             "us-east-1",
             "gc-test",
             &gc_test_utils::reference_mh_registry(),
+            &gc_test_utils::reference_mc_assignment(),
         )
         .await
     });
@@ -756,6 +778,7 @@ async fn test_concurrent_assignment_same_meeting(pool: PgPool) {
             "us-east-1",
             "gc-test",
             &gc_test_utils::reference_mh_registry(),
+            &gc_test_utils::reference_mc_assignment(),
         )
         .await
     });

@@ -65,7 +65,6 @@ import {
   gcRecomputeSuccessByInstance,
   gcSelectableByInstance,
   gcStalenessSecondsByReplica,
-  mcDisconnectGraceMs,
   mcReplacementRetryBudgetMs,
   mhScrapeTimestampByInstance,
   mhScrapeUpByInstance,
@@ -277,7 +276,7 @@ interface LegBounds {
   readonly timings: ResilienceTimings;
   readonly ceilings: ResilienceCeilings;
   readonly settleBudgetMs: number;
-  /** The per-meeting end proof's FAILURE ceiling: MC's published grace + log ingest. */
+  /** The per-meeting end proof's FAILURE ceiling: the log-ingest ceiling (a leave is immediate). */
   readonly meetingEndCeilingMs: number;
 }
 
@@ -286,11 +285,10 @@ async function legBounds(testInfo: TestInfo): Promise<LegBounds> {
   const retryBudgetMs = await mcReplacementRetryBudgetMs();
   const ceilings = resilienceCeilings(timings, retryBudgetMs, HEAR_SENDER_TIMEOUT_MS);
   const settleBudgetMs = await removalSettleBudgetMs(timings);
-  // MC holds a browser leaver through its disconnect grace today (docs/TODO.md,
-  // "MC classifies the browser SDK's CLEAN disconnect as `server_initiated`"), so
-  // the end proof's ceiling is that grace, read from MC's config echo (the same
-  // source as Rust `metrics::mc_disconnect_grace`), plus the log-ingest ceiling.
-  const meetingEndCeilingMs = (await mcDisconnectGraceMs()) + LOG_AGGREGATION_CEILING_MS;
+  // The SDK's disconnect() sends a LeaveRequest and MC removes the participant
+  // at once (no disconnect grace), so the end proof's ceiling is the log-ingest
+  // ceiling alone; a leave that never arrived fails the proof (mcLoki.ts step 1).
+  const meetingEndCeilingMs = LOG_AGGREGATION_CEILING_MS;
   testInfo.setTimeout(
     // before/after baseline + the removed-MH settle + the meeting-end proof's whole
     // budget (`meetingEndBudgetMs`: its shared deadline + one release window) +
@@ -419,14 +417,12 @@ async function afterLeg(
   }
   // BEFORE the owner teardown, on purpose: a meeting still live when the
   // run-owned MH goes would make MC acquire a replacement for it (the orphan
-  // class). `leaveGracefully` proves only that the SDK reached `disconnecting`,
-  // not that MC heard the leave, so each meeting is PROVED ended and released
-  // from MC's own lines (`mcLoki.ts`). Do not "simplify" this back into a
-  // fleet-counter wait or drop it. The departure check accepts MC's grace-expiry
-  // line beside its clean-close line because MC classifies the SDK's leave as
-  // `server_initiated` today (docs/TODO.md, "MC classifies the browser SDK's
-  // CLEAN disconnect as `server_initiated`"); that is also why this step costs
-  // about one disconnect grace until that is fixed.
+  // class). `leaveGracefully` proves MC acknowledged each participant's leave,
+  // not that the MEETING ended and its handlers were released, so each meeting
+  // is PROVED ended and released from MC's own lines (`mcLoki.ts`). Do not "simplify" this back into a
+  // fleet-counter wait or drop it. The departure check accepts ONLY MC's
+  // deliberate-leave line ("Participant left (LeaveRequest)"): a grace-expiry
+  // departure means the LeaveRequest was lost and fails the leg.
   if (meetings.departed.length > 0) {
     await step('meetings ended (per-meeting proof)', () =>
       proveMeetingsEnded(meetings.departed, meetings.sinceNs, bounds.meetingEndCeilingMs),

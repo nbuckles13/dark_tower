@@ -9,7 +9,7 @@
 //! Per-failure-class fidelity: `operation ∈ {hash, verify}` — both
 //! production-reachable values exercised with adjacency.
 //!
-//! # Bcrypt cost: DEFAULT_BCRYPT_COST is load-bearing here
+//! # Bcrypt cost: RECOMMENDED_MIN_BCRYPT_COST is load-bearing here
 //!
 //! Per @operations review: production parity for histogram-bucket fidelity
 //! is required. The bucket boundaries at
@@ -23,14 +23,14 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use ac_service::config::DEFAULT_BCRYPT_COST;
+use ac_service::config::RECOMMENDED_MIN_BCRYPT_COST;
 use ac_service::crypto;
 use common::observability::testing::MetricAssertion;
 
 #[test]
 fn bcrypt_hash_emits_operation_hash() {
     let snap = MetricAssertion::snapshot();
-    let _ = crypto::hash_client_secret("test-secret-12345", DEFAULT_BCRYPT_COST).unwrap();
+    let _ = crypto::hash_client_secret("test-secret-12345", RECOMMENDED_MIN_BCRYPT_COST).unwrap();
 
     snap.histogram("ac_bcrypt_duration_seconds")
         .with_labels(&[("operation", "hash")])
@@ -57,7 +57,8 @@ fn bcrypt_verify_emits_operation_verify() {
     // snapshot, then drop the snapshot and take a fresh one for the
     // verify-only assertion. See histogram-first / fresh-snapshot
     // discipline in testing.rs §"Histograms DRAIN".
-    let hash = crypto::hash_client_secret("test-secret-12345", DEFAULT_BCRYPT_COST).unwrap();
+    let hash =
+        crypto::hash_client_secret("test-secret-12345", RECOMMENDED_MIN_BCRYPT_COST).unwrap();
     drop(snap);
 
     let snap = MetricAssertion::snapshot();
@@ -78,7 +79,7 @@ fn bcrypt_verify_emits_operation_verify() {
 fn bcrypt_verify_failure_still_emits_operation_verify() {
     // Even when verify returns Ok(false) (mismatched secret/hash), the
     // metric must fire because the bcrypt CPU work happened.
-    let hash = crypto::hash_client_secret("right-secret", DEFAULT_BCRYPT_COST).unwrap();
+    let hash = crypto::hash_client_secret("right-secret", RECOMMENDED_MIN_BCRYPT_COST).unwrap();
     let snap = MetricAssertion::snapshot();
 
     let result = crypto::verify_client_secret("wrong-secret", &hash).unwrap();

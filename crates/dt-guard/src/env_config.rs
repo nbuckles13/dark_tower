@@ -50,6 +50,13 @@
 //!    declared in neither per-instance map and read by neither is unguarded
 //!    by design. Within a service, check 5 reports only "read by nothing";
 //!    its per-workload half is this check.
+//! 7. (Since the 2026-11-15 meeting-end-safety devloop.) No workload reads a
+//!    key its service's `config.rs` REQUIRES (a `MissingEnvVar` key) through an
+//!    `optional: true` ref. Optional is the shape of "a code default applies
+//!    when absent"; a required key has no default, so an optional ref to it
+//!    only moves the failure from a loud `CreateContainerConfigError` to a
+//!    later `MissingEnvVar` — and is the shape that once hid a silent fallback.
+//!    Keys no `config.rs` reads (retired keys) are outside it by construction.
 //!
 //! # Discovery
 //!
@@ -219,6 +226,11 @@ pub const CONFIGMAP_KEY_NAME_MISMATCH_RULE_ID: &str = "configmap_key_name_mismat
 /// that pod on a different value with every other check green.
 pub const CONFIGMAP_REFS_NOT_IN_LOCKSTEP_RULE_ID: &str = "configmap_refs_not_in_lockstep";
 
+/// Check 7: a workload reads a key its service's `config.rs` REQUIRES through
+/// an `optional: true` ref (the shape of a silent fallback, on a key that has
+/// none).
+pub const REQUIRED_KEY_OPTIONAL_REF_RULE_ID: &str = "required_key_optional_ref";
+
 /// Check 5: an OVERLAY ConfigMap patch adds a `data:` key that no base
 /// workload consumes (no `configMapKeyRef` naming that ConfigMap and key). A
 /// strategic merge on a ConfigMap is additive, so such a key reaches the
@@ -295,6 +307,10 @@ const RULE_PRECEDENCE: &[(&str, &str)] = &[
     (
         CONFIGMAP_REFS_NOT_IN_LOCKSTEP_RULE_ID,
         "configmap-refs-not-in-lockstep",
+    ),
+    (
+        REQUIRED_KEY_OPTIONAL_REF_RULE_ID,
+        "required-key-optional-ref",
     ),
     (ORPHAN_CONFIGMAP_KEY_RULE_ID, "orphan-key"),
 ];
@@ -1035,6 +1051,20 @@ fn analyze_service(
                         file: workload.path.clone(),
                     });
                 }
+            }
+        }
+
+        // Check 7 — a key config.rs requires is never read through an
+        // optional ref (check 4 makes the ref's key the env var's name).
+        for (cm_name, key) in &workload.optional_refs {
+            if required.contains(key) {
+                report.hits.push(Hit {
+                    rule_id: REQUIRED_KEY_OPTIONAL_REF_RULE_ID,
+                    detail: format!(
+                        "{dir}: config.rs requires {key} (no code default), but this workload reads it from ConfigMap {cm_name:?} through an `optional: true` ref — make the ref hard"
+                    ),
+                    file: workload.path.clone(),
+                });
             }
         }
 
@@ -3844,5 +3874,40 @@ data:
             run(td.path(), false).is_err(),
             "suppression implies a fatal hit"
         );
+    }
+
+    /// Check 7 positive control: a key config.rs REQUIRES, read through an
+    /// `optional: true` ref, is a hit on that workload; the same ref made hard
+    /// is clean. (The real tree is covered by the analyze-the-repo tests.)
+    #[test]
+    fn a_required_key_read_through_an_optional_ref_is_flagged() {
+        let config_rs = r#"let w = vars.get("WINDOW").ok_or_else(|| ConfigError::MissingEnvVar("WINDOW".to_string()))?;"#;
+        let optional = mc_deployment("mc-0", true);
+        let hard = deployment_ref("mc-0", "mc-service-config", "A").replace(
+            "              key: A\n",
+            "              key: A\n        - name: WINDOW\n          valueFrom:\n            configMapKeyRef:\n              name: mc-service-config\n              key: WINDOW\n",
+        );
+        let cm = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: mc-service-config\ndata:\n  A: \"a\"\n  WINDOW: \"30\"\n";
+        for (deployment, expect_hit) in [(&optional, true), (&hard, false)] {
+            let td = fixture(&[(
+                "mc-service",
+                config_rs,
+                &[("mc-0-deployment.yaml", deployment), ("configmap.yaml", cm)],
+            )]);
+            let report = analyze(td.path()).expect("analyze");
+            let hits = hits_for(&report, REQUIRED_KEY_OPTIONAL_REF_RULE_ID);
+            assert_eq!(
+                hits.len(),
+                usize::from(expect_hit),
+                "optional={expect_hit}: hits {:?}",
+                report.hits
+            );
+            if expect_hit {
+                assert!(hits[0].detail.contains("WINDOW"));
+                assert_eq!(report.hits.len(), 1, "only check 7: {:?}", report.hits);
+            } else {
+                assert!(report.hits.is_empty(), "hits: {:?}", report.hits);
+            }
+        }
     }
 }

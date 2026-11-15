@@ -474,17 +474,21 @@ psql $DATABASE_URL
 |----------|----------|-------------|---------|---------|
 | `DATABASE_URL` | **Yes** | PostgreSQL connection string with TLS | None | `postgresql://ac_user:password@postgres.dark-tower.svc.cluster.local:5432/dark_tower?sslmode=verify-full` |
 | `AC_MASTER_KEY` | **Yes** | Base64-encoded 32-byte AES-256-GCM master key for signing key encryption | None | `base64(random_32_bytes)` |
-| `BIND_ADDRESS` | No | TCP bind address for HTTP server | `0.0.0.0:8082` | `0.0.0.0:8082` |
+| `AC_HASH_SECRET` | **Yes** (secret, `ac-service-secrets`; since 2026-11-15) | Base64, at least 32 bytes: the HMAC key for correlation hashes in logs (ADR-0011). MUST differ from `AC_MASTER_KEY`. Before 2026-11-15 an unset key silently became 32 zero bytes. | None | `base64(random_32_bytes)` |
+| `BIND_ADDRESS` | **Yes** (no code default since 2026-11-15) | TCP bind address for HTTP server | — (config.env `0.0.0.0:8082`) | `0.0.0.0:8082` |
+| `AC_CLUSTER_NAME` | **Yes** (no code default since 2026-11-15) | Prefix of every signing-key `kid` (initial key and rotations). Validated `^[a-z0-9][a-z0-9-]{0,62}$` (it lands in JWT headers and the JWKS). Replaces the former `CLUSTER_NAME` (startup, default `us`) / `AC_CLUSTER_NAME` (rotation, default `default`) split: one key, read once. Existing keys are unaffected (kids are resolved by exact JWKS lookup); only a fresh database's first kid prefix changes. | — (config.env) | `dark-tower-prod` |
+| `AC_DRAIN_SECONDS` | **Yes** (no code default since 2026-11-15) | Seconds AC keeps serving in-flight requests after SIGTERM. Bounds `0..=30` (inside `terminationGracePeriodSeconds`, 35); unparseable refuses boot (it used to be masked as 30). | — (config.env `30`) | `0` (local) |
+| `JWT_CLOCK_SKEW_SECONDS` | **Yes** (no code default since 2026-11-15) | Token `iat`/`exp` tolerance. Bounds `(0, 600]`; below 60 warns. | — (config.env `300`) | `300` |
+| `BCRYPT_COST` | **Yes** (no code default since 2026-11-15) | Hash cost for client secrets/passwords. Bounds `[10, 14]`; below 12 warns. Affects NEW hashes only. | — (config.env `12`) | `12` |
 | `OTEL_ENABLED` | No | Master switch for OpenTelemetry tracing. When `true`, AC initializes the OTLP exporter at startup and **fails readiness if the collector is unreachable** (fail-hard at init, R-54). Default-off keeps AC bootable without a collector. | `false` | `true` (Kind/dev) |
 | `OTLP_ENDPOINT` | When `OTEL_ENABLED=true` | OTLP-gRPC collector endpoint. **Must** include the `http://` scheme (parsed via tonic `Endpoint`; a bare `host:port` fails at init). Consumed only when `OTEL_ENABLED=true`. | `""` | `http://otel-collector.dark-tower:4317` |
-| `OTEL_SAMPLE_RATE` | No | Trace sampling ratio in `[0.0, 1.0]`. Parsed at config load; the range is enforced by `init_otel` at startup when enabled (fail-hard). | `1.0` | `0.1` |
-| `DEPLOYMENT_ENVIRONMENT` | No | Value of the `deployment.environment` OTel resource attribute on emitted spans. | `development` | `production` |
-| `CLUSTER_NAME` | No | Cluster identifier for key ID generation | `us` | `us`, `eu`, `ap` |
+| `OTEL_SAMPLE_RATE` | **Yes** (no code default since 2026-11-15) | Trace sampling ratio in `[0.0, 1.0]`. Parsed at config load; the range is enforced by `init_otel` at startup when enabled (fail-hard). | — (config.env `1.0`) | `0.1` |
+| `DEPLOYMENT_ENVIRONMENT` | **Yes** (no code default since 2026-11-15) | Value of the `deployment.environment` OTel resource attribute on emitted spans. | — (config.env) | `production` |
 | `RUST_LOG` | No | Logging level | `info` | `info,ac_service=debug` |
-| `AC_RATE_LIMIT_WINDOW_MINUTES` | No | Login rate limit sliding window (minutes). Range: 1-60 | `15` | `1` (dev/test) |
-| `AC_RATE_LIMIT_MAX_ATTEMPTS` | No | Login rate limit max failed attempts before lockout. Range: 1-100 | `5` | `100` (dev/test) |
-| `AC_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES` | No | Registration rate limit sliding window (minutes). Range: 1-1440 | `60` | `1` (dev/test) |
-| `AC_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS` | No | Registration rate limit max attempts per IP per window. Range: 1-100 | `5` | `100` (dev/test) |
+| `AC_RATE_LIMIT_WINDOW_MINUTES` | **Yes** (no code default since 2026-11-15) | Login rate limit sliding window (minutes). Range: 1-60 | `15` | `1` (dev/test) |
+| `AC_RATE_LIMIT_MAX_ATTEMPTS` | **Yes** (no code default since 2026-11-15) | Login rate limit max failed attempts before lockout. Range: 1-100 | `5` | `100` (dev/test) |
+| `AC_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES` | **Yes** (no code default since 2026-11-15) | Registration rate limit sliding window (minutes). Range: 1-1440 | `60` | `1` (dev/test) |
+| `AC_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS` | **Yes** (no code default since 2026-11-15) | Registration rate limit max attempts per IP per window. Range: 1-100 | `5` | `100` (dev/test) |
 
 > **Log targets (since 2026-10-05).** AC's module events (handlers, services, repositories, …)
 > carry the lib crate's target, `ac_service::<module>`, now that the `auth-controller` binary
@@ -515,13 +519,15 @@ type: Opaque
 data:
   DATABASE_URL: <base64-encoded-connection-string>
   AC_MASTER_KEY: <base64-encoded-32-byte-key>
+  AC_HASH_SECRET: <base64-encoded-32-byte-key>   # REQUIRED; distinct from AC_MASTER_KEY
 ```
 
 **Creating secrets:**
 
 ```bash
-# Generate master key (32 random bytes)
+# Generate master key and the (distinct) correlation HMAC key (32 random bytes each)
 AC_MASTER_KEY=$(openssl rand -base64 32)
+AC_HASH_SECRET=$(openssl rand -base64 32)
 
 # Create DATABASE_URL (adjust credentials and host)
 DATABASE_URL="postgresql://ac_user:REPLACE_PASSWORD@postgres.dark-tower.svc.cluster.local:5432/dark_tower?sslmode=verify-full"
@@ -530,17 +536,21 @@ DATABASE_URL="postgresql://ac_user:REPLACE_PASSWORD@postgres.dark-tower.svc.clus
 kubectl create secret generic ac-service-secrets \
   --from-literal=DATABASE_URL="${DATABASE_URL}" \
   --from-literal=AC_MASTER_KEY="${AC_MASTER_KEY}" \
+  --from-literal=AC_HASH_SECRET="${AC_HASH_SECRET}" \
   --namespace dark-tower \
   --dry-run=client -o yaml | kubectl apply -f -
 ```
 
-**Rotating secrets:**
+**Rotating secrets:** `kubectl create secret ... | kubectl apply` REPLACES the secret's whole
+`data`: list EVERY key, or the omitted one disappears and the next restart leaves AC in
+`CreateContainerConfigError`.
 
 ```bash
 # Update secret
 kubectl create secret generic ac-service-secrets \
   --from-literal=DATABASE_URL="${NEW_DATABASE_URL}" \
   --from-literal=AC_MASTER_KEY="${NEW_AC_MASTER_KEY}" \
+  --from-literal=AC_HASH_SECRET="${AC_HASH_SECRET}" \
   --namespace dark-tower \
   --dry-run=client -o yaml | kubectl apply -f -
 
@@ -549,6 +559,10 @@ kubectl rollout restart statefulset/ac-service -n dark-tower
 ```
 
 **CRITICAL:** Master key rotation requires re-encrypting all signing keys in database. See ADR-0008 for key rotation procedure.
+
+Rotating `AC_HASH_SECRET` changes every correlation hash (ADR-0011): hashes logged before and
+after the rotation no longer match, so log correlation across the rotation is lost. Nothing
+persisted depends on it.
 
 ### Kubernetes ConfigMap
 
@@ -729,6 +743,12 @@ psql $DATABASE_URL
 - Image pull failures (registry authentication, network)
 - Insufficient node resources (CPU/memory)
 - `AC_MASTER_KEY` invalid (not 32 bytes, not base64-encoded)
+- `CreateContainerConfigError: couldn't find key AC_HASH_SECRET in Secret dark-tower/ac-service-secrets`:
+  the cluster's secret predates 2026-11-15 (AC_HASH_SECRET became required). Remedy: re-run
+  provisioning (`infra/kind/scripts/provision.sh` writes it) or add the key to the existing secret,
+  listing every existing key too (the create|apply pattern replaces the whole secret)
+- `Missing required environment variable: <KEY>` in the logs: a required ConfigMap key is
+  absent — every AC behaviour key is required since 2026-11-15 (Configuration Reference)
 
 **Resolution:**
 
@@ -867,7 +887,9 @@ kubectl get secret ac-service-secrets -n dark-tower -o jsonpath='{.data.AC_MASTE
    ```bash
    NEW_MASTER_KEY=$(openssl rand -base64 32)
    kubectl create secret generic ac-service-secrets \
+     --from-literal=DATABASE_URL="${DATABASE_URL}" \
      --from-literal=AC_MASTER_KEY="${NEW_MASTER_KEY}" \
+     --from-literal=AC_HASH_SECRET="${AC_HASH_SECRET}" \
      --dry-run=client -o yaml | kubectl apply -f -
    kubectl rollout restart statefulset/ac-service -n dark-tower
    ```

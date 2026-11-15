@@ -221,12 +221,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         egress_stream_ceiling_recommended_min =
             mh_service::config::EGRESS_STREAM_CEILING_RECOMMENDED_MIN,
         egress_rejection_ratio_threshold = config.egress_admission.rejection_ratio_threshold,
-        // PROVENANCE. Every key above that is a ConfigMap key is a REQUIRED
-        // read, so its provenance is necessarily `env` — absence refuses to
-        // start, and there is no default to confuse it with. The one optional
-        // ConfigMap-backed value on this line reports its source explicitly.
+        otel_sample_rate = config.otel_sample_rate,
+        environment = %config.environment,
+        // PROVENANCE. Every ConfigMap key on this line is a REQUIRED read, so
+        // its provenance is necessarily `env` — absence refuses to start, and
+        // there is no default to confuse it with.
         media_latency_sample_ratio = config.media_latency_sample_ratio,
-        media_latency_sample_ratio_source = config.media_latency_sample_ratio_source.as_str(),
         // OPERATOR-FACING only: nothing parses this line. What the running
         // process loaded is read from the static gauges
         // `observability::metrics::publish_egress_admission` sets (env-test

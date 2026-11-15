@@ -1,8 +1,18 @@
 use base64::{engine::general_purpose, Engine as _};
-// Re-export clock skew constants from common for backwards compatibility
+// The shared JWT clock-skew values (common::jwt, a GSA). `JWT_CLOCK_SKEW_SECONDS`
+// is REQUIRED; the common default is only the RECOMMENDED value AC compares to.
 pub use common::jwt::{
-    DEFAULT_CLOCK_SKEW as DEFAULT_JWT_CLOCK_SKEW, MAX_CLOCK_SKEW as MAX_JWT_CLOCK_SKEW,
+    DEFAULT_CLOCK_SKEW as RECOMMENDED_JWT_CLOCK_SKEW, MAX_CLOCK_SKEW as MAX_JWT_CLOCK_SKEW,
 };
+
+/// Upper bound on `AC_DRAIN_SECONDS`: the drain must finish inside the pod's
+/// `terminationGracePeriodSeconds` (35 in the statefulset), or the kubelet
+/// kills AC mid-drain.
+pub const MAX_DRAIN_SECONDS: u64 = 30;
+
+/// Maximum length of `AC_CLUSTER_NAME` (a DNS label): it is part of every
+/// signing-key `kid` in JWT headers and the JWKS.
+pub const MAX_CLUSTER_NAME_LEN: usize = 63;
 use common::secret::{ExposeSecret, SecretBox};
 use std::collections::HashMap;
 use std::env;
@@ -10,11 +20,13 @@ use std::fmt;
 use thiserror::Error;
 use tracing::warn;
 
-/// Default bcrypt cost factor (12 per ADR-0003).
+/// Recommended minimum bcrypt cost factor (12 per ADR-0003): a configured
+/// `BCRYPT_COST` below it is accepted (the floor is [`MIN_BCRYPT_COST`]) but
+/// warned about. NOT a default — `BCRYPT_COST` is REQUIRED.
 ///
 /// Cost 12 = 2^12 = 4,096 iterations, providing appropriate security
 /// for 2024+ per OWASP guidelines. Approximate hash time: ~200ms.
-pub const DEFAULT_BCRYPT_COST: u32 = 12;
+pub const RECOMMENDED_MIN_BCRYPT_COST: u32 = 12;
 
 /// Minimum allowed bcrypt cost factor (10 per OWASP 2024 guidelines).
 ///
@@ -29,47 +41,40 @@ pub const MIN_BCRYPT_COST: u32 = 10;
 pub const MAX_BCRYPT_COST: u32 = 14;
 
 // =============================================================================
-// Rate Limit Configuration Defaults & Bounds
+// Rate Limit Configuration: ADR-0003 recommended values & bounds
 // =============================================================================
 
-/// Default login rate limit window in minutes (15-minute sliding window per ADR-0003).
-pub const DEFAULT_RATE_LIMIT_WINDOW_MINUTES: i64 = 15;
+/// ADR-0003 recommended login rate limit window in minutes (warn when
+/// configured otherwise; NOT a default — the key is REQUIRED) (15-minute sliding window per ADR-0003).
+pub const RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES: i64 = 15;
 /// Minimum login rate limit window (1 minute).
 pub const MIN_RATE_LIMIT_WINDOW_MINUTES: i64 = 1;
 /// Maximum login rate limit window (60 minutes / 1 hour).
 pub const MAX_RATE_LIMIT_WINDOW_MINUTES: i64 = 60;
 
-/// Default login rate limit max attempts before lockout (5 per ADR-0003).
-pub const DEFAULT_RATE_LIMIT_MAX_ATTEMPTS: i64 = 5;
+/// ADR-0003 recommended login rate limit max attempts before lockout (warn
+/// when configured otherwise; NOT a default) (5 per ADR-0003).
+pub const RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS: i64 = 5;
 /// Minimum login rate limit max attempts (1).
 pub const MIN_RATE_LIMIT_MAX_ATTEMPTS: i64 = 1;
 /// Maximum login rate limit max attempts (100).
 pub const MAX_RATE_LIMIT_MAX_ATTEMPTS: i64 = 100;
 
-/// Default registration rate limit window in minutes (60 minutes / 1 hour).
-pub const DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES: i64 = 60;
+/// Recommended registration rate limit window in minutes (warn when
+/// configured otherwise; NOT a default) (60 minutes / 1 hour).
+pub const RECOMMENDED_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES: i64 = 60;
 /// Minimum registration rate limit window (1 minute).
 pub const MIN_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES: i64 = 1;
 /// Maximum registration rate limit window (1440 minutes / 24 hours).
 pub const MAX_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES: i64 = 1440;
 
-/// Default registration rate limit max attempts (5 per IP per window).
-pub const DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS: i64 = 5;
+/// Recommended registration rate limit max attempts (warn when configured
+/// otherwise; NOT a default) (5 per IP per window).
+pub const RECOMMENDED_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS: i64 = 5;
 /// Minimum registration rate limit max attempts (1).
 pub const MIN_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS: i64 = 1;
 /// Maximum registration rate limit max attempts (100).
 pub const MAX_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS: i64 = 100;
-
-// =============================================================================
-// OpenTelemetry Configuration Defaults & Bounds (R-55)
-// =============================================================================
-
-/// Default head-sampling ratio when `OTEL_SAMPLE_RATE` is unset (1.0 = sample all).
-/// The `[0.0, 1.0]` range is owned + enforced by `init_otel` (common), not here —
-/// config parsing is parse-only (single owner for the bound; team-lead FREEZE 2026-06-25).
-pub const DEFAULT_OTEL_SAMPLE_RATE: f64 = 1.0;
-/// Default deployment environment when `DEPLOYMENT_ENVIRONMENT` is unset.
-pub const DEFAULT_DEPLOYMENT_ENVIRONMENT: &str = "development";
 
 /// Application configuration with secure handling of sensitive fields.
 ///
@@ -121,14 +126,21 @@ pub struct Config {
     /// Default: 15 (per ADR-0003). Range: 1-60.
     pub rate_limit_window_minutes: i64,
     /// Login rate limit max failed attempts before lockout.
-    /// Default: 5 (per ADR-0003). Range: 1-100.
+    /// REQUIRED; recommended 5 (ADR-0003). Range: 1-100.
     pub rate_limit_max_attempts: i64,
     /// Registration rate limit sliding window in minutes.
-    /// Default: 60. Range: 1-1440.
+    /// REQUIRED; recommended 60. Range: 1-1440.
     pub registration_rate_limit_window_minutes: i64,
     /// Registration rate limit max attempts per IP per window.
-    /// Default: 5. Range: 1-100.
+    /// REQUIRED; recommended 5. Range: 1-100.
     pub registration_rate_limit_max_attempts: i64,
+    /// This AC cluster's name (`AC_CLUSTER_NAME`, REQUIRED): the prefix of
+    /// every signing-key `kid` it mints (initial key and rotations). Validated
+    /// `^[a-z0-9][a-z0-9-]{0,62}$` at load.
+    pub cluster_name: String,
+    /// Seconds AC keeps serving in-flight requests after SIGTERM
+    /// (`AC_DRAIN_SECONDS`, REQUIRED, `0..=MAX_DRAIN_SECONDS`).
+    pub drain_seconds: u64,
 }
 
 /// Clone implementation that explicitly clones SecretBox fields.
@@ -149,6 +161,8 @@ impl Clone for Config {
             rate_limit_max_attempts: self.rate_limit_max_attempts,
             registration_rate_limit_window_minutes: self.registration_rate_limit_window_minutes,
             registration_rate_limit_max_attempts: self.registration_rate_limit_max_attempts,
+            cluster_name: self.cluster_name.clone(),
+            drain_seconds: self.drain_seconds,
         }
     }
 }
@@ -182,6 +196,8 @@ impl fmt::Debug for Config {
                 "registration_rate_limit_max_attempts",
                 &self.registration_rate_limit_max_attempts,
             )
+            .field("cluster_name", &self.cluster_name)
+            .field("drain_seconds", &self.drain_seconds)
             .finish()
     }
 }
@@ -209,6 +225,12 @@ pub enum ConfigError {
     #[error("Invalid rate limit configuration: {0}")]
     InvalidRateLimitConfig(String),
 
+    #[error("Invalid AC_CLUSTER_NAME: {0}")]
+    InvalidClusterName(String),
+
+    #[error("Invalid AC_DRAIN_SECONDS: {0}")]
+    InvalidDrainSeconds(String),
+
     #[error("Invalid OTel configuration: {0}")]
     InvalidOtelConfig(String),
 }
@@ -226,10 +248,11 @@ impl Config {
             .ok_or_else(|| ConfigError::MissingEnvVar("DATABASE_URL".to_string()))?
             .clone();
 
+        // REQUIRED (meeting-end safety P2): no code default.
         let bind_address = vars
             .get("BIND_ADDRESS")
-            .cloned()
-            .unwrap_or_else(|| "0.0.0.0:8082".to_string());
+            .ok_or_else(|| ConfigError::MissingEnvVar("BIND_ADDRESS".to_string()))?
+            .clone();
 
         let master_key_base64 = vars
             .get("AC_MASTER_KEY")
@@ -246,9 +269,14 @@ impl Config {
             )));
         }
 
-        // ADR-0011: Load hash secret for HMAC-SHA256 correlation hashing
-        // Default to 32 zero bytes for tests to avoid requiring env var in test environment
-        let hash_secret = if let Some(hash_secret_base64) = vars.get("AC_HASH_SECRET") {
+        // ADR-0011: hash secret for HMAC-SHA256 correlation hashing. REQUIRED
+        // (meeting-end safety P2): an unset key used to substitute 32 ZERO
+        // bytes silently — a publicly known HMAC key in any deployment that
+        // forgot it.
+        let hash_secret = {
+            let hash_secret_base64 = vars
+                .get("AC_HASH_SECRET")
+                .ok_or_else(|| ConfigError::MissingEnvVar("AC_HASH_SECRET".to_string()))?;
             let secret = general_purpose::STANDARD
                 .decode(hash_secret_base64)
                 .map_err(ConfigError::Base64Error)?;
@@ -261,10 +289,6 @@ impl Config {
             }
 
             secret
-        } else {
-            // Default for tests: 32 zero bytes
-            // Production MUST set AC_HASH_SECRET via environment
-            vec![0u8; 32]
         };
 
         // ADR-0011 / R-55: OpenTelemetry SDK configuration.
@@ -297,21 +321,22 @@ impl Config {
         // objected to a dup, @dry-reviewer flagged it). Non-numeric still fails
         // fast at load. An out-of-range value is accepted at config load and only
         // hard-fails at `init_otel` when `otel_enabled=true` — intended.
-        let otel_sample_rate = if let Some(value_str) = vars.get("OTEL_SAMPLE_RATE") {
+        let otel_sample_rate = {
+            let value_str = vars
+                .get("OTEL_SAMPLE_RATE")
+                .ok_or_else(|| ConfigError::MissingEnvVar("OTEL_SAMPLE_RATE".to_string()))?;
             value_str.parse::<f64>().map_err(|e| {
                 ConfigError::InvalidOtelConfig(format!(
                     "OTEL_SAMPLE_RATE must be a number, got '{}': {}",
                     value_str, e
                 ))
             })?
-        } else {
-            DEFAULT_OTEL_SAMPLE_RATE
         };
 
         let environment = vars
             .get("DEPLOYMENT_ENVIRONMENT")
-            .cloned()
-            .unwrap_or_else(|| DEFAULT_DEPLOYMENT_ENVIRONMENT.to_string());
+            .ok_or_else(|| ConfigError::MissingEnvVar("DEPLOYMENT_ENVIRONMENT".to_string()))?
+            .clone();
 
         // When OTel is enabled the endpoint is required: fail fast with a clear
         // message rather than letting init_otel reject an empty/unparseable URL.
@@ -321,10 +346,14 @@ impl Config {
             ));
         }
 
-        // Parse JWT clock skew tolerance with validation
-        // Default: 300 seconds (5 minutes) per NIST SP 800-63B
-        // Max: 600 seconds (10 minutes) to prevent security misconfiguration
-        let jwt_clock_skew_seconds = if let Some(value_str) = vars.get("JWT_CLOCK_SKEW_SECONDS") {
+        // Parse JWT clock skew tolerance with validation. REQUIRED (no
+        // fallback to `common::jwt::DEFAULT_CLOCK_SKEW`; the base config.env
+        // sets 300 s, NIST SP 800-63B). Max: 600 seconds (10 minutes) to
+        // prevent security misconfiguration.
+        let jwt_clock_skew_seconds = {
+            let value_str = vars
+                .get("JWT_CLOCK_SKEW_SECONDS")
+                .ok_or_else(|| ConfigError::MissingEnvVar("JWT_CLOCK_SKEW_SECONDS".to_string()))?;
             let value: i64 = value_str.parse().map_err(|e| {
                 ConfigError::InvalidJwtClockSkew(format!(
                     "JWT_CLOCK_SKEW_SECONDS must be a valid integer, got '{}': {}",
@@ -358,15 +387,16 @@ impl Config {
             }
 
             value
-        } else {
-            DEFAULT_JWT_CLOCK_SKEW.as_secs() as i64
         };
 
-        // Parse bcrypt cost factor with validation
-        // Default: 12 (ADR-0003)
+        // Parse bcrypt cost factor with validation. REQUIRED (the base
+        // config.env sets 12, ADR-0003).
         // Min: 10 (OWASP 2024 security floor)
         // Max: 14 (prevent excessive latency)
-        let bcrypt_cost = if let Some(value_str) = vars.get("BCRYPT_COST") {
+        let bcrypt_cost = {
+            let value_str = vars
+                .get("BCRYPT_COST")
+                .ok_or_else(|| ConfigError::MissingEnvVar("BCRYPT_COST".to_string()))?;
             let value: u32 = value_str.parse().map_err(|e| {
                 ConfigError::InvalidBcryptCost(format!(
                     "BCRYPT_COST must be a valid positive integer, got '{}': {}",
@@ -388,28 +418,25 @@ impl Config {
                 )));
             }
 
-            // Warn if cost is below recommended default of 12
+            // Warn if cost is below the recommended 12
             // Cost 10-11 is secure but provides less protection against brute force
-            if value < DEFAULT_BCRYPT_COST {
+            if value < RECOMMENDED_MIN_BCRYPT_COST {
                 warn!(
                     bcrypt_cost = value,
-                    default = DEFAULT_BCRYPT_COST,
-                    "BCRYPT_COST is below recommended default of {}. \
+                    recommended = RECOMMENDED_MIN_BCRYPT_COST,
+                    "BCRYPT_COST is below the recommended {}. \
                      This reduces protection against brute force attacks.",
-                    DEFAULT_BCRYPT_COST
+                    RECOMMENDED_MIN_BCRYPT_COST
                 );
             }
 
             value
-        } else {
-            DEFAULT_BCRYPT_COST
         };
 
         // Parse rate limit configuration
         let rate_limit_window_minutes = Self::parse_rate_limit_i64(
             vars,
             "AC_RATE_LIMIT_WINDOW_MINUTES",
-            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
             MIN_RATE_LIMIT_WINDOW_MINUTES,
             MAX_RATE_LIMIT_WINDOW_MINUTES,
         )?;
@@ -417,7 +444,6 @@ impl Config {
         let rate_limit_max_attempts = Self::parse_rate_limit_i64(
             vars,
             "AC_RATE_LIMIT_MAX_ATTEMPTS",
-            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
             MIN_RATE_LIMIT_MAX_ATTEMPTS,
             MAX_RATE_LIMIT_MAX_ATTEMPTS,
         )?;
@@ -425,7 +451,6 @@ impl Config {
         let registration_rate_limit_window_minutes = Self::parse_rate_limit_i64(
             vars,
             "AC_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES",
-            DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
             MIN_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
             MAX_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
         )?;
@@ -433,48 +458,82 @@ impl Config {
         let registration_rate_limit_max_attempts = Self::parse_rate_limit_i64(
             vars,
             "AC_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS",
-            DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
             MIN_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
             MAX_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
         )?;
 
-        // Warn on non-default rate limit values
-        if rate_limit_window_minutes != DEFAULT_RATE_LIMIT_WINDOW_MINUTES {
+        // Warn on values other than the recommended ones
+        if rate_limit_window_minutes != RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES {
             warn!(
                 rate_limit_window_minutes,
-                default = DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-                "AC_RATE_LIMIT_WINDOW_MINUTES differs from default of {} minutes. \
+                recommended = RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+                "AC_RATE_LIMIT_WINDOW_MINUTES differs from the recommended {} minutes. \
                  Shorter windows increase false-positive lockouts; longer windows delay recovery.",
-                DEFAULT_RATE_LIMIT_WINDOW_MINUTES
+                RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES
             );
         }
-        if rate_limit_max_attempts != DEFAULT_RATE_LIMIT_MAX_ATTEMPTS {
+        if rate_limit_max_attempts != RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS {
             warn!(
                 rate_limit_max_attempts,
-                default = DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
-                "AC_RATE_LIMIT_MAX_ATTEMPTS differs from default of {}. \
+                recommended = RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
+                "AC_RATE_LIMIT_MAX_ATTEMPTS differs from the recommended {}. \
                  Lower values may lock out legitimate users; higher values reduce brute force protection.",
-                DEFAULT_RATE_LIMIT_MAX_ATTEMPTS
+                RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS
             );
         }
-        if registration_rate_limit_window_minutes != DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES
+        if registration_rate_limit_window_minutes
+            != RECOMMENDED_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES
         {
             warn!(
                 registration_rate_limit_window_minutes,
-                default = DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
-                "AC_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES differs from default of {} minutes.",
-                DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES
+                recommended = RECOMMENDED_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
+                "AC_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES differs from the recommended {} minutes.",
+                RECOMMENDED_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES
             );
         }
-        if registration_rate_limit_max_attempts != DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS {
+        if registration_rate_limit_max_attempts != RECOMMENDED_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS
+        {
             warn!(
                 registration_rate_limit_max_attempts,
-                default = DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
-                "AC_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS differs from default of {}. \
+                recommended = RECOMMENDED_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
+                "AC_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS differs from the recommended {}. \
                  Higher values reduce registration abuse protection.",
-                DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS
+                RECOMMENDED_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS
             );
         }
+
+        // AC_CLUSTER_NAME: REQUIRED, one key read once (it used to be read as
+        // `CLUSTER_NAME` defaulting to "us" at startup and as `AC_CLUSTER_NAME`
+        // defaulting to "default" at rotation). Bounded charset + length: it is
+        // part of every kid in JWT headers and the JWKS.
+        let cluster_name = vars
+            .get("AC_CLUSTER_NAME")
+            .ok_or_else(|| ConfigError::MissingEnvVar("AC_CLUSTER_NAME".to_string()))?
+            .clone();
+        if !is_valid_cluster_name(&cluster_name) {
+            return Err(ConfigError::InvalidClusterName(format!(
+                "must match ^[a-z0-9][a-z0-9-]{{0,{}}}$ (length {})",
+                MAX_CLUSTER_NAME_LEN - 1,
+                cluster_name.len()
+            )));
+        }
+
+        // AC_DRAIN_SECONDS: REQUIRED and fail-loud (an unparseable value used
+        // to be masked as 30).
+        let drain_seconds = {
+            let raw = vars
+                .get("AC_DRAIN_SECONDS")
+                .ok_or_else(|| ConfigError::MissingEnvVar("AC_DRAIN_SECONDS".to_string()))?;
+            let v: u64 = raw.trim().parse().map_err(|e| {
+                ConfigError::InvalidDrainSeconds(format!("must be an integer, got '{raw}': {e}"))
+            })?;
+            if v > MAX_DRAIN_SECONDS {
+                return Err(ConfigError::InvalidDrainSeconds(format!(
+                    "must be <= {MAX_DRAIN_SECONDS} (inside terminationGracePeriodSeconds), got {v}"
+                )));
+            }
+            v
+        };
 
         // ADR-0012: Validate TLS configuration for PostgreSQL
         // Production deployments should use sslmode=verify-full
@@ -496,6 +555,8 @@ impl Config {
             rate_limit_max_attempts,
             registration_rate_limit_window_minutes,
             registration_rate_limit_max_attempts,
+            cluster_name,
+            drain_seconds,
         })
     }
 
@@ -539,14 +600,17 @@ impl Config {
     }
 
     /// Parse an i64 rate limit config value with min/max bounds validation.
+    /// REQUIRED (meeting-end safety P2): a missing key refuses boot.
     fn parse_rate_limit_i64(
         vars: &HashMap<String, String>,
         env_var: &str,
-        default: i64,
         min: i64,
         max: i64,
     ) -> Result<i64, ConfigError> {
-        let value = if let Some(value_str) = vars.get(env_var) {
+        let value = {
+            let value_str = vars
+                .get(env_var)
+                .ok_or_else(|| ConfigError::MissingEnvVar(env_var.to_string()))?;
             let v: i64 = value_str.parse().map_err(|e| {
                 ConfigError::InvalidRateLimitConfig(format!(
                     "{} must be a valid integer, got '{}': {}",
@@ -569,11 +633,69 @@ impl Config {
             }
 
             v
-        } else {
-            default
         };
 
         Ok(value)
+    }
+}
+
+/// `^[a-z0-9][a-z0-9-]{0,62}$`: a DNS-label-shaped name (it lands in every kid).
+fn is_valid_cluster_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    bytes.len() <= MAX_CLUSTER_NAME_LEN
+        && bytes
+            .first()
+            .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+}
+
+/// Test-only: the complete REQUIRED key set, for every in-crate test that
+/// builds a `Config` from vars (config tests and handler tests share it).
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::collections::HashMap;
+
+    /// Every key meeting-end safety P2 made REQUIRED, with today's effective
+    /// values spelled out as literals (the base config.env's). Never a
+    /// harness default: a test of a missing key removes it explicitly.
+    pub(crate) fn required_vars() -> HashMap<String, String> {
+        [
+            ("BIND_ADDRESS", "0.0.0.0:8082"),
+            (
+                "AC_HASH_SECRET",
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            ),
+            ("AC_CLUSTER_NAME", "test-cluster"),
+            ("AC_DRAIN_SECONDS", "30"),
+            ("JWT_CLOCK_SKEW_SECONDS", "300"),
+            ("BCRYPT_COST", "12"),
+            ("AC_RATE_LIMIT_WINDOW_MINUTES", "15"),
+            ("AC_RATE_LIMIT_MAX_ATTEMPTS", "5"),
+            ("AC_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES", "60"),
+            ("AC_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS", "5"),
+            ("OTEL_SAMPLE_RATE", "1.0"),
+            ("DEPLOYMENT_ENVIRONMENT", "development"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+    }
+
+    /// [`required_vars`] plus the two secrets: a complete, loadable var set.
+    pub(crate) fn complete_vars() -> HashMap<String, String> {
+        use base64::{engine::general_purpose, Engine as _};
+        let mut vars = required_vars();
+        vars.insert(
+            "DATABASE_URL".to_string(),
+            "postgresql://localhost/test".to_string(),
+        );
+        vars.insert(
+            "AC_MASTER_KEY".to_string(),
+            general_purpose::STANDARD.encode([0u8; 32]),
+        );
+        vars
     }
 }
 
@@ -581,14 +703,49 @@ impl Config {
 #[allow(clippy::panic, clippy::assertions_on_constants)]
 mod tests {
     use super::*;
+    use test_support::required_vars;
 
     fn test_master_key_base64() -> String {
         general_purpose::STANDARD.encode([0u8; 32])
     }
 
+    /// [`required_vars`] plus the test's own pairs (which win).
+    fn complete<const N: usize>(pairs: [(String, String); N]) -> HashMap<String, String> {
+        let mut vars = required_vars();
+        vars.extend(pairs);
+        vars
+    }
+
+    /// The minimal complete set: [`required_vars`] + the two secrets.
+    fn base_vars() -> HashMap<String, String> {
+        complete([
+            (
+                "DATABASE_URL".to_string(),
+                "postgresql://localhost/test".to_string(),
+            ),
+            ("AC_MASTER_KEY".to_string(), test_master_key_base64()),
+        ])
+    }
+
+    /// meeting-end-safety P2: every behaviour/topology key is REQUIRED. Unset
+    /// refuses boot naming THE key — never a code default (the bcrypt cost,
+    /// clock skew and hash secret included: AC no longer falls back to
+    /// `common::jwt::DEFAULT_CLOCK_SKEW` or to a 32-zero-byte HMAC key).
+    #[test]
+    fn every_behaviour_and_topology_key_is_required() {
+        for key in required_vars().keys() {
+            let mut vars = base_vars();
+            vars.remove(key);
+            match Config::from_vars(&vars) {
+                Err(ConfigError::MissingEnvVar(k)) => assert_eq!(&k, key),
+                other => panic!("{key} unset must refuse boot naming it, got {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn test_from_vars_success() {
-        let vars = HashMap::from([
+        let vars = complete([
             (
                 "DATABASE_URL".to_string(),
                 "postgresql://localhost/test".to_string(),
@@ -613,7 +770,7 @@ mod tests {
 
     #[test]
     fn test_from_vars_missing_database_url() {
-        let vars = HashMap::from([("AC_MASTER_KEY".to_string(), test_master_key_base64())]);
+        let vars = complete([("AC_MASTER_KEY".to_string(), test_master_key_base64())]);
 
         let result = Config::from_vars(&vars);
         assert!(matches!(result, Err(ConfigError::MissingEnvVar(v)) if v == "DATABASE_URL"));
@@ -621,7 +778,7 @@ mod tests {
 
     #[test]
     fn test_from_vars_missing_master_key() {
-        let vars = HashMap::from([(
+        let vars = complete([(
             "DATABASE_URL".to_string(),
             "postgresql://localhost/test".to_string(),
         )]);
@@ -632,7 +789,7 @@ mod tests {
 
     #[test]
     fn test_from_vars_invalid_base64() {
-        let vars = HashMap::from([
+        let vars = complete([
             (
                 "DATABASE_URL".to_string(),
                 "postgresql://localhost/test".to_string(),
@@ -655,7 +812,7 @@ mod tests {
         use base64::DecodeError;
 
         let with_key = |key: &str| {
-            HashMap::from([
+            complete([
                 (
                     "DATABASE_URL".to_string(),
                     "postgresql://localhost/test".to_string(),
@@ -713,7 +870,7 @@ mod tests {
     #[test]
     fn test_from_vars_master_key_too_short() {
         let short_key = general_purpose::STANDARD.encode([0u8; 16]);
-        let vars = HashMap::from([
+        let vars = complete([
             (
                 "DATABASE_URL".to_string(),
                 "postgresql://localhost/test".to_string(),
@@ -730,7 +887,7 @@ mod tests {
     #[test]
     fn test_from_vars_master_key_too_long() {
         let long_key = general_purpose::STANDARD.encode([0u8; 64]);
-        let vars = HashMap::from([
+        let vars = complete([
             (
                 "DATABASE_URL".to_string(),
                 "postgresql://localhost/test".to_string(),
@@ -745,22 +902,8 @@ mod tests {
     }
 
     #[test]
-    fn test_from_vars_default_bind_address() {
-        let vars = HashMap::from([
-            (
-                "DATABASE_URL".to_string(),
-                "postgresql://localhost/test".to_string(),
-            ),
-            ("AC_MASTER_KEY".to_string(), test_master_key_base64()),
-        ]);
-
-        let config = Config::from_vars(&vars).expect("Config should load successfully");
-        assert_eq!(config.bind_address, "0.0.0.0:8082");
-    }
-
-    #[test]
     fn test_from_vars_custom_bind_address() {
-        let vars = HashMap::from([
+        let vars = complete([
             (
                 "DATABASE_URL".to_string(),
                 "postgresql://localhost/test".to_string(),
@@ -780,7 +923,7 @@ mod tests {
     /// Helper: the minimal valid var set (DATABASE_URL + AC_MASTER_KEY) plus any
     /// extra OTel vars supplied by the caller.
     fn otel_vars(extra: &[(&str, &str)]) -> HashMap<String, String> {
-        let mut vars = HashMap::from([
+        let mut vars = complete([
             (
                 "DATABASE_URL".to_string(),
                 "postgresql://localhost/test".to_string(),
@@ -794,12 +937,12 @@ mod tests {
     }
 
     #[test]
-    fn test_otel_defaults() {
-        // No OTel env vars: disabled, empty endpoint, full sampling, dev environment.
+    fn test_otel_unset_enabled_is_off_and_rate_and_environment_are_taken_verbatim() {
+        // OTEL_ENABLED / OTLP_ENDPOINT unset: export off (a mode, not a
+        // substituted value); the REQUIRED rate and environment as configured.
         let config = Config::from_vars(&otel_vars(&[])).expect("Config should load");
         assert!(!config.otel_enabled, "OTel disabled by default");
         assert_eq!(config.otel_endpoint, "");
-        assert_eq!(config.otel_sample_rate, DEFAULT_OTEL_SAMPLE_RATE);
         assert_eq!(config.otel_sample_rate, 1.0);
         assert_eq!(config.environment, "development");
         // Disabled → no OtelConfig produced.
@@ -937,26 +1080,10 @@ mod tests {
     }
 
     #[test]
-    fn test_from_vars_hash_secret_default() {
-        // ADR-0011: hash_secret defaults to 32 zero bytes for tests
-        let vars = HashMap::from([
-            (
-                "DATABASE_URL".to_string(),
-                "postgresql://localhost/test".to_string(),
-            ),
-            ("AC_MASTER_KEY".to_string(), test_master_key_base64()),
-        ]);
-
-        let config = Config::from_vars(&vars).expect("Config should load successfully");
-        assert_eq!(config.hash_secret.expose_secret().len(), 32);
-        assert_eq!(config.hash_secret.expose_secret(), &vec![0u8; 32]);
-    }
-
-    #[test]
     fn test_from_vars_hash_secret_custom() {
         // ADR-0011: hash_secret can be explicitly set via AC_HASH_SECRET
         let hash_secret_base64 = general_purpose::STANDARD.encode([1u8; 32]);
-        let vars = HashMap::from([
+        let vars = complete([
             (
                 "DATABASE_URL".to_string(),
                 "postgresql://localhost/test".to_string(),
@@ -974,7 +1101,7 @@ mod tests {
     fn test_from_vars_hash_secret_too_short() {
         // ADR-0011: hash_secret must be at least 32 bytes
         let short_secret = general_purpose::STANDARD.encode([0u8; 16]);
-        let vars = HashMap::from([
+        let vars = complete([
             (
                 "DATABASE_URL".to_string(),
                 "postgresql://localhost/test".to_string(),
@@ -993,7 +1120,7 @@ mod tests {
     fn test_from_vars_hash_secret_allows_longer() {
         // ADR-0011: hash_secret can be longer than 32 bytes (HMAC accepts variable-length keys)
         let long_secret = general_purpose::STANDARD.encode([2u8; 64]);
-        let vars = HashMap::from([
+        let vars = complete([
             (
                 "DATABASE_URL".to_string(),
                 "postgresql://localhost/test".to_string(),
@@ -1010,7 +1137,7 @@ mod tests {
     #[test]
     fn test_from_vars_hash_secret_invalid_base64() {
         // ADR-0011: hash_secret must be valid base64
-        let vars = HashMap::from([
+        let vars = complete([
             (
                 "DATABASE_URL".to_string(),
                 "postgresql://localhost/test".to_string(),
@@ -1031,29 +1158,9 @@ mod tests {
     // ============================================================================
 
     #[test]
-    fn test_jwt_clock_skew_default_value() {
-        // When JWT_CLOCK_SKEW_SECONDS is not set, default to 300 seconds (5 minutes)
-        let vars = HashMap::from([
-            (
-                "DATABASE_URL".to_string(),
-                "postgresql://localhost/test".to_string(),
-            ),
-            ("AC_MASTER_KEY".to_string(), test_master_key_base64()),
-        ]);
-
-        let config = Config::from_vars(&vars).expect("Config should load successfully");
-        assert_eq!(
-            config.jwt_clock_skew_seconds,
-            DEFAULT_JWT_CLOCK_SKEW.as_secs() as i64,
-            "Default JWT clock skew should be 300 seconds (5 minutes)"
-        );
-        assert_eq!(config.jwt_clock_skew_seconds, 300);
-    }
-
-    #[test]
     fn test_jwt_clock_skew_custom_value() {
         // When JWT_CLOCK_SKEW_SECONDS is set, use the provided value
-        let vars = HashMap::from([
+        let vars = complete([
             (
                 "DATABASE_URL".to_string(),
                 "postgresql://localhost/test".to_string(),
@@ -1072,7 +1179,7 @@ mod tests {
     #[test]
     fn test_jwt_clock_skew_max_allowed_value() {
         // 600 seconds (10 minutes) is the maximum allowed value
-        let vars = HashMap::from([
+        let vars = complete([
             (
                 "DATABASE_URL".to_string(),
                 "postgresql://localhost/test".to_string(),
@@ -1091,7 +1198,7 @@ mod tests {
     #[test]
     fn test_jwt_clock_skew_rejects_zero() {
         // Zero is not a valid clock skew value
-        let vars = HashMap::from([
+        let vars = complete([
             (
                 "DATABASE_URL".to_string(),
                 "postgresql://localhost/test".to_string(),
@@ -1110,7 +1217,7 @@ mod tests {
     #[test]
     fn test_jwt_clock_skew_rejects_negative() {
         // Negative values are not valid
-        let vars = HashMap::from([
+        let vars = complete([
             (
                 "DATABASE_URL".to_string(),
                 "postgresql://localhost/test".to_string(),
@@ -1129,7 +1236,7 @@ mod tests {
     #[test]
     fn test_jwt_clock_skew_rejects_too_large() {
         // Values greater than 600 seconds (10 minutes) are not allowed
-        let vars = HashMap::from([
+        let vars = complete([
             (
                 "DATABASE_URL".to_string(),
                 "postgresql://localhost/test".to_string(),
@@ -1148,7 +1255,7 @@ mod tests {
     #[test]
     fn test_jwt_clock_skew_rejects_very_large() {
         // Very large values are rejected
-        let vars = HashMap::from([
+        let vars = complete([
             (
                 "DATABASE_URL".to_string(),
                 "postgresql://localhost/test".to_string(),
@@ -1167,7 +1274,7 @@ mod tests {
     #[test]
     fn test_jwt_clock_skew_rejects_non_numeric() {
         // Non-numeric values should be rejected
-        let vars = HashMap::from([
+        let vars = complete([
             (
                 "DATABASE_URL".to_string(),
                 "postgresql://localhost/test".to_string(),
@@ -1189,7 +1296,7 @@ mod tests {
     #[test]
     fn test_jwt_clock_skew_rejects_float() {
         // Floating point values should be rejected (must be integer)
-        let vars = HashMap::from([
+        let vars = complete([
             (
                 "DATABASE_URL".to_string(),
                 "postgresql://localhost/test".to_string(),
@@ -1208,7 +1315,7 @@ mod tests {
     #[test]
     fn test_jwt_clock_skew_rejects_empty_string() {
         // Empty string should be rejected
-        let vars = HashMap::from([
+        let vars = complete([
             (
                 "DATABASE_URL".to_string(),
                 "postgresql://localhost/test".to_string(),
@@ -1227,7 +1334,7 @@ mod tests {
     #[test]
     fn test_jwt_clock_skew_accepts_minimum() {
         // The minimum valid value is 1 second
-        let vars = HashMap::from([
+        let vars = complete([
             (
                 "DATABASE_URL".to_string(),
                 "postgresql://localhost/test".to_string(),
@@ -1248,28 +1355,9 @@ mod tests {
     // ============================================================================
 
     #[test]
-    fn test_bcrypt_cost_default_value() {
-        // When BCRYPT_COST is not set, default to 12 (ADR-0003)
-        let vars = HashMap::from([
-            (
-                "DATABASE_URL".to_string(),
-                "postgresql://localhost/test".to_string(),
-            ),
-            ("AC_MASTER_KEY".to_string(), test_master_key_base64()),
-        ]);
-
-        let config = Config::from_vars(&vars).expect("Config should load successfully");
-        assert_eq!(
-            config.bcrypt_cost, DEFAULT_BCRYPT_COST,
-            "Default bcrypt cost should be 12 (ADR-0003)"
-        );
-        assert_eq!(config.bcrypt_cost, 12);
-    }
-
-    #[test]
     fn test_bcrypt_cost_custom_value() {
         // When BCRYPT_COST is set, use the provided value
-        let vars = HashMap::from([
+        let vars = complete([
             (
                 "DATABASE_URL".to_string(),
                 "postgresql://localhost/test".to_string(),
@@ -1288,7 +1376,7 @@ mod tests {
     #[test]
     fn test_bcrypt_cost_min_allowed_value() {
         // 10 is the minimum allowed value (OWASP 2024 security floor)
-        let vars = HashMap::from([
+        let vars = complete([
             (
                 "DATABASE_URL".to_string(),
                 "postgresql://localhost/test".to_string(),
@@ -1307,7 +1395,7 @@ mod tests {
     #[test]
     fn test_bcrypt_cost_max_allowed_value() {
         // 14 is the maximum allowed value (prevents excessive latency)
-        let vars = HashMap::from([
+        let vars = complete([
             (
                 "DATABASE_URL".to_string(),
                 "postgresql://localhost/test".to_string(),
@@ -1326,7 +1414,7 @@ mod tests {
     #[test]
     fn test_bcrypt_cost_rejects_too_low() {
         // Values less than 10 are insecure per OWASP 2024
-        let vars = HashMap::from([
+        let vars = complete([
             (
                 "DATABASE_URL".to_string(),
                 "postgresql://localhost/test".to_string(),
@@ -1345,7 +1433,7 @@ mod tests {
     #[test]
     fn test_bcrypt_cost_rejects_zero() {
         // Zero is not a valid bcrypt cost
-        let vars = HashMap::from([
+        let vars = complete([
             (
                 "DATABASE_URL".to_string(),
                 "postgresql://localhost/test".to_string(),
@@ -1364,7 +1452,7 @@ mod tests {
     #[test]
     fn test_bcrypt_cost_rejects_too_high() {
         // Values greater than 14 cause excessive latency
-        let vars = HashMap::from([
+        let vars = complete([
             (
                 "DATABASE_URL".to_string(),
                 "postgresql://localhost/test".to_string(),
@@ -1383,7 +1471,7 @@ mod tests {
     #[test]
     fn test_bcrypt_cost_rejects_very_high() {
         // Very high values are rejected
-        let vars = HashMap::from([
+        let vars = complete([
             (
                 "DATABASE_URL".to_string(),
                 "postgresql://localhost/test".to_string(),
@@ -1402,7 +1490,7 @@ mod tests {
     #[test]
     fn test_bcrypt_cost_rejects_negative() {
         // Negative values should be rejected (u32 parse fails)
-        let vars = HashMap::from([
+        let vars = complete([
             (
                 "DATABASE_URL".to_string(),
                 "postgresql://localhost/test".to_string(),
@@ -1421,7 +1509,7 @@ mod tests {
     #[test]
     fn test_bcrypt_cost_rejects_non_numeric() {
         // Non-numeric values should be rejected
-        let vars = HashMap::from([
+        let vars = complete([
             (
                 "DATABASE_URL".to_string(),
                 "postgresql://localhost/test".to_string(),
@@ -1440,7 +1528,7 @@ mod tests {
     #[test]
     fn test_bcrypt_cost_rejects_float() {
         // Floating point values should be rejected (must be integer)
-        let vars = HashMap::from([
+        let vars = complete([
             (
                 "DATABASE_URL".to_string(),
                 "postgresql://localhost/test".to_string(),
@@ -1459,7 +1547,7 @@ mod tests {
     #[test]
     fn test_bcrypt_cost_rejects_empty_string() {
         // Empty string should be rejected
-        let vars = HashMap::from([
+        let vars = complete([
             (
                 "DATABASE_URL".to_string(),
                 "postgresql://localhost/test".to_string(),
@@ -1479,7 +1567,7 @@ mod tests {
     fn test_bcrypt_cost_accepts_all_valid_range() {
         // Test all valid cost values: 10, 11, 12, 13, 14
         for cost in MIN_BCRYPT_COST..=MAX_BCRYPT_COST {
-            let vars = HashMap::from([
+            let vars = complete([
                 (
                     "DATABASE_URL".to_string(),
                     "postgresql://localhost/test".to_string(),
@@ -1501,7 +1589,10 @@ mod tests {
     #[test]
     fn test_bcrypt_cost_constants_are_valid() {
         // Verify our constants have sensible values
-        assert_eq!(DEFAULT_BCRYPT_COST, 12, "Default should be 12 per ADR-0003");
+        assert_eq!(
+            RECOMMENDED_MIN_BCRYPT_COST, 12,
+            "Default should be 12 per ADR-0003"
+        );
         assert_eq!(MIN_BCRYPT_COST, 10, "Minimum should be 10 per OWASP 2024");
         assert_eq!(
             MAX_BCRYPT_COST, 14,
@@ -1510,11 +1601,11 @@ mod tests {
 
         // Verify ordering: MIN <= DEFAULT <= MAX
         assert!(
-            MIN_BCRYPT_COST <= DEFAULT_BCRYPT_COST,
+            MIN_BCRYPT_COST <= RECOMMENDED_MIN_BCRYPT_COST,
             "Default must be >= minimum"
         );
         assert!(
-            DEFAULT_BCRYPT_COST <= MAX_BCRYPT_COST,
+            RECOMMENDED_MIN_BCRYPT_COST <= MAX_BCRYPT_COST,
             "Default must be <= maximum"
         );
     }
@@ -1524,25 +1615,8 @@ mod tests {
     // ============================================================================
 
     #[test]
-    fn test_rate_limit_defaults() {
-        let vars = HashMap::from([
-            (
-                "DATABASE_URL".to_string(),
-                "postgresql://localhost/test".to_string(),
-            ),
-            ("AC_MASTER_KEY".to_string(), test_master_key_base64()),
-        ]);
-
-        let config = Config::from_vars(&vars).expect("Config should load successfully");
-        assert_eq!(config.rate_limit_window_minutes, 15);
-        assert_eq!(config.rate_limit_max_attempts, 5);
-        assert_eq!(config.registration_rate_limit_window_minutes, 60);
-        assert_eq!(config.registration_rate_limit_max_attempts, 5);
-    }
-
-    #[test]
     fn test_rate_limit_custom_values() {
-        let vars = HashMap::from([
+        let vars = complete([
             (
                 "DATABASE_URL".to_string(),
                 "postgresql://localhost/test".to_string(),
@@ -1569,7 +1643,7 @@ mod tests {
 
     #[test]
     fn test_rate_limit_rejects_zero() {
-        let vars = HashMap::from([
+        let vars = complete([
             (
                 "DATABASE_URL".to_string(),
                 "postgresql://localhost/test".to_string(),
@@ -1587,7 +1661,7 @@ mod tests {
 
     #[test]
     fn test_rate_limit_rejects_exceeds_max() {
-        let vars = HashMap::from([
+        let vars = complete([
             (
                 "DATABASE_URL".to_string(),
                 "postgresql://localhost/test".to_string(),
@@ -1605,7 +1679,7 @@ mod tests {
 
     #[test]
     fn test_rate_limit_rejects_non_numeric() {
-        let vars = HashMap::from([
+        let vars = complete([
             (
                 "DATABASE_URL".to_string(),
                 "postgresql://localhost/test".to_string(),
@@ -1623,7 +1697,7 @@ mod tests {
 
     #[test]
     fn test_rate_limit_rejects_negative() {
-        let vars = HashMap::from([
+        let vars = complete([
             (
                 "DATABASE_URL".to_string(),
                 "postgresql://localhost/test".to_string(),
@@ -1641,7 +1715,7 @@ mod tests {
 
     #[test]
     fn test_rate_limit_max_attempts_rejects_exceeds_max() {
-        let vars = HashMap::from([
+        let vars = complete([
             (
                 "DATABASE_URL".to_string(),
                 "postgresql://localhost/test".to_string(),
@@ -1659,7 +1733,7 @@ mod tests {
 
     #[test]
     fn test_registration_rate_limit_window_max() {
-        let vars = HashMap::from([
+        let vars = complete([
             (
                 "DATABASE_URL".to_string(),
                 "postgresql://localhost/test".to_string(),
@@ -1677,7 +1751,7 @@ mod tests {
 
     #[test]
     fn test_registration_rate_limit_window_rejects_exceeds_max() {
-        let vars = HashMap::from([
+        let vars = complete([
             (
                 "DATABASE_URL".to_string(),
                 "postgresql://localhost/test".to_string(),
@@ -1699,25 +1773,75 @@ mod tests {
     #[test]
     fn test_rate_limit_constants_are_valid() {
         // Verify ordering: MIN <= DEFAULT <= MAX for all rate limit constants
-        assert!(MIN_RATE_LIMIT_WINDOW_MINUTES <= DEFAULT_RATE_LIMIT_WINDOW_MINUTES);
-        assert!(DEFAULT_RATE_LIMIT_WINDOW_MINUTES <= MAX_RATE_LIMIT_WINDOW_MINUTES);
-        assert!(MIN_RATE_LIMIT_MAX_ATTEMPTS <= DEFAULT_RATE_LIMIT_MAX_ATTEMPTS);
-        assert!(DEFAULT_RATE_LIMIT_MAX_ATTEMPTS <= MAX_RATE_LIMIT_MAX_ATTEMPTS);
+        assert!(MIN_RATE_LIMIT_WINDOW_MINUTES <= RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES);
+        assert!(RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES <= MAX_RATE_LIMIT_WINDOW_MINUTES);
+        assert!(MIN_RATE_LIMIT_MAX_ATTEMPTS <= RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS);
+        assert!(RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS <= MAX_RATE_LIMIT_MAX_ATTEMPTS);
         assert!(
             MIN_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES
-                <= DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES
+                <= RECOMMENDED_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES
         );
         assert!(
-            DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES
+            RECOMMENDED_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES
                 <= MAX_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES
         );
         assert!(
             MIN_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS
-                <= DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS
+                <= RECOMMENDED_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS
         );
         assert!(
-            DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS
+            RECOMMENDED_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS
                 <= MAX_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS
         );
+    }
+
+    #[test]
+    fn cluster_name_is_validated_at_load() {
+        let long_ok = "a".repeat(63);
+        for good in ["us", "dark-tower-prod", "a", long_ok.as_str()] {
+            let mut vars = base_vars();
+            vars.insert("AC_CLUSTER_NAME".to_string(), good.to_string());
+            assert_eq!(Config::from_vars(&vars).expect("valid").cluster_name, good);
+        }
+        let too_long = "a".repeat(64);
+        for bad in [
+            "",
+            "-us",
+            "US",
+            "us_west",
+            "us.west",
+            "us west",
+            too_long.as_str(),
+        ] {
+            let mut vars = base_vars();
+            vars.insert("AC_CLUSTER_NAME".to_string(), bad.to_string());
+            assert!(
+                matches!(
+                    Config::from_vars(&vars),
+                    Err(ConfigError::InvalidClusterName(_))
+                ),
+                "{bad:?} must refuse boot"
+            );
+        }
+    }
+
+    #[test]
+    fn drain_seconds_is_bounded_and_fail_loud() {
+        for (raw, want) in [("0", 0), ("30", 30)] {
+            let mut vars = base_vars();
+            vars.insert("AC_DRAIN_SECONDS".to_string(), raw.to_string());
+            assert_eq!(Config::from_vars(&vars).expect("valid").drain_seconds, want);
+        }
+        for bad in ["31", "abc", "-1", ""] {
+            let mut vars = base_vars();
+            vars.insert("AC_DRAIN_SECONDS".to_string(), bad.to_string());
+            assert!(
+                matches!(
+                    Config::from_vars(&vars),
+                    Err(ConfigError::InvalidDrainSeconds(_))
+                ),
+                "{bad:?} must refuse boot"
+            );
+        }
     }
 }

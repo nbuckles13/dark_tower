@@ -443,6 +443,7 @@ pub async fn join_meeting(
         &state.config.region,
         &state.config.gc_id,
         &state.config.mh_registry,
+        &state.config.mc_assignment,
     )
     .await
     .inspect_err(|_| {
@@ -629,6 +630,7 @@ pub async fn get_guest_token(
         &state.config.region,
         &state.config.gc_id,
         &state.config.mh_registry,
+        &state.config.mc_assignment,
     )
     .await
     .inspect_err(|_| {

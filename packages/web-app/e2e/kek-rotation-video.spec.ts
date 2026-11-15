@@ -3,8 +3,8 @@
 // Story 3 — KEK ROTATION ON LEAVE WITH VIDEO FLOWING (R-14).
 //
 // Three participants publish both kinds (N=3, M=3). C leaves; MC rotates the
-// meeting KEK (grace + W, from MC's own config — a liveness bound, never a
-// latency gate). Neither T nor a leave-triggered rotation forces a keyframe
+// meeting KEK within W of the leave (MC removes a LeaveRequest at once; W from
+// MC's own config — a liveness bound, never a latency gate). Neither T nor a leave-triggered rotation forces a keyframe
 // (R-14): the video transmit keys rotate in-band on KEK receipt.
 //
 // "No slot loses decodability for longer than the stop rule allows": from just
@@ -33,7 +33,7 @@ import { assertVideoWindow, sampleVideoWindow } from './receiveEvidence.js';
 import { VideoScenario } from './videoScenario.js';
 
 const TIMINGS = mcRotationBudget();
-/** Grace + W plus the shared poll margin: a liveness bound, never a latency gate. */
+/** W plus the shared poll margin: a liveness bound, never a latency gate. */
 const ROTATION_BUDGET_MS = TIMINGS.budgetMs + ROTATION_POLL_MARGIN_MS;
 const BOTH: CohortMemberPlan = { publish: 'both', audioReceiveSlots: 3, videoReceiveSlots: 3 };
 
@@ -101,7 +101,7 @@ test.describe('story 3 R-14: KEK rotation on leave with video flowing', () => {
           if (Date.now() > deadline) {
             throw new Error(
               `LIVENESS: the remaining clients did not both install a newer KEK generation within ` +
-                `grace (${TIMINGS.graceSeconds}s) + W (${TIMINGS.debounceSeconds}s) of the leave ` +
+                `W (${TIMINGS.debounceSeconds}s) of the leave (+ the poll margin) ` +
                 `(generations ${JSON.stringify(before)} -> ${JSON.stringify(now)})`,
             );
           }

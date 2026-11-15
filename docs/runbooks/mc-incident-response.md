@@ -1502,7 +1502,7 @@ kubectl exec -it deployment/mc-0 -n dark-tower -- \
 kubectl exec -it deployment/mc-0 -n dark-tower -- date -u
 kubectl exec -it deployment/ac-service -n dark-tower -- date -u
 # Compare timestamps — drift >5s may cause validation failures
-# (MC allows DEFAULT_CLOCK_SKEW_SECONDS = 5 for binding tokens;
+# (MC allows MC_CLOCK_SKEW_SECONDS — infra/services/mc-service/config.env — for binding tokens;
 #  common JWT layer allows 300s for standard tokens per NIST SP 800-63B)
 
 # 7. Check NTP sync on nodes
@@ -1989,6 +1989,11 @@ sum(rate(mc_participant_disconnects_total[5m])) by (cause)
   sessions — cross-check that `keep_alive` < idle in the `"QUIC idle timeout + keep-alive
   configured"` startup log).
 - `client_closed` dominates → normal (clean tab-closes); no action.
+- A deliberate leave (the SDK's `disconnect()` sends `LeaveRequest`) emits NO disconnect at
+  all: MC removes the participant at once (`leaves{voluntary}`, INFO "Participant left
+  (LeaveRequest) — removing immediately") and the close that follows is not counted. So
+  `leaves{voluntary}` exceeding `client_closed` disconnects is normal; `server_initiated`
+  counts only local closes (shutdown/drain) of participants still rostered.
 
 **If roster removal is slower than the derived worst case**: the idle timeout may not be
 taking effect. Confirm the startup log line `QUIC idle timeout + keep-alive configured`
@@ -3575,7 +3580,7 @@ clears at rotation. Undelivered pushes are `MCKekPushFailureRate`
 ### Scenario 20: Meeting Teardown Failing / MH Budget Ratchet
 
 **Alerts**: `MCEndMeetingOwnershipRejected`, `MCEndMeetingFailureRate`, `MCPushQuiesceTimeouts`,
-`MCTeardownFenceBackstop`, `MCNotifyMeetingEndedFailing`, `MCMeetingEndedNotificationsDropped`
+`MCTeardownFenceBackstop`, `MCNotifyMeetingEndedRejected`, `MCNotifyMeetingEndedStuck`, `MCMeetingEndedNotificationsDropped`
 (all warning; `infra/docker/prometheus/rules/mc-alerts.yaml`); `MHMediaEgressEdgeHeadroomLow`
 (warning; `infra/docker/prometheus/rules/mh-alerts.yaml`).
 
@@ -3651,7 +3656,9 @@ is wedged".
 sum by (outcome) (increase(mc_media_end_meeting_total[15m]))       # one per (meeting, handler)
 sum by (outcome) (increase(mc_media_push_quiesce_total[15m]))      # one per meeting teardown or handler removal
 sum(increase(mc_media_teardown_fence_backstop_total[30m]))
-sum by (status) (increase(mc_gc_notify_meeting_ended_total[15m]))
+sum by (outcome) (increase(mc_gc_notify_meeting_ended_total[15m]))
+max(mc_gc_notify_meeting_ended_pending)                            # backlog
+max(mc_gc_notify_meeting_ended_oldest_pending_age_seconds)         # how stuck
 sum(increase(mc_gc_meeting_ended_notifications_dropped_total[15m]))
 ```
 
@@ -3663,8 +3670,9 @@ sum(increase(mc_gc_meeting_ended_notifications_dropped_total[15m]))
 | `{outcome="superseded_by_successor"}` | the same refusal on a graceful-shutdown release | **Expected during a rolling MC deploy**: a successor already took the meeting over, and MH refused a release that would have cut it. Consistent with supersession, not proof of it — rising OUTSIDE a rollout window is worth a look. No alert. MH's `rejected_ownership` is the UNION of this value and the row above: compare against their sum, never token to token |
 | `{outcome="invalid_argument"}` or `{outcome="error"}` | MH refused the request shape, or an unclassified failure | MC defect; the `mc.teardown` ERROR line carries the gRPC code and message. Escalate to `meeting-controller` |
 | `mc_media_push_quiesce_total{outcome="timed_out"}` | a push worker was still mid-`RegisterMeeting` at the bound; MC waited one more window, then released anyway | A queued late apply is refused MH-side (`mh_media_released_meeting_apply_refusals_total`); a registration still in flight is only ORDERED by the wait, which fails open. Confirm against the handler's `mh_media_registered_meetings`, and read `mh-incident-response.md` for the two races |
-| `mc_media_teardown_fence_backstop_total` | the fence was lifted by its deadline, not by the teardown's report: the teardown task hung or died without unwinding. GC is still told a meeting that ENDED has ended (the cause is recorded at reap), so the id stays joinable; if joins to it return `meeting_not_found`, check `mc_gc_notify_meeting_ended_total{status="error"}` | Escalate on a repeat — every firing is also a meeting whose `EndMeeting` may never have gone out. **Not mutually exclusive with `timed_out`**: backstop WITHOUT a matching `timed_out` is a different fault (hung outside the drain) from the two together |
-| `mc_gc_notify_meeting_ended_total{status="error"}` | GC did not take the notify | Sent at most once for anything GC may have processed, so the error is final. GC keeps the row live; joins to that id get `meeting_not_found` until MC restarts or is marked unhealthy. Check GC health (`gc-incident-response.md`) |
+| `mc_media_teardown_fence_backstop_total` | the fence was lifted by its deadline, not by the teardown's report: the teardown task hung or died without unwinding. GC is still told a meeting that ENDED has ended (the cause is recorded at reap), so the id stays joinable; if joins to it return `meeting_not_found`, check `mc_gc_notify_meeting_ended_oldest_pending_age_seconds` and `mc_gc_notify_meeting_ended_total{outcome="rejected"}` | Escalate on a repeat — every firing is also a meeting whose `EndMeeting` may never have gone out. **Not mutually exclusive with `timed_out`**: backstop WITHOUT a matching `timed_out` is a different fault (hung outside the drain) from the two together |
+| `mc_gc_notify_meeting_ended_oldest_pending_age_seconds` growing (`MCNotifyMeetingEndedStuck`) | GC is not answering MC's notifies; MC keeps retrying each (fenced by `controller_id` + `assignment_id`, so a retry is always safe) | A GROWING BACKLOG (`mc_gc_notify_meeting_ended_pending`) means joins to each pending meeting id reach MC, which no longer holds it (`meeting_not_found`). Check GC health and the MC→GC path (`gc-incident-response.md`); the `mc.grpc.gc_client` WARN lines give the failure code per attempt. It drains by itself once GC answers. If MC→GC is down entirely, MC's heartbeats fail too and GC fails the rows over on the next join |
+| `mc_gc_notify_meeting_ended_total{outcome="rejected"}` (`MCNotifyMeetingEndedRejected`) | GC refused the notify as invalid, or answered with no outcome | A DEFECT (MC built a bad request, or GC/MC version skew), never retried: the row stays live until this MC stops heartbeating. Escalate to `meeting-controller` + `global-controller` with the ERROR line |
 | `mc_gc_meeting_ended_notifications_dropped_total` | MC's notify queue was full; the end was never reported | Expected-empty: MC is losing events, not GC being down. Escalate to `meeting-controller` |
 
 **Logs.** `mc.teardown` carries one INFO per released meeting ("Meeting released on its media
@@ -3695,10 +3703,11 @@ nothing. **Do not** replace an MH unless the registered-meetings check says the 
 limit — it drains the pod and migrates every live meeting on it (`mh-deployment.md` §Rollout With
 Media Flowing).
 
-**A split meeting.** If participants of one meeting id end up on two MCs, suspect GC failover
-(`atomic_assign`'s unhealthy/stale-MC arm re-pointing the assignment to another MC on a join) racing the old MC's in-flight notify — the notify is not
-incarnation-safe (`docs/TODO.md`, "`NotifyMeetingEnded` is not incarnation-safe"). See
-`gc-incident-response.md` beside the `MCNotifyMeetingEndedFailing` triage.
+**A split meeting.** The notify can no longer cause one: it is fenced by `controller_id` +
+`assignment_id`, so an old MC's notify (after a failover) or an orphan meeting's notify (a GC that
+lost the assignment race) ends nothing but its own incarnation — GC counts it
+`gc_meeting_end_notifications_total{outcome="fenced"}` and logs it at WARN. If participants of one
+meeting id still end up on two MCs, see `gc-incident-response.md` Scenario 3.
 
 **Escalation**: `meeting-controller` for `rejected_ownership` (and `superseded_by_successor` outside a rollout), `invalid_argument`, `error`, the
 backstop and dropped notifications; `media-handler` for `unimplemented` (rollout order) and
@@ -4482,11 +4491,13 @@ meeting and reaches MC after its window is refused with `meeting_not_found` or
    take up to `teardown_fence_hold_max_seconds` (MC's startup line), and GC keeps handing out the
    ending assignment until MC's notify. Check that bound and the health of that meeting's MHs
    (MH incident runbook). The remedy is a manual rejoin after that bound.
-3. If refusals persist past that bound with a HEALTHY MC, suspect a lost `NotifyMeetingEnded`
-   (`MCNotifyMeetingEndedFailing`, `MCMeetingEndedNotificationsDropped`; `docs/TODO.md`
-   residual): from GC's view the row was never ended, so GC keeps reusing the LIVE assignment
-   for a meeting MC has already ended, until MC restarts or is marked unhealthy (then the next
-   join fails the row over in `atomic_assign`, and the backstop eventually ends it).
+3. If refusals persist past that bound with a HEALTHY MC, suspect a `NotifyMeetingEnded` GC has
+   not answered (`MCNotifyMeetingEndedStuck`, `MCNotifyMeetingEndedRejected`,
+   `MCMeetingEndedNotificationsDropped`): from GC's view the row was never ended, so GC keeps
+   reusing the LIVE assignment for a meeting MC has already ended. MC retries a pending notify
+   until GC answers (it is fenced, so safe), so this lasts only while MC→GC is failing; a rejected
+   or dropped one lasts until this MC stops heartbeating (then the next join fails the row over in
+   `atomic_assign`, and the backstop eventually ends it).
 
 **(b) A sustained rise in `join_window_expired` relative to `last_participant_left`**:
 

@@ -82,29 +82,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     observability::metrics::zero_initialize_counters();
     info!("Prometheus metrics recorder initialized");
 
-    // Log whether clock skew was explicitly configured or using default
-    let is_default_clock_skew =
-        config.jwt_clock_skew_seconds == config::DEFAULT_JWT_CLOCK_SKEW.as_secs() as i64;
+    // Every value below is REQUIRED (no code default), so it is always the
+    // configured one; the `*_is_recommended` fields compare it to the
+    // recommended value (ADR-0003 / NIST SP 800-63B).
+    let clock_skew_is_recommended =
+        config.jwt_clock_skew_seconds == config::RECOMMENDED_JWT_CLOCK_SKEW.as_secs() as i64;
     info!(
         jwt_clock_skew_seconds = config.jwt_clock_skew_seconds,
-        is_default = is_default_clock_skew,
+        is_recommended = clock_skew_is_recommended,
+        bcrypt_cost = config.bcrypt_cost,
+        otel_sample_rate = config.otel_sample_rate,
+        environment = %config.environment,
+        cluster_name = %config.cluster_name,
+        drain_seconds = config.drain_seconds,
         "Configuration loaded successfully"
     );
 
     // Log rate limit configuration
     info!(
         rate_limit_window_minutes = config.rate_limit_window_minutes,
-        rate_limit_window_is_default =
-            (config.rate_limit_window_minutes == config::DEFAULT_RATE_LIMIT_WINDOW_MINUTES),
+        rate_limit_window_is_recommended =
+            (config.rate_limit_window_minutes == config::RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES),
         rate_limit_max_attempts = config.rate_limit_max_attempts,
-        rate_limit_attempts_is_default =
-            (config.rate_limit_max_attempts == config::DEFAULT_RATE_LIMIT_MAX_ATTEMPTS),
+        rate_limit_attempts_is_recommended =
+            (config.rate_limit_max_attempts == config::RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS),
         registration_rate_limit_window_minutes = config.registration_rate_limit_window_minutes,
-        reg_rate_limit_window_is_default = (config.registration_rate_limit_window_minutes
-            == config::DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES),
+        reg_rate_limit_window_is_recommended = (config.registration_rate_limit_window_minutes
+            == config::RECOMMENDED_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES),
         registration_rate_limit_max_attempts = config.registration_rate_limit_max_attempts,
-        reg_rate_limit_attempts_is_default = (config.registration_rate_limit_max_attempts
-            == config::DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS),
+        reg_rate_limit_attempts_is_recommended = (config.registration_rate_limit_max_attempts
+            == config::RECOMMENDED_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS),
         "Rate limit configuration"
     );
 
@@ -132,12 +139,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize signing key if none exists
     info!("Initializing signing keys...");
-    let cluster_name = std::env::var("CLUSTER_NAME").unwrap_or_else(|_| "us".to_string());
-
     key_management_service::initialize_signing_key(
         &db_pool,
         config.master_key.expose_secret(),
-        &cluster_name,
+        &config.cluster_name,
     )
     .await
     .map_err(|e| {
@@ -155,6 +160,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Parse bind address before moving config
     let bind_address = config.bind_address.clone();
+    let drain_seconds = config.drain_seconds;
 
     // Create application state
     let state = Arc::new(AppState {
@@ -182,7 +188,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
+    .with_graceful_shutdown(shutdown_signal(drain_seconds))
     .await?;
 
     info!("Auth Controller shutdown complete");
@@ -193,8 +199,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Listens for shutdown signals (SIGTERM, SIGINT)
 /// Returns when a shutdown signal is received and drain period is complete
 ///
-/// ADR-0012: Graceful shutdown with 30s drain period
-async fn shutdown_signal() {
+/// ADR-0012: Graceful shutdown, then a `drain_seconds` drain (`AC_DRAIN_SECONDS`)
+async fn shutdown_signal(drain_seconds: u64) {
     let ctrl_c = async {
         match signal::ctrl_c().await {
             Ok(()) => info!("Received SIGINT, starting graceful shutdown..."),
@@ -234,11 +240,9 @@ async fn shutdown_signal() {
     // - Existing connections are allowed to complete
     // - K8s removes us from service endpoints (readiness probe fails after SIGTERM)
     //
-    // For local development, use AC_DRAIN_SECONDS=0 to exit immediately
-    let drain_secs: u64 = std::env::var("AC_DRAIN_SECONDS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(30);
+    // AC_DRAIN_SECONDS is REQUIRED and bounded in Config (local development
+    // sets 0 to exit immediately).
+    let drain_secs = drain_seconds;
 
     if drain_secs > 0 {
         warn!("Draining connections for {} seconds...", drain_secs);

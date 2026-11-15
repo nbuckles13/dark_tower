@@ -1,7 +1,7 @@
 #[cfg(test)]
 use crate::config::{
-    DEFAULT_BCRYPT_COST, DEFAULT_JWT_CLOCK_SKEW, DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
-    DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+    RECOMMENDED_JWT_CLOCK_SKEW, RECOMMENDED_MIN_BCRYPT_COST, RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
+    RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
 };
 use crate::crypto::{self, Claims, EncryptedKey, UserClaims};
 use crate::errors::AcError;
@@ -394,7 +394,8 @@ mod tests {
         let master_key = crypto::generate_random_bytes(32)?;
         key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
 
-        let valid_hash = crypto::hash_client_secret("valid-secret-12345", DEFAULT_BCRYPT_COST)?;
+        let valid_hash =
+            crypto::hash_client_secret("valid-secret-12345", RECOMMENDED_MIN_BCRYPT_COST)?;
         service_credentials::create_service_credential(
             &pool,
             "valid-client",
@@ -406,7 +407,7 @@ mod tests {
         .await?;
         // Fill the dummy-hash cache now, as main.rs does at startup, so its
         // one-time hash isn't counted against the not-found path.
-        crypto::dummy_hash(DEFAULT_BCRYPT_COST)?;
+        crypto::dummy_hash(RECOMMENDED_MIN_BCRYPT_COST)?;
 
         for client_id in ["valid-client", "nonexistent-client"] {
             let snap = MetricAssertion::snapshot();
@@ -420,9 +421,9 @@ mod tests {
                 None,
                 None,
                 None,
-                DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-                DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
-                DEFAULT_BCRYPT_COST,
+                RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+                RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
+                RECOMMENDED_MIN_BCRYPT_COST,
             )
             .await;
 
@@ -452,7 +453,7 @@ mod tests {
 
         // Create valid credential
         let valid_secret = "valid-secret-12345";
-        let valid_hash = crypto::hash_client_secret(valid_secret, DEFAULT_BCRYPT_COST)?;
+        let valid_hash = crypto::hash_client_secret(valid_secret, RECOMMENDED_MIN_BCRYPT_COST)?;
         service_credentials::create_service_credential(
             &pool,
             "valid-client",
@@ -474,9 +475,9 @@ mod tests {
             None,
             None,
             None,
-            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
-            DEFAULT_BCRYPT_COST,
+            RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+            RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
+            RECOMMENDED_MIN_BCRYPT_COST,
         )
         .await;
 
@@ -491,9 +492,9 @@ mod tests {
             None,
             None,
             None,
-            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
-            DEFAULT_BCRYPT_COST,
+            RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+            RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
+            RECOMMENDED_MIN_BCRYPT_COST,
         )
         .await;
 
@@ -517,7 +518,7 @@ mod tests {
         key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
 
         let valid_secret = "valid-secret-12345";
-        let valid_hash = crypto::hash_client_secret(valid_secret, DEFAULT_BCRYPT_COST)?;
+        let valid_hash = crypto::hash_client_secret(valid_secret, RECOMMENDED_MIN_BCRYPT_COST)?;
         let _credential = service_credentials::create_service_credential(
             &pool,
             "test-client",
@@ -528,8 +529,8 @@ mod tests {
         )
         .await?;
 
-        // Attempt DEFAULT_RATE_LIMIT_MAX_ATTEMPTS failed logins
-        for _ in 0..DEFAULT_RATE_LIMIT_MAX_ATTEMPTS {
+        // Attempt RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS failed logins
+        for _ in 0..RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS {
             let _ = issue_service_token(
                 &pool,
                 &master_key,
@@ -540,9 +541,9 @@ mod tests {
                 None,
                 Some("192.168.1.1"),
                 None,
-                DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-                DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
-                DEFAULT_BCRYPT_COST,
+                RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+                RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
+                RECOMMENDED_MIN_BCRYPT_COST,
             )
             .await;
         }
@@ -558,9 +559,9 @@ mod tests {
             None,
             Some("192.168.1.1"),
             None,
-            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
-            DEFAULT_BCRYPT_COST,
+            RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+            RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
+            RECOMMENDED_MIN_BCRYPT_COST,
         )
         .await;
 
@@ -577,9 +578,9 @@ mod tests {
             None,
             Some("192.168.1.1"),
             None,
-            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
-            DEFAULT_BCRYPT_COST,
+            RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+            RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
+            RECOMMENDED_MIN_BCRYPT_COST,
         )
         .await;
 
@@ -597,7 +598,7 @@ mod tests {
         key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
 
         let valid_secret = "valid-secret-12345";
-        let valid_hash = crypto::hash_client_secret(valid_secret, DEFAULT_BCRYPT_COST)?;
+        let valid_hash = crypto::hash_client_secret(valid_secret, RECOMMENDED_MIN_BCRYPT_COST)?;
         service_credentials::create_service_credential(
             &pool,
             "test-client-window",
@@ -624,9 +625,9 @@ mod tests {
                 None,
                 Some("192.168.1.2"),
                 None,
-                DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-                DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
-                DEFAULT_BCRYPT_COST,
+                RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+                RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
+                RECOMMENDED_MIN_BCRYPT_COST,
             )
             .await;
         }
@@ -642,9 +643,9 @@ mod tests {
             None,
             Some("192.168.1.2"),
             None,
-            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
-            DEFAULT_BCRYPT_COST,
+            RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+            RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
+            RECOMMENDED_MIN_BCRYPT_COST,
         )
         .await;
 
@@ -661,7 +662,7 @@ mod tests {
         key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
 
         let valid_secret = "valid-secret-12345";
-        let valid_hash = crypto::hash_client_secret(valid_secret, DEFAULT_BCRYPT_COST)?;
+        let valid_hash = crypto::hash_client_secret(valid_secret, RECOMMENDED_MIN_BCRYPT_COST)?;
 
         // Create credential with limited scopes
         service_credentials::create_service_credential(
@@ -688,9 +689,9 @@ mod tests {
             ]),
             None,
             None,
-            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
-            DEFAULT_BCRYPT_COST,
+            RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+            RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
+            RECOMMENDED_MIN_BCRYPT_COST,
         )
         .await;
 
@@ -706,7 +707,7 @@ mod tests {
         key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
 
         let valid_secret = "valid-secret-12345";
-        let valid_hash = crypto::hash_client_secret(valid_secret, DEFAULT_BCRYPT_COST)?;
+        let valid_hash = crypto::hash_client_secret(valid_secret, RECOMMENDED_MIN_BCRYPT_COST)?;
 
         service_credentials::create_service_credential(
             &pool,
@@ -733,9 +734,9 @@ mod tests {
             Some(vec!["scope-b".to_string()]),
             None,
             None,
-            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
-            DEFAULT_BCRYPT_COST,
+            RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+            RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
+            RECOMMENDED_MIN_BCRYPT_COST,
         )
         .await?;
 
@@ -752,7 +753,7 @@ mod tests {
         key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
 
         let valid_secret = "valid-secret-12345";
-        let valid_hash = crypto::hash_client_secret(valid_secret, DEFAULT_BCRYPT_COST)?;
+        let valid_hash = crypto::hash_client_secret(valid_secret, RECOMMENDED_MIN_BCRYPT_COST)?;
 
         let credential = service_credentials::create_service_credential(
             &pool,
@@ -778,9 +779,9 @@ mod tests {
             None,
             None,
             None,
-            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
-            DEFAULT_BCRYPT_COST,
+            RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+            RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
+            RECOMMENDED_MIN_BCRYPT_COST,
         )
         .await;
 
@@ -796,7 +797,7 @@ mod tests {
         key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
 
         let valid_secret = "valid-secret-12345";
-        let valid_hash = crypto::hash_client_secret(valid_secret, DEFAULT_BCRYPT_COST)?;
+        let valid_hash = crypto::hash_client_secret(valid_secret, RECOMMENDED_MIN_BCRYPT_COST)?;
 
         service_credentials::create_service_credential(
             &pool,
@@ -819,9 +820,9 @@ mod tests {
             None,
             None,
             None,
-            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
-            DEFAULT_BCRYPT_COST,
+            RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+            RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
+            RECOMMENDED_MIN_BCRYPT_COST,
         )
         .await;
 
@@ -837,7 +838,7 @@ mod tests {
         key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
 
         let valid_secret = "valid-secret-12345";
-        let valid_hash = crypto::hash_client_secret(valid_secret, DEFAULT_BCRYPT_COST)?;
+        let valid_hash = crypto::hash_client_secret(valid_secret, RECOMMENDED_MIN_BCRYPT_COST)?;
 
         service_credentials::create_service_credential(
             &pool,
@@ -859,9 +860,9 @@ mod tests {
             None,
             Some("192.168.1.100"),
             Some("TestAgent/1.0"),
-            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
-            DEFAULT_BCRYPT_COST,
+            RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+            RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
+            RECOMMENDED_MIN_BCRYPT_COST,
         )
         .await?;
 
@@ -898,7 +899,7 @@ mod tests {
         key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
 
         let valid_secret = "valid-secret-12345";
-        let valid_hash = crypto::hash_client_secret(valid_secret, DEFAULT_BCRYPT_COST)?;
+        let valid_hash = crypto::hash_client_secret(valid_secret, RECOMMENDED_MIN_BCRYPT_COST)?;
 
         service_credentials::create_service_credential(
             &pool,
@@ -921,9 +922,9 @@ mod tests {
             None,
             None,
             None,
-            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
-            DEFAULT_BCRYPT_COST,
+            RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+            RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
+            RECOMMENDED_MIN_BCRYPT_COST,
         )
         .await?;
 
@@ -955,7 +956,7 @@ mod tests {
         let result = crypto::verify_jwt(
             &tampered_token,
             &signing_key.public_key,
-            DEFAULT_JWT_CLOCK_SKEW,
+            RECOMMENDED_JWT_CLOCK_SKEW,
         );
 
         // Should be rejected due to signature mismatch
@@ -1003,7 +1004,7 @@ mod tests {
         let result = crypto::verify_jwt(
             &token_wrong_key,
             &correct_key.public_key,
-            DEFAULT_JWT_CLOCK_SKEW,
+            RECOMMENDED_JWT_CLOCK_SKEW,
         );
 
         // Should be rejected - signature won't match
@@ -1014,8 +1015,11 @@ mod tests {
 
         // Also verify that verifying with the wrong public key would succeed
         // (to prove the token itself is valid, just not for our system)
-        let verify_with_wrong_key =
-            crypto::verify_jwt(&token_wrong_key, &wrong_public_key, DEFAULT_JWT_CLOCK_SKEW);
+        let verify_with_wrong_key = crypto::verify_jwt(
+            &token_wrong_key,
+            &wrong_public_key,
+            RECOMMENDED_JWT_CLOCK_SKEW,
+        );
         assert!(
             verify_with_wrong_key.is_ok(),
             "Token should be valid for the key it was signed with"
@@ -1033,7 +1037,7 @@ mod tests {
         key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
 
         let valid_secret = "valid-secret-12345";
-        let valid_hash = crypto::hash_client_secret(valid_secret, DEFAULT_BCRYPT_COST)?;
+        let valid_hash = crypto::hash_client_secret(valid_secret, RECOMMENDED_MIN_BCRYPT_COST)?;
 
         service_credentials::create_service_credential(
             &pool,
@@ -1056,9 +1060,9 @@ mod tests {
             None,
             None,
             None,
-            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
-            DEFAULT_BCRYPT_COST,
+            RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+            RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
+            RECOMMENDED_MIN_BCRYPT_COST,
         )
         .await?;
 
@@ -1073,7 +1077,7 @@ mod tests {
         let result = crypto::verify_jwt(
             &stripped_token,
             &signing_key.public_key,
-            DEFAULT_JWT_CLOCK_SKEW,
+            RECOMMENDED_JWT_CLOCK_SKEW,
         );
 
         // Should be rejected - invalid JWT format
@@ -1097,7 +1101,7 @@ mod tests {
         key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
 
         let valid_secret = "valid-secret-12345";
-        let valid_hash = crypto::hash_client_secret(valid_secret, DEFAULT_BCRYPT_COST)?;
+        let valid_hash = crypto::hash_client_secret(valid_secret, RECOMMENDED_MIN_BCRYPT_COST)?;
 
         service_credentials::create_service_credential(
             &pool,
@@ -1120,9 +1124,9 @@ mod tests {
             None,
             None,
             None,
-            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
-            DEFAULT_BCRYPT_COST,
+            RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+            RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
+            RECOMMENDED_MIN_BCRYPT_COST,
         )
         .await?;
 
@@ -1153,7 +1157,7 @@ mod tests {
         let result = crypto::verify_jwt(
             &tampered_token,
             &signing_key.public_key,
-            DEFAULT_JWT_CLOCK_SKEW,
+            RECOMMENDED_JWT_CLOCK_SKEW,
         );
 
         // Should be rejected due to algorithm mismatch
@@ -1178,7 +1182,7 @@ mod tests {
         key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
 
         let valid_secret = "valid-secret-12345";
-        let valid_hash = crypto::hash_client_secret(valid_secret, DEFAULT_BCRYPT_COST)?;
+        let valid_hash = crypto::hash_client_secret(valid_secret, RECOMMENDED_MIN_BCRYPT_COST)?;
 
         service_credentials::create_service_credential(
             &pool,
@@ -1201,9 +1205,9 @@ mod tests {
             None,
             None,
             None,
-            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
-            DEFAULT_BCRYPT_COST,
+            RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+            RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
+            RECOMMENDED_MIN_BCRYPT_COST,
         )
         .await?;
 
@@ -1228,8 +1232,11 @@ mod tests {
         let signing_key = signing_keys::get_active_key(&pool)
             .await?
             .expect("No active signing key found");
-        let result =
-            crypto::verify_jwt(&none_token, &signing_key.public_key, DEFAULT_JWT_CLOCK_SKEW);
+        let result = crypto::verify_jwt(
+            &none_token,
+            &signing_key.public_key,
+            RECOMMENDED_JWT_CLOCK_SKEW,
+        );
 
         // Should be rejected - "none" algorithm not allowed
         assert!(
@@ -1282,7 +1289,7 @@ mod tests {
         let result = crypto::verify_jwt(
             &expired_token,
             &signing_key_model.public_key,
-            DEFAULT_JWT_CLOCK_SKEW,
+            RECOMMENDED_JWT_CLOCK_SKEW,
         );
 
         // Should be rejected due to expiration
@@ -1349,7 +1356,7 @@ mod tests {
         let result = crypto::verify_jwt(
             &future_token,
             &signing_key_model.public_key,
-            DEFAULT_JWT_CLOCK_SKEW,
+            RECOMMENDED_JWT_CLOCK_SKEW,
         );
 
         // Should be rejected - iat too far in the future
@@ -1407,7 +1414,7 @@ mod tests {
         let result = crypto::verify_jwt(
             &token,
             &signing_key_model.public_key,
-            DEFAULT_JWT_CLOCK_SKEW,
+            RECOMMENDED_JWT_CLOCK_SKEW,
         );
 
         assert!(
@@ -1444,7 +1451,7 @@ mod tests {
         let claims_at_boundary = crypto::Claims {
             sub: "boundary-client".to_string(),
             exp: now.timestamp() + TOKEN_EXPIRY_SECONDS_I64,
-            iat: now.timestamp() + DEFAULT_JWT_CLOCK_SKEW.as_secs() as i64, // Exactly at 5 min boundary
+            iat: now.timestamp() + RECOMMENDED_JWT_CLOCK_SKEW.as_secs() as i64, // Exactly at 5 min boundary
             scope: "valid-scope".to_string(),
             service_type: Some("global-controller".to_string()),
         };
@@ -1466,7 +1473,7 @@ mod tests {
         let result = crypto::verify_jwt(
             &token,
             &signing_key_model.public_key,
-            DEFAULT_JWT_CLOCK_SKEW,
+            RECOMMENDED_JWT_CLOCK_SKEW,
         );
 
         assert!(
@@ -1510,7 +1517,7 @@ mod tests {
         let claims_beyond_boundary = crypto::Claims {
             sub: "beyond-boundary-client".to_string(),
             exp: now.timestamp() + TOKEN_EXPIRY_SECONDS_I64,
-            iat: now.timestamp() + DEFAULT_JWT_CLOCK_SKEW.as_secs() as i64 * 2, // well beyond 5 min
+            iat: now.timestamp() + RECOMMENDED_JWT_CLOCK_SKEW.as_secs() as i64 * 2, // well beyond 5 min
             scope: "valid-scope".to_string(),
             service_type: Some("global-controller".to_string()),
         };
@@ -1536,7 +1543,7 @@ mod tests {
         let result = crypto::verify_jwt(
             &token,
             &signing_key_model.public_key,
-            DEFAULT_JWT_CLOCK_SKEW,
+            RECOMMENDED_JWT_CLOCK_SKEW,
         );
 
         assert!(
@@ -1615,7 +1622,7 @@ mod tests {
         let result = crypto::verify_jwt(
             &token_at_jwt,
             &signing_key_model.public_key,
-            DEFAULT_JWT_CLOCK_SKEW,
+            RECOMMENDED_JWT_CLOCK_SKEW,
         );
         assert!(
             result.is_ok(),
@@ -1631,7 +1638,7 @@ mod tests {
         let result = crypto::verify_jwt(
             &token_lowercase,
             &signing_key_model.public_key,
-            DEFAULT_JWT_CLOCK_SKEW,
+            RECOMMENDED_JWT_CLOCK_SKEW,
         );
         assert!(
             result.is_ok(),
@@ -1647,7 +1654,7 @@ mod tests {
         let result = crypto::verify_jwt(
             &token_custom,
             &signing_key_model.public_key,
-            DEFAULT_JWT_CLOCK_SKEW,
+            RECOMMENDED_JWT_CLOCK_SKEW,
         );
         assert!(
             result.is_ok(),
@@ -1664,7 +1671,7 @@ mod tests {
         let result = crypto::verify_jwt(
             &token_no_typ,
             &signing_key_model.public_key,
-            DEFAULT_JWT_CLOCK_SKEW,
+            RECOMMENDED_JWT_CLOCK_SKEW,
         );
         assert!(
             result.is_ok(),
@@ -1704,7 +1711,7 @@ mod tests {
         key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
 
         let valid_secret = "valid-secret-12345";
-        let valid_hash = crypto::hash_client_secret(valid_secret, DEFAULT_BCRYPT_COST)?;
+        let valid_hash = crypto::hash_client_secret(valid_secret, RECOMMENDED_MIN_BCRYPT_COST)?;
 
         service_credentials::create_service_credential(
             &pool,
@@ -1727,9 +1734,9 @@ mod tests {
             None,
             None,
             None,
-            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
-            DEFAULT_BCRYPT_COST,
+            RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+            RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
+            RECOMMENDED_MIN_BCRYPT_COST,
         )
         .await?;
 
@@ -1768,7 +1775,7 @@ mod tests {
         let result = crypto::verify_jwt(
             &tampered_token,
             &signing_key.public_key,
-            DEFAULT_JWT_CLOCK_SKEW,
+            RECOMMENDED_JWT_CLOCK_SKEW,
         );
 
         // Should be rejected - algorithm mismatch
@@ -1786,7 +1793,7 @@ mod tests {
         let result = crypto::verify_jwt(
             &tampered_token_rs256,
             &signing_key.public_key,
-            DEFAULT_JWT_CLOCK_SKEW,
+            RECOMMENDED_JWT_CLOCK_SKEW,
         );
         assert!(
             matches!(result, Err(AcError::InvalidToken(_))),
@@ -1866,7 +1873,7 @@ mod tests {
         let result = crypto::verify_jwt(
             &attacker_token,
             &legitimate_key.public_key,
-            DEFAULT_JWT_CLOCK_SKEW,
+            RECOMMENDED_JWT_CLOCK_SKEW,
         );
 
         // Should be REJECTED - signature won't match our public key
@@ -1880,7 +1887,7 @@ mod tests {
         let attacker_verification = crypto::verify_jwt(
             &attacker_token,
             &attacker_public_key,
-            DEFAULT_JWT_CLOCK_SKEW,
+            RECOMMENDED_JWT_CLOCK_SKEW,
         );
         assert!(
             attacker_verification.is_ok(),
@@ -1890,7 +1897,7 @@ mod tests {
         // Test 2: Legitimate token with manipulated kid header
         // Issue a real token
         let valid_secret = "valid-secret-12345";
-        let valid_hash = crypto::hash_client_secret(valid_secret, DEFAULT_BCRYPT_COST)?;
+        let valid_hash = crypto::hash_client_secret(valid_secret, RECOMMENDED_MIN_BCRYPT_COST)?;
         service_credentials::create_service_credential(
             &pool,
             "kid-test-client",
@@ -1911,9 +1918,9 @@ mod tests {
             None,
             None,
             None,
-            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
-            DEFAULT_BCRYPT_COST,
+            RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+            RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
+            RECOMMENDED_MIN_BCRYPT_COST,
         )
         .await?;
 
@@ -1936,7 +1943,7 @@ mod tests {
         let result = crypto::verify_jwt(
             &tampered_token,
             &legitimate_key.public_key,
-            DEFAULT_JWT_CLOCK_SKEW,
+            RECOMMENDED_JWT_CLOCK_SKEW,
         );
 
         // Token should be REJECTED because changing the header invalidates the signature
@@ -2011,7 +2018,7 @@ mod tests {
         let verified = crypto::verify_jwt(
             &token_with_extra,
             &signing_key_model.public_key,
-            DEFAULT_JWT_CLOCK_SKEW,
+            RECOMMENDED_JWT_CLOCK_SKEW,
         )?;
 
         // Should successfully parse the standard fields
@@ -2074,7 +2081,7 @@ mod tests {
         let result = crypto::verify_jwt(
             &incomplete_token,
             &signing_key_model.public_key,
-            DEFAULT_JWT_CLOCK_SKEW,
+            RECOMMENDED_JWT_CLOCK_SKEW,
         );
 
         assert!(
@@ -2096,7 +2103,7 @@ mod tests {
         key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
 
         let valid_secret = "valid-secret-12345";
-        let valid_hash = crypto::hash_client_secret(valid_secret, DEFAULT_BCRYPT_COST)?;
+        let valid_hash = crypto::hash_client_secret(valid_secret, RECOMMENDED_MIN_BCRYPT_COST)?;
 
         service_credentials::create_service_credential(
             &pool,
@@ -2119,9 +2126,9 @@ mod tests {
             None,
             None,
             None,
-            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
-            DEFAULT_BCRYPT_COST,
+            RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+            RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
+            RECOMMENDED_MIN_BCRYPT_COST,
         )
         .await?;
 
@@ -2147,7 +2154,7 @@ mod tests {
         let result = crypto::verify_jwt(
             &tampered_token,
             &signing_key.public_key,
-            DEFAULT_JWT_CLOCK_SKEW,
+            RECOMMENDED_JWT_CLOCK_SKEW,
         );
 
         // Should be rejected due to signature mismatch
@@ -2255,7 +2262,7 @@ mod tests {
         let result = crypto::verify_jwt(
             &oversized_token,
             &signing_key_model.public_key,
-            DEFAULT_JWT_CLOCK_SKEW,
+            RECOMMENDED_JWT_CLOCK_SKEW,
         );
 
         // Should be rejected due to size limit
@@ -2287,7 +2294,7 @@ mod tests {
         let result = crypto::verify_jwt(
             &normal_token,
             &signing_key_model.public_key,
-            DEFAULT_JWT_CLOCK_SKEW,
+            RECOMMENDED_JWT_CLOCK_SKEW,
         );
         assert!(
             result.is_ok(),
@@ -2340,7 +2347,7 @@ mod tests {
 
         // Create a valid credential
         let valid_secret = "valid-secret-12345";
-        let valid_hash = crypto::hash_client_secret(valid_secret, DEFAULT_BCRYPT_COST)?;
+        let valid_hash = crypto::hash_client_secret(valid_secret, RECOMMENDED_MIN_BCRYPT_COST)?;
         service_credentials::create_service_credential(
             &pool,
             "existing-client",
@@ -2376,9 +2383,9 @@ mod tests {
                 None,
                 None,
                 None,
-                DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-                DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
-                DEFAULT_BCRYPT_COST,
+                RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+                RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
+                RECOMMENDED_MIN_BCRYPT_COST,
             )
             .await;
 
@@ -2453,7 +2460,7 @@ mod tests {
         key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
 
         let valid_secret = "valid-secret-12345";
-        let valid_hash = crypto::hash_client_secret(valid_secret, DEFAULT_BCRYPT_COST)?;
+        let valid_hash = crypto::hash_client_secret(valid_secret, RECOMMENDED_MIN_BCRYPT_COST)?;
         service_credentials::create_service_credential(
             &pool,
             "valid-client",
@@ -2475,9 +2482,9 @@ mod tests {
             None,
             None,
             None,
-            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
-            DEFAULT_BCRYPT_COST,
+            RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+            RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
+            RECOMMENDED_MIN_BCRYPT_COST,
         )
         .await;
 
@@ -2491,9 +2498,9 @@ mod tests {
             None,
             None,
             None,
-            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
-            DEFAULT_BCRYPT_COST,
+            RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+            RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
+            RECOMMENDED_MIN_BCRYPT_COST,
         )
         .await;
 
@@ -2557,7 +2564,7 @@ mod tests {
         email: &str,
         password: &str,
     ) -> uuid::Uuid {
-        let password_hash = crypto::hash_client_secret(password, DEFAULT_BCRYPT_COST)
+        let password_hash = crypto::hash_client_secret(password, RECOMMENDED_MIN_BCRYPT_COST)
             .expect("Should hash password");
 
         let user = crate::repositories::users::create_user(
@@ -2600,9 +2607,9 @@ mod tests {
             password,
             Some("192.168.1.1"),
             Some("TestAgent/1.0"),
-            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
-            DEFAULT_BCRYPT_COST,
+            RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+            RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
+            RECOMMENDED_MIN_BCRYPT_COST,
         )
         .await?;
 
@@ -2618,7 +2625,7 @@ mod tests {
         let claims = crypto::verify_user_jwt(
             &result.access_token,
             &signing_key.public_key,
-            DEFAULT_JWT_CLOCK_SKEW,
+            RECOMMENDED_JWT_CLOCK_SKEW,
         )?;
 
         assert_eq!(claims.org_id, org_id.to_string());
@@ -2651,9 +2658,9 @@ mod tests {
             "wrong-password",
             None,
             None,
-            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
-            DEFAULT_BCRYPT_COST,
+            RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+            RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
+            RECOMMENDED_MIN_BCRYPT_COST,
         )
         .await;
 
@@ -2667,9 +2674,9 @@ mod tests {
             "some-password",
             None,
             None,
-            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
-            DEFAULT_BCRYPT_COST,
+            RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+            RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
+            RECOMMENDED_MIN_BCRYPT_COST,
         )
         .await;
 
@@ -2719,9 +2726,9 @@ mod tests {
             password,
             None,
             None,
-            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
-            DEFAULT_BCRYPT_COST,
+            RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+            RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
+            RECOMMENDED_MIN_BCRYPT_COST,
         )
         .await;
 
@@ -2745,8 +2752,8 @@ mod tests {
         let email = "lockout@example.com";
         let _user_id = create_test_user(&pool, org_id, email, password).await;
 
-        // Attempt DEFAULT_RATE_LIMIT_MAX_ATTEMPTS failed logins
-        for _ in 0..DEFAULT_RATE_LIMIT_MAX_ATTEMPTS {
+        // Attempt RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS failed logins
+        for _ in 0..RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS {
             let _ = issue_user_token(
                 &pool,
                 &master_key,
@@ -2756,9 +2763,9 @@ mod tests {
                 "wrong-password",
                 Some("192.168.1.1"),
                 None,
-                DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-                DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
-                DEFAULT_BCRYPT_COST,
+                RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+                RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
+                RECOMMENDED_MIN_BCRYPT_COST,
             )
             .await;
         }
@@ -2773,9 +2780,9 @@ mod tests {
             "wrong-password",
             Some("192.168.1.1"),
             None,
-            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
-            DEFAULT_BCRYPT_COST,
+            RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+            RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
+            RECOMMENDED_MIN_BCRYPT_COST,
         )
         .await;
 
@@ -2794,9 +2801,9 @@ mod tests {
             password,
             Some("192.168.1.1"),
             None,
-            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
-            DEFAULT_BCRYPT_COST,
+            RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+            RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
+            RECOMMENDED_MIN_BCRYPT_COST,
         )
         .await;
 
@@ -2839,9 +2846,9 @@ mod tests {
             password,
             None,
             None,
-            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
-            DEFAULT_BCRYPT_COST,
+            RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+            RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
+            RECOMMENDED_MIN_BCRYPT_COST,
         )
         .await?;
 
@@ -2882,9 +2889,9 @@ mod tests {
             password,
             None,
             None,
-            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
-            DEFAULT_BCRYPT_COST,
+            RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+            RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
+            RECOMMENDED_MIN_BCRYPT_COST,
         )
         .await?;
 
@@ -2895,7 +2902,7 @@ mod tests {
         let claims = crypto::verify_user_jwt(
             &result.access_token,
             &signing_key.public_key,
-            DEFAULT_JWT_CLOCK_SKEW,
+            RECOMMENDED_JWT_CLOCK_SKEW,
         )?;
 
         assert!(claims.roles.contains(&"user".to_string()));
@@ -2918,7 +2925,7 @@ mod tests {
         let org_id = create_test_org(&pool, "timing-test").await;
         create_test_user(&pool, org_id, "exists@example.com", "secure-password-123").await;
         // Fill the dummy-hash cache now, as main.rs does at startup.
-        crypto::dummy_hash(DEFAULT_BCRYPT_COST)?;
+        crypto::dummy_hash(RECOMMENDED_MIN_BCRYPT_COST)?;
 
         for email in ["exists@example.com", "nonexistent@example.com"] {
             let snap = MetricAssertion::snapshot();
@@ -2931,9 +2938,9 @@ mod tests {
                 "wrong-password",
                 None,
                 None,
-                DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-                DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
-                DEFAULT_BCRYPT_COST,
+                RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+                RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
+                RECOMMENDED_MIN_BCRYPT_COST,
             )
             .await;
 

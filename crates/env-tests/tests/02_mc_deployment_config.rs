@@ -164,6 +164,29 @@ const WIRED_KEYS: &[(&str, &str, ValueShape)] = &[
         MC_CONFIGMAP,
         ValueShape::PositiveInteger,
     ),
+    // Meeting lifetime + session timers (meeting-end safety P2): REQUIRED
+    // since 2026-11-15, no Rust default, hard refs. The grace's floor is 0
+    // (immediate removal), so NonNegative; bounds stay with MC's reader.
+    (
+        "MC_MEETING_JOIN_WINDOW_SECONDS",
+        MC_CONFIGMAP,
+        ValueShape::PositiveInteger,
+    ),
+    (
+        "MC_DISCONNECT_GRACE_PERIOD_SECONDS",
+        MC_CONFIGMAP,
+        ValueShape::NonNegativeInteger,
+    ),
+    (
+        "MC_CLOCK_SKEW_SECONDS",
+        MC_CONFIGMAP,
+        ValueShape::NonNegativeInteger,
+    ),
+    (
+        "MC_QUIC_MAX_IDLE_TIMEOUT_SECONDS",
+        MC_CONFIGMAP,
+        ValueShape::PositiveInteger,
+    ),
     // Shared media codec profile: all eight keys MC directs from.
     ("MEDIA_VIDEO_CODEC", PROFILE_CONFIGMAP, ValueShape::Token),
     (

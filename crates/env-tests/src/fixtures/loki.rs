@@ -188,6 +188,16 @@ pub const MC_CLEAN_CLOSE: LogLine = LogLine {
     message: "Clean transport close — removing participant immediately (grace skipped)",
 };
 
+/// `crates/mc-service/src/actors/meeting.rs` (`handle_leave`): the
+/// participant's deliberate `LeaveRequest` removed `participant_id` at once
+/// (no grace). THE departure line for a browser `disconnect()`; the browser
+/// end proof (`packages/web-app/e2e/mcLoki.ts`) twins it.
+pub const MC_LEAVE_REQUEST: LogLine = LogLine {
+    app: "mc-service",
+    target: "mc.actor.meeting",
+    message: "Participant left (LeaveRequest) — removing immediately",
+};
+
 /// `crates/mc-service/src/actors/meeting.rs` (`check_disconnect_timeouts`):
 /// `participant_id` was removed only when its disconnect grace expired.
 pub const MC_GRACE_EXPIRED: LogLine = LogLine {
@@ -227,6 +237,7 @@ pub const EMITTERS: &[(LogLine, &str)] = &[
         "crates/mc-service/src/media_routing/teardown.rs",
     ),
     (MC_CLEAN_CLOSE, "crates/mc-service/src/actors/meeting.rs"),
+    (MC_LEAVE_REQUEST, "crates/mc-service/src/actors/meeting.rs"),
     (MC_GRACE_EXPIRED, "crates/mc-service/src/actors/meeting.rs"),
     (MC_WINDOW_FIRED, "crates/mc-service/src/actors/meeting.rs"),
     (GC_ENDED, "crates/gc-service/src/services/mc_assignment.rs"),

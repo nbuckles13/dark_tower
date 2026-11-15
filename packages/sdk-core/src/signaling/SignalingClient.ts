@@ -42,6 +42,7 @@ import { TypedEventEmitter } from '../events/TypedEventEmitter.js';
 import { getTracer } from '../telemetry/telemetryConfig.js';
 import { capMhUrl } from '../validation/limits.js';
 import { connect as defaultConnect } from '../transport/BrowserWebTransport.js';
+import { LEAVE_ACK_TIMEOUT_MS } from '../config/clientConfig.js';
 import type {
   IWebTransport,
   WebTransportBidirectionalStream,
@@ -54,6 +55,7 @@ import {
   ConnectionState,
   ErrorCode,
   JoinRequestSchema,
+  LeaveRequestSchema,
   MediaConnectionUpdateSchema,
   MhConnectionStatusSchema,
   ParticipantCapabilitiesSchema,
@@ -152,6 +154,46 @@ export interface SignalingLogger {
 }
 
 /** Construction options for {@link SignalingClient}. */
+/**
+ * How a `close()` ended (bounded; never carries data): `acknowledged` — MC
+ * closed the session after the LeaveRequest (its acknowledgement); `timed_out`
+ * — MC did not close within the leave bound; `write_failed` — the LeaveRequest
+ * could not be written; `not_sent` — no settled join (or an error-path
+ * teardown), so no leave was sent. Only `acknowledged` proves MC removed the
+ * participant at once; the others leave it to MC's disconnect grace.
+ */
+export type LeaveOutcome = 'acknowledged' | 'timed_out' | 'write_failed' | 'not_sent';
+
+/**
+ * Race MC's close (the ack) against the bound and a failed leave write.
+ *
+ * DELIBERATE OVER-CLAIM: `transport.closed` settling EITHER way inside the
+ * window counts as `acknowledged` (MC closes the session only after it handled
+ * the leave, and a browser's settlement of `closed` on a server-initiated QUIC
+ * close is not reliable enough to bet a false `timed_out` on). Residual: a
+ * network drop inside the <= `LEAVE_ACK_TIMEOUT_MS` window also reports
+ * `acknowledged`. The authoritative check is MC-side, per meeting — MC's
+ * "Participant left (LeaveRequest)" line, proved by `mcLoki.ts`.
+ */
+function awaitLeaveAck(
+  transport: IWebTransport | undefined,
+  written: Promise<void>,
+  timeoutMs: number,
+): Promise<LeaveOutcome> {
+  const never = new Promise<LeaveOutcome>(() => undefined);
+  const writeFailed = written.then(
+    () => never,
+    (): LeaveOutcome => 'write_failed',
+  );
+  const settled = (): LeaveOutcome => 'acknowledged';
+  const mcClosed = transport === undefined ? never : transport.closed.then(settled, settled);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const bound = new Promise<LeaveOutcome>((resolve) => {
+    timer = setTimeout(() => resolve('timed_out'), timeoutMs);
+  });
+  return Promise.race([mcClosed, bound, writeFailed]).finally(() => clearTimeout(timer));
+}
+
 export interface SignalingClientOptions {
   /**
    * Transport factory. Defaults to the production `connect`. Tests inject a
@@ -167,6 +209,28 @@ export interface SignalingClientOptions {
    * `<= 0` value disables the timeout (opt-out).
    */
   readonly joinTimeoutMs?: number;
+  /**
+   * How long {@link SignalingClient.close} waits for MC's close after sending
+   * the `LeaveRequest`, in ms (default {@link LEAVE_ACK_TIMEOUT_MS}). Tests
+   * inject a short bound.
+   *
+   * THE LEAVE RULES (one home).
+   * After a settled join `close()` is a DELIBERATE LEAVE: a `LeaveRequest` is
+   * queued on the signalling stream (MC removes the participant at once, no
+   * reconnect grace — `signaling.proto`, `LeaveRequest`) and the LEAVE WINDOW
+   * opens synchronously. In the window every inbound server message is dropped at
+   * the ONE `#dispatch` gate, ahead of every sink (KEK intake, roster keys, the
+   * handler set and its dial tokens, identity, events); nothing more is sent; no
+   * `'error'` is emitted — the caller has already cleared its key material
+   * (R-23, ADR-0028 §5) and nothing may re-install it. The transport closes when
+   * MC closes the session (its acknowledgement) or after `LEAVE_ACK_TIMEOUT_MS`,
+   * whichever comes first, so it closes within that bound AFTER `close()`
+   * returns; a failed write closes at once (MC then applies its grace — correct
+   * for a leave that never arrived). Before the join settles it is a plain close.
+   * The window holds no credential (the deferred work captures only the
+   * transport); a second call in the window does nothing.
+   */
+  readonly leaveAckTimeoutMs?: number;
   /**
    * Where a decoded meeting KEK is deposited (ADR-0036 §4's KEK-source seam).
    *
@@ -364,6 +428,14 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
   #started = false;
   #joinSettled = false;
   #terminated = false;
+  /** The leave window (rules: {@link SignalingClientOptions.leaveAckTimeoutMs}). */
+  #leaving = false;
+  readonly #leaveAckTimeoutMs: number;
+  #resolveTerminated!: (outcome: LeaveOutcome) => void;
+  readonly #terminated$ = new Promise<LeaveOutcome>((resolve) => {
+    this.#resolveTerminated = resolve;
+  });
+  #leaveOutcome: LeaveOutcome | undefined;
 
   #correlationId: string | undefined;
   #bindingToken: string | undefined;
@@ -400,6 +472,7 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
     this.#connectFn = options.connect ?? defaultConnect;
     this.#logger = options.logger ?? defaultLogger;
     this.#joinTimeoutMs = options.joinTimeoutMs ?? DEFAULT_JOIN_TIMEOUT_MS;
+    this.#leaveAckTimeoutMs = options.leaveAckTimeoutMs ?? LEAVE_ACK_TIMEOUT_MS;
     this.#kekSink = options.kekSink;
     this.#handlerSetSink = options.handlerSetSink;
     this.#onNonMemberRef = options.onNonMemberRef;
@@ -496,9 +569,34 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
     return this.#join.promise;
   }
 
-  /** Tear down the connection and read loop. Idempotent. */
+  /**
+   * Resolves once this client has torn down (the single terminal path ran) —
+   * after a deliberate leave, once the transport is closed. Never rejects.
+   */
+  get terminated(): Promise<LeaveOutcome> {
+    return this.#terminated$;
+  }
+
+  /** Leave and tear down. Synchronous, idempotent; rules: {@link SignalingClientOptions.leaveAckTimeoutMs}. */
   close(): void {
-    this.#terminate();
+    // Binding material goes NOW, on every path, never after a deferred close.
+    this.#bindingToken = undefined;
+    this.#correlationId = undefined;
+    if (this.#terminated || this.#leaving) return;
+    const stream = this.#stream;
+    if (stream === undefined || !this.#joinSettled) {
+      this.#terminate();
+      return;
+    }
+    this.#leaving = true;
+    const leave = create(ClientMessageSchema, {
+      message: { case: 'leaveRequest', value: create(LeaveRequestSchema, {}) },
+    });
+    const written = this.#sendClientMessage(stream, leave);
+    void awaitLeaveAck(this.#transport, written, this.#leaveAckTimeoutMs).then((outcome) => {
+      this.#leaveOutcome = outcome;
+      this.#terminate();
+    });
   }
 
   // ----------------------------------------------------------------------------
@@ -639,7 +737,7 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
    */
   async sendMediaConnectionUpdate(reports: readonly MhConnectionStatusReport[]): Promise<void> {
     const stream = this.#stream;
-    if (stream === undefined || this.#terminated || !this.#joinSettled) {
+    if (stream === undefined || this.#terminated || this.#leaving || !this.#joinSettled) {
       throw new SignalingError(
         SignalingErrorCode.Transport,
         'sendMediaConnectionUpdate requires a settled, open join',
@@ -703,6 +801,8 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
   }
 
   #dispatch(serverMessage: ServerMessage): void {
+    // THE leave-window gate, ahead of every sink (see `#leaving`).
+    if (this.#leaving) return;
     const message = serverMessage.message;
     switch (message.case) {
       case 'joinResponse': {
@@ -1112,7 +1212,7 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
 
   #requireOpenStream(what: string): WebTransportBidirectionalStream {
     const stream = this.#stream;
-    if (stream === undefined || this.#terminated || !this.#joinSettled) {
+    if (stream === undefined || this.#terminated || this.#leaving || !this.#joinSettled) {
       throw new SignalingError(
         SignalingErrorCode.Transport,
         `${what} requires a settled, open join`,
@@ -1183,6 +1283,14 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
   #terminate(error?: SignalingError): void {
     if (this.#terminated) return;
     this.#terminated = true;
+    // Inside the leave window MC's close, a failed write or a stream end is
+    // the expected ending, never an error to surface.
+    if (this.#leaving) error = undefined;
+    this.#bindingToken = undefined;
+    this.#correlationId = undefined;
+    // MC's close or stream end reached the read loop first: acknowledged (the
+    // same deliberate over-claim as `awaitLeaveAck`).
+    this.#resolveTerminated(this.#leaveOutcome ?? (this.#leaving ? 'acknowledged' : 'not_sent'));
     if (error !== undefined) {
       if (this.#started && !this.#joinSettled) {
         this.#settleJoinFailure(error);

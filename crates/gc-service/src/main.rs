@@ -23,10 +23,7 @@ use gc_service::grpc::auth_layer::GrpcAuthLayer;
 use gc_service::grpc::{McService, MhService};
 use gc_service::repositories::MeetingControllersRepository;
 use gc_service::routes::AppState;
-use gc_service::tasks::{
-    start_assignment_cleanup, start_health_checker, start_mh_health_checker,
-    AssignmentCleanupConfig,
-};
+use gc_service::tasks::{start_assignment_cleanup, start_health_checker, start_mh_health_checker};
 use gc_service::{grpc, handlers, observability, repositories, routes, services};
 use proto_gen::dark_tower::internal::v1::global_controller_service_server::GlobalControllerServiceServer;
 use proto_gen::dark_tower::internal::v1::media_handler_registry_service_server::MediaHandlerRegistryServiceServer;
@@ -48,11 +45,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // exit (Debug to stderr) — nothing is lost because no spans/logs have been
     // emitted yet, and ConfigError carries no secret material. Mirrors AC's
     // task #25 main.rs ordering.
+    // Every required key, including the assignment-cleanup and MC liveness
+    // settings, is validated here: a missing or invalid value fails startup
+    // before any connection is opened.
     let config = Config::from_env()?;
-    // Loaded here with `Config` so an invalid GC_CLEANUP_INTERVAL_SECONDS /
-    // GC_INACTIVITY_HOURS / GC_RETENTION_DAYS fails startup before any
-    // connection is opened, rather than being defaulted.
-    let cleanup_config = AssignmentCleanupConfig::from_env()?;
+    let cleanup_config = config.assignment_cleanup;
+    let drain = config.drain;
 
     // R-55: initialize the OpenTelemetry SDK only when explicitly enabled
     // (OTEL_ENABLED=true). `init_otel` is async, eagerly probes the collector,
@@ -117,7 +115,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bind_address = %config.bind_address,
         grpc_bind_address = %config.grpc_bind_address,
         jwt_clock_skew_seconds = config.jwt_clock_skew_seconds,
-        mc_staleness_threshold_seconds = config.mc_staleness_threshold_seconds,
+        mc_staleness = ?config.mc_assignment.mc_staleness(),
+        assign_commit_budget = ?config.mc_assignment.commit_budget(),
+        drain = ?config.drain,
+        otel_sample_rate = config.otel_sample_rate,
+        environment = %config.environment,
         mh_load_report_interval = ?config.mh_registry.load_report_interval(),
         mh_staleness_multiplier = config.mh_registry.staleness_multiplier(),
         mh_staleness_bound = ?config.mh_registry.staleness_bound(),
@@ -147,7 +149,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse bind addresses before moving config
     let http_bind_address = config.bind_address.clone();
     let grpc_bind_address = config.grpc_bind_address.clone();
-    let mc_staleness_threshold = config.mc_staleness_threshold_seconds;
+    let mc_staleness = config.mc_assignment.mc_staleness();
 
     // Spawn TokenManager for OAuth 2.0 client credentials flow
     // Use from_url() to automatically handle HTTP (local dev) or HTTPS (production)
@@ -237,7 +239,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let health_checker_handle = tokio::spawn(async move {
         start_health_checker(
             health_checker_pool,
-            mc_staleness_threshold,
+            mc_staleness.as_secs(),
             health_checker_token,
         )
         .await;
@@ -253,7 +255,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Assignment cleanup configuration loaded"
     );
     let cleanup_handle = tokio::spawn(async move {
-        start_assignment_cleanup(cleanup_pool, cleanup_config, cleanup_token).await;
+        start_assignment_cleanup(cleanup_pool, cleanup_config, mc_staleness, cleanup_token).await;
     });
 
     // Start MH health checker background task
@@ -337,7 +339,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Run both servers concurrently with graceful shutdown
     let cancel_for_shutdown = cancel_token.clone();
     tokio::select! {
-        result = http_server.with_graceful_shutdown(shutdown_signal(cancel_for_shutdown.clone())) => {
+        result = http_server.with_graceful_shutdown(shutdown_signal(cancel_for_shutdown.clone(), drain)) => {
             if let Err(e) = result {
                 error!("HTTP server error: {}", e);
             }
@@ -419,7 +421,7 @@ async fn init_registered_controllers_metric(pool: &sqlx::PgPool) {
 /// Listens for shutdown signals (SIGTERM, SIGINT).
 /// Returns when a shutdown signal is received and drain period is complete.
 /// Also triggers the cancellation token for coordinated shutdown.
-async fn shutdown_signal(cancel_token: CancellationToken) {
+async fn shutdown_signal(cancel_token: CancellationToken, drain: Duration) {
     let ctrl_c = async {
         match signal::ctrl_c().await {
             Ok(()) => info!("Received SIGINT, starting graceful shutdown..."),
@@ -452,15 +454,13 @@ async fn shutdown_signal(cancel_token: CancellationToken) {
     // Trigger cancellation for all tasks
     cancel_token.cancel();
 
-    // Graceful shutdown drain period
-    let drain_secs: u64 = std::env::var("GC_DRAIN_SECONDS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(30);
+    // Graceful shutdown drain period (REQUIRED `GC_DRAIN_SECONDS`, validated
+    // at startup).
+    let drain_secs = drain.as_secs();
 
     if drain_secs > 0 {
         warn!("Draining connections for {} seconds...", drain_secs);
-        tokio::time::sleep(Duration::from_secs(drain_secs)).await;
+        tokio::time::sleep(drain).await;
         info!("Drain period complete");
     } else {
         info!("Skipping drain period (GC_DRAIN_SECONDS=0)");

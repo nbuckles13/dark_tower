@@ -94,9 +94,10 @@
 )]
 
 use proto_gen::dark_tower::internal::v1::{
-    AcquireMediaHandlerRequest, AcquireMediaHandlerResponse, ApplyRefusal, CandidateSource,
-    DisconnectReason, EgressStream, EndMeetingRequest, EndMeetingResponse, HeartbeatVerdict,
-    MeetingHeartbeatRequest, MeetingHeartbeatResponse, MhAssignment,
+    AcquireMediaHandlerRequest, AcquireMediaHandlerResponse, ApplyRefusal,
+    AssignMeetingWithMhRequest, CandidateSource, DisconnectReason, EgressStream, EndMeetingRequest,
+    EndMeetingResponse, HeartbeatVerdict, MeetingHeartbeatRequest, MeetingHeartbeatResponse,
+    MhAssignment, NotifyMeetingEndedOutcome, NotifyMeetingEndedRequest, NotifyMeetingEndedResponse,
     NotifyParticipantConnectedRequest, NotifyParticipantConnectedResponse,
     NotifyParticipantDisconnectedRequest, RegisterMcResponse, RegisterMeetingRequest,
     RegisterMeetingResponse, ReleaseCause, SelectionRules, ServingState, SourceDisposition,
@@ -1276,4 +1277,66 @@ fn gc3_frozen_tags_are_on_the_wire() {
         }),
     };
     assert_eq!(top_level_field_numbers(&response.encode_to_vec()), vec![1]);
+}
+
+// ---------------------------------------------------------------------------
+// Meeting-end incarnation fence (2026-11-15)
+// ---------------------------------------------------------------------------
+
+const ASSIGNMENT_ID: &str = "6f1c2a0e-3b4d-4e5f-8a9b-0c1d2e3f4a5b";
+
+#[test]
+fn assign_request_carries_the_assignment_id_on_tag_4() {
+    let req = AssignMeetingWithMhRequest {
+        meeting_id: "m-1".to_string(),
+        mh_assignments: Vec::new(),
+        requesting_gc_id: "gc-1".to_string(),
+        assignment_id: ASSIGNMENT_ID.to_string(),
+    };
+    assert!(top_level_field_numbers(&req.encode_to_vec()).contains(&4));
+    assert_eq!(roundtrip(&req).assignment_id, ASSIGNMENT_ID);
+}
+
+#[test]
+fn notify_request_carries_controller_and_assignment_id() {
+    let req = NotifyMeetingEndedRequest {
+        meeting_id: "m-1".to_string(),
+        region: "us-east-1".to_string(),
+        controller_id: "mc-a".to_string(),
+        assignment_id: ASSIGNMENT_ID.to_string(),
+    };
+    assert_eq!(
+        top_level_field_numbers(&req.encode_to_vec()),
+        vec![1, 2, 3, 4]
+    );
+    let back = roundtrip(&req);
+    assert_eq!(back.controller_id, "mc-a");
+    assert_eq!(back.assignment_id, ASSIGNMENT_ID);
+}
+
+/// `outcome` lives on tag 2; tag 1 (`acknowledged`) is reserved, and an empty
+/// reply decodes as the fail-closed UNSPECIFIED, never as a success.
+#[test]
+fn notify_response_outcome_is_tag_2_and_defaults_to_unspecified() {
+    for outcome in [
+        NotifyMeetingEndedOutcome::Ended,
+        NotifyMeetingEndedOutcome::NotCurrent,
+    ] {
+        let resp = NotifyMeetingEndedResponse {
+            outcome: outcome.into(),
+        };
+        assert_eq!(top_level_field_numbers(&resp.encode_to_vec()), vec![2]);
+        assert_eq!(roundtrip(&resp).outcome(), outcome);
+    }
+    let empty = NotifyMeetingEndedResponse::decode(&[][..]).expect("decode");
+    assert_eq!(empty.outcome(), NotifyMeetingEndedOutcome::Unspecified);
+    // CONVENTIONS §5, the case the reservation exists for: an OLD-shape reply
+    // `acknowledged: true` (tag 1 varint 1) decodes as UNSPECIFIED (a defect
+    // MC refuses), never as a success.
+    let old_shape = NotifyMeetingEndedResponse::decode(&[0x08, 0x01][..]).expect("decode");
+    assert_eq!(old_shape.outcome(), NotifyMeetingEndedOutcome::Unspecified);
+    assert_ne!(
+        NotifyMeetingEndedOutcome::Ended as i32,
+        NotifyMeetingEndedOutcome::NotCurrent as i32
+    );
 }

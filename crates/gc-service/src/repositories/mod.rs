@@ -15,7 +15,10 @@ pub use media_handlers::{
     MediaHandler, MediaHandlersRepository, MhAvailabilityRow, MhCandidate, MhRegistrationDecision,
     NewMhRegistration, LOAD_BALANCING_CANDIDATE_COUNT, MH_REGISTRY_LOCK_KEY,
 };
-pub use meeting_assignments::{McAssignment, MeetingAssignmentsRepository};
+pub use meeting_assignments::{
+    AssignmentId, AtomicAssignOutcome, EndAssignmentOutcome, McAssignment,
+    MeetingAssignmentsRepository,
+};
 // McCandidate and MeetingAssignment are used in tests
 #[allow(unused_imports)]
 pub use meeting_assignments::{McCandidate, MeetingAssignment};

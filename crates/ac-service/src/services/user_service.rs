@@ -307,9 +307,9 @@ async fn log_registration_failure(
 mod tests {
     use super::*;
     use crate::config::{
-        DEFAULT_BCRYPT_COST, DEFAULT_RATE_LIMIT_MAX_ATTEMPTS, DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-        DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
-        DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
+        RECOMMENDED_MIN_BCRYPT_COST, RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
+        RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES, RECOMMENDED_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
+        RECOMMENDED_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
     };
     use crate::crypto;
     use crate::services::key_management_service;
@@ -404,11 +404,11 @@ mod tests {
             request,
             "192.168.1.1",
             Some("TestAgent/1.0"),
-            DEFAULT_BCRYPT_COST,
-            DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
-            DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
-            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+            RECOMMENDED_MIN_BCRYPT_COST,
+            RECOMMENDED_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
+            RECOMMENDED_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
+            RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+            RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
         )
         .await?;
 
@@ -446,7 +446,7 @@ mod tests {
         let org_id = create_test_org(&pool, "reg-rate").await;
         let ip = "192.168.1.100";
 
-        let max = usize::try_from(DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS)
+        let max = usize::try_from(RECOMMENDED_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS)
             .expect("configured maximum fits usize");
         let mut success_count = 0;
         let mut hit_rate_limit = false;
@@ -466,11 +466,11 @@ mod tests {
                 request,
                 ip,
                 None,
-                DEFAULT_BCRYPT_COST,
-                DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
-                DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
-                DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-                DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+                RECOMMENDED_MIN_BCRYPT_COST,
+                RECOMMENDED_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
+                RECOMMENDED_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
+                RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+                RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
             )
             .await;
 
@@ -528,11 +528,11 @@ mod tests {
                 request,
                 &ip,
                 None,
-                DEFAULT_BCRYPT_COST,
-                DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
-                DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
-                DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-                DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+                RECOMMENDED_MIN_BCRYPT_COST,
+                RECOMMENDED_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
+                RECOMMENDED_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
+                RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+                RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
             )
             .await;
 
@@ -571,11 +571,11 @@ mod tests {
                 request,
                 "192.0.2.1",
                 None,
-                DEFAULT_BCRYPT_COST,
-                DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
-                DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
-                DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-                DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+                RECOMMENDED_MIN_BCRYPT_COST,
+                RECOMMENDED_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
+                RECOMMENDED_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
+                RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+                RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
             )
             .await;
 
@@ -612,11 +612,11 @@ mod tests {
             request1,
             "192.0.2.1",
             None,
-            DEFAULT_BCRYPT_COST,
-            DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
-            DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
-            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+            RECOMMENDED_MIN_BCRYPT_COST,
+            RECOMMENDED_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
+            RECOMMENDED_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
+            RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+            RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
         )
         .await;
         assert!(result1.is_ok(), "First registration should succeed");
@@ -636,11 +636,11 @@ mod tests {
             request2,
             "192.0.2.1",
             None,
-            DEFAULT_BCRYPT_COST,
-            DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
-            DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
-            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+            RECOMMENDED_MIN_BCRYPT_COST,
+            RECOMMENDED_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
+            RECOMMENDED_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
+            RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+            RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
         )
         .await;
 
@@ -682,11 +682,11 @@ mod tests {
                 request,
                 "192.0.2.1",
                 None,
-                DEFAULT_BCRYPT_COST,
-                DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
-                DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
-                DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-                DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+                RECOMMENDED_MIN_BCRYPT_COST,
+                RECOMMENDED_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
+                RECOMMENDED_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
+                RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+                RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
             )
             .await;
 
@@ -725,11 +725,11 @@ mod tests {
             request,
             "192.0.2.1",
             None,
-            DEFAULT_BCRYPT_COST,
-            DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
-            DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
-            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+            RECOMMENDED_MIN_BCRYPT_COST,
+            RECOMMENDED_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
+            RECOMMENDED_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
+            RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+            RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
         )
         .await?;
 
@@ -764,11 +764,11 @@ mod tests {
             request1,
             "192.0.2.1",
             None,
-            DEFAULT_BCRYPT_COST,
-            DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
-            DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
-            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+            RECOMMENDED_MIN_BCRYPT_COST,
+            RECOMMENDED_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
+            RECOMMENDED_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
+            RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+            RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
         )
         .await?;
         assert_eq!(result1.email, email);
@@ -788,11 +788,11 @@ mod tests {
             request2,
             "192.0.2.1",
             None,
-            DEFAULT_BCRYPT_COST,
-            DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
-            DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
-            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+            RECOMMENDED_MIN_BCRYPT_COST,
+            RECOMMENDED_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
+            RECOMMENDED_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
+            RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+            RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
         )
         .await?;
         assert_eq!(result2.email, email);
