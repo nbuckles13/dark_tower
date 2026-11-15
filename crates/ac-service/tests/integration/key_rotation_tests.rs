@@ -3,7 +3,7 @@
 //! These tests validate the key rotation endpoint with proper authentication,
 //! authorization, and rate limiting enforcement.
 
-use ac_service::config::{DEFAULT_BCRYPT_COST, DEFAULT_JWT_CLOCK_SKEW};
+use ac_service::config::{RECOMMENDED_JWT_CLOCK_SKEW, RECOMMENDED_MIN_BCRYPT_COST};
 use ac_service::crypto;
 use ac_service::repositories::{service_credentials, signing_keys};
 use ac_service::services::token_service;
@@ -26,7 +26,8 @@ async fn create_service_with_token(
 ) -> Result<String, anyhow::Error> {
     // Create service credentials
     let client_secret = "test-secret-12345";
-    let client_secret_hash = crypto::hash_client_secret(client_secret, DEFAULT_BCRYPT_COST)?;
+    let client_secret_hash =
+        crypto::hash_client_secret(client_secret, RECOMMENDED_MIN_BCRYPT_COST)?;
     service_credentials::create_service_credential(
         pool,
         client_id,
@@ -48,9 +49,9 @@ async fn create_service_with_token(
         None,
         None,
         None,
-        ac_service::config::DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-        ac_service::config::DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
-        ac_service::config::DEFAULT_BCRYPT_COST,
+        ac_service::config::RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+        ac_service::config::RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
+        ac_service::config::RECOMMENDED_MIN_BCRYPT_COST,
     )
     .await?;
 
@@ -710,7 +711,7 @@ async fn test_old_key_tokens_valid_after_rotation(pool: PgPool) -> Result<(), an
     );
 
     // Verify the token can be parsed and verified with the old key
-    let claims = crypto::verify_jwt(&old_token, &old_key.public_key, DEFAULT_JWT_CLOCK_SKEW)?;
+    let claims = crypto::verify_jwt(&old_token, &old_key.public_key, RECOMMENDED_JWT_CLOCK_SKEW)?;
     assert_eq!(
         claims.sub, "overlap-test-client",
         "Token claims should be intact"

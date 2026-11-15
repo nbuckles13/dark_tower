@@ -167,10 +167,10 @@ async fn audit_log_failure_emits_event_type_user_registered(pool: PgPool) {
         "198.51.100.3",
         None,
         ac_service::config::MIN_BCRYPT_COST,
-        ac_service::config::DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
-        ac_service::config::DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
-        ac_service::config::DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-        ac_service::config::DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+        ac_service::config::RECOMMENDED_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
+        ac_service::config::RECOMMENDED_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
+        ac_service::config::RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+        ac_service::config::RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
     )
     .await;
     // Fail-soft: the registration itself succeeds and the user is persisted.
@@ -245,9 +245,9 @@ async fn audit_log_failure_emits_event_type_service_token_failed(pool: PgPool) {
         None,
         None,
         None,
-        ac_service::config::DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-        ac_service::config::DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
-        ac_service::config::DEFAULT_BCRYPT_COST,
+        ac_service::config::RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+        ac_service::config::RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
+        ac_service::config::RECOMMENDED_MIN_BCRYPT_COST,
     )
     .await;
 
@@ -283,9 +283,9 @@ async fn audit_log_failure_emits_event_type_service_token_issued(pool: PgPool) {
         None,
         None,
         None,
-        ac_service::config::DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-        ac_service::config::DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
-        ac_service::config::DEFAULT_BCRYPT_COST,
+        ac_service::config::RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+        ac_service::config::RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
+        ac_service::config::RECOMMENDED_MIN_BCRYPT_COST,
     )
     .await;
 
@@ -442,10 +442,10 @@ async fn audit_log_failure_emits_event_type_user_login(pool: PgPool) {
         "198.51.100.1",
         None,
         ac_service::config::MIN_BCRYPT_COST,
-        ac_service::config::DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
-        ac_service::config::DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
-        ac_service::config::DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-        ac_service::config::DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+        ac_service::config::RECOMMENDED_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
+        ac_service::config::RECOMMENDED_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
+        ac_service::config::RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+        ac_service::config::RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
     )
     .await
     .unwrap();
@@ -461,9 +461,9 @@ async fn audit_log_failure_emits_event_type_user_login(pool: PgPool) {
         "test-password-12345", // <- valid creds → success branch → user_login
         Some("198.51.100.1"),
         None,
-        ac_service::config::DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-        ac_service::config::DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
-        ac_service::config::DEFAULT_BCRYPT_COST,
+        ac_service::config::RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+        ac_service::config::RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
+        ac_service::config::RECOMMENDED_MIN_BCRYPT_COST,
     )
     .await;
     assert_only_event_type(&snap, "user_login");
@@ -503,10 +503,10 @@ async fn audit_log_failure_emits_event_type_user_login_failed(pool: PgPool) {
         "198.51.100.2",
         None,
         ac_service::config::MIN_BCRYPT_COST,
-        ac_service::config::DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
-        ac_service::config::DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
-        ac_service::config::DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-        ac_service::config::DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+        ac_service::config::RECOMMENDED_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
+        ac_service::config::RECOMMENDED_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
+        ac_service::config::RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+        ac_service::config::RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
     )
     .await
     .unwrap();
@@ -522,9 +522,9 @@ async fn audit_log_failure_emits_event_type_user_login_failed(pool: PgPool) {
         "WRONG-password-99999", // <- bad creds → failure branch → user_login_failed
         Some("198.51.100.2"),
         None,
-        ac_service::config::DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-        ac_service::config::DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
-        ac_service::config::DEFAULT_BCRYPT_COST,
+        ac_service::config::RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+        ac_service::config::RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
+        ac_service::config::RECOMMENDED_MIN_BCRYPT_COST,
     )
     .await;
     assert_only_event_type(&snap, "user_login_failed");
@@ -599,10 +599,10 @@ async fn audit_log_failure_emits_event_type_user_registration_failed(pool: PgPoo
         "198.51.100.4",
         None,
         ac_service::config::MIN_BCRYPT_COST,
-        ac_service::config::DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
-        ac_service::config::DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
-        ac_service::config::DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-        ac_service::config::DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+        ac_service::config::RECOMMENDED_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
+        ac_service::config::RECOMMENDED_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
+        ac_service::config::RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+        ac_service::config::RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
     )
     .await;
     assert!(matches!(

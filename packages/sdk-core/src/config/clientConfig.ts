@@ -710,6 +710,22 @@ export const JOIN_RETRY = {
  */
 export const MC_END_MEETING_BACKOFF_MS = 1000;
 
+/**
+ * How long `disconnect()` waits, after sending the `LeaveRequest`, for MC to
+ * close the signalling session (MC's acknowledgement that the participant was
+ * removed — `signaling.proto`, `LeaveRequest`) before closing the transport
+ * itself, in ms.
+ *
+ * WHY 1000: it only delays the local transport close on a slow link — the
+ * session state, keys and media are torn down synchronously — while the cost
+ * of closing too early is a lost leave: MC then treats the departure as a
+ * lost connection and keeps a ghost participant on every roster for its
+ * reconnect grace (`MC_DISCONNECT_GRACE_PERIOD_SECONDS`, MC's config). One
+ * second sits well above an in-region round trip. Not a runtime knob (same
+ * posture as {@link JOIN_RETRY}).
+ */
+export const LEAVE_ACK_TIMEOUT_MS = 1_000;
+
 /** Media-path configuration. */
 export interface MediaConfig {
   readonly audio: AudioConfig;

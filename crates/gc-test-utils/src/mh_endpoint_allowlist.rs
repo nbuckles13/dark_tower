@@ -90,14 +90,18 @@ pub fn test_mh_endpoint_allowlist_vars() -> HashMap<String, String> {
     vars
 }
 
-/// Every REQUIRED `GC_MH_*` key a test `Config` needs: the shipped MH
-/// registry values plus the test allowlist. The one call for building a
-/// `Config::from_vars` map in tests.
-#[must_use]
-pub fn mh_config_vars() -> HashMap<String, String> {
-    let mut vars = crate::reference_config::reference_mh_registry_vars();
-    vars.extend(test_mh_endpoint_allowlist_vars());
-    vars
+/// Fill every REQUIRED GC config key a test has NOT set itself: the shipped
+/// config.env value for each key, except the four topology allowlist keys
+/// (empty in config.env, rendered per deploy), which take the test allowlist.
+/// The one call for building a `Config::from_vars` map in tests: a test sets
+/// what it is ABOUT, then calls this, so its own values are never
+/// overwritten and a new required key flows in from config.env.
+pub fn fill_required_config(vars: &mut HashMap<String, String>) {
+    let mut shipped = crate::reference_config::reference_config_vars();
+    shipped.extend(test_mh_endpoint_allowlist_vars());
+    for (key, value) in shipped {
+        vars.entry(key).or_insert(value);
+    }
 }
 
 /// The test allowlist, parsed by GC's own parser (no second parse path).

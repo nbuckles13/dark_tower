@@ -45,6 +45,16 @@ function events(): ReadonlyArray<Readonly<Record<string, unknown>>> {
   return window.__darktower_test__?.events ?? [];
 }
 
+test('projects the leave outcome as a bounded scalar', () => {
+  const session = new MockMeetingSession();
+  install(session);
+  session.fire('left', 'acknowledged');
+  expect(events().find((e) => e['type'] === 'left')).toEqual({
+    type: 'left',
+    outcome: 'acknowledged',
+  });
+});
+
 test('installs the bus and records bounded events in the replay buffer', () => {
   const session = new MockMeetingSession();
   install(session);

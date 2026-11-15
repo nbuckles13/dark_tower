@@ -131,6 +131,7 @@ export { CloseReason, normalizeCloseReason } from './telemetry/closeReason.js';
 export { SignalingClient } from './signaling/SignalingClient.js';
 export type {
   SignalingClientOptions,
+  LeaveOutcome,
   SignalingEventMap,
   SignalingLogger,
   WebTransportConnectFn,

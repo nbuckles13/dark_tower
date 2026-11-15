@@ -308,7 +308,7 @@ pub fn record_mc_assignment(status: &str, rejection_reason: Option<&str>, durati
 /// Metric: `gc_db_query_duration_seconds`, `gc_db_queries_total`
 /// Labels: `operation`, `status`
 ///
-/// Operations: select_mc, insert_assignment, update_heartbeat, get_healthy_assignment,
+/// Operations: select_mc, insert_assignment, update_heartbeat, get_live_assignment,
 ///             get_candidate_mcs, atomic_assign, end_assignment, etc.
 pub fn record_db_query(operation: &str, status: &str, duration: Duration) {
     histogram!("gc_db_query_duration_seconds",
@@ -532,6 +532,19 @@ const MH_LOAD_REPORT_OUTCOMES: &[&str] = &[MH_LOAD_REPORT_ACCEPTED, MH_LOAD_REPO
 /// (`gc_db_queries_total` covers DB errors).
 pub fn record_mh_load_report(outcome: &'static str) {
     counter!("gc_mh_load_reports_total", "outcome" => outcome).increment(1);
+}
+
+/// Record what GC did with one `NotifyMeetingEnded` (ADR-0010 §3).
+///
+/// Metric: `gc_meeting_end_notifications_total`
+/// Labels: `outcome` (`ended` | `already_ended` | `fenced`), decided in ONE
+/// statement by `MeetingAssignmentsRepository::end_assignment`. No meeting,
+/// controller or incarnation label. Validation failures (INVALID_ARGUMENT)
+/// and DB errors are NOT counted here (`gc_db_queries_total` covers DB
+/// errors). `fenced` is the detection signal for a notify from an orphan or a
+/// superseded incarnation, and for a breached accept->commit budget.
+pub fn record_meeting_end_notification(outcome: crate::repositories::EndAssignmentOutcome) {
+    counter!("gc_meeting_end_notifications_total", "outcome" => outcome.as_label()).increment(1);
 }
 
 /// `gc_mh_registrations_total{match}` on `superseded`: which endpoints of the
@@ -1229,7 +1242,8 @@ const STATUS_SUCCESS_ERROR: &[&str] = &["success", "error"];
 /// `gc_mc_assignments_total{status}` non-success arms. Emit: `mc_assignment.rs`.
 const ASSIGNMENT_FAIL_STATUSES: &[&str] = &["rejected", "error"];
 /// `gc_mc_assignments_total{rejection_reason}` — `McRejectionReason` label range
-/// + `no_mcs_available`. Emit: `services/mc_assignment.rs` (wildcard-free match).
+/// plus `no_mcs_available` and `commit_budget_exceeded`. Emit:
+/// `services/mc_assignment.rs` (wildcard-free match).
 const ASSIGNMENT_REJECTION_REASONS: &[&str] = &[
     "at_capacity",
     "draining",
@@ -1237,6 +1251,7 @@ const ASSIGNMENT_REJECTION_REASONS: &[&str] = &[
     "unspecified",
     "invalid_request",
     "no_mcs_available",
+    "commit_budget_exceeded",
 ];
 /// `gc_token_refresh_failures_total{error_type}` — `common::token_manager`
 /// `error_category()` wildcard-free range.
@@ -1371,7 +1386,7 @@ const GC_DB_QUERY_OPERATIONS: &[&str] = &[
     "count_available_mh",
     "get_candidate_mhs",
     "get_handler",
-    "get_healthy_assignment",
+    "get_live_assignment",
     "get_active_assignment_region",
     "get_candidate_mcs",
     "atomic_assign",
@@ -1398,6 +1413,10 @@ pub fn zero_initialize_counters() {
             counter!("gc_mc_assignments_total", "status" => *st, "rejection_reason" => *r)
                 .increment(0);
         }
+    }
+    // gc_meeting_end_notifications_total{outcome}
+    for o in crate::repositories::EndAssignmentOutcome::ALL {
+        counter!("gc_meeting_end_notifications_total", "outcome" => o.as_label()).increment(0);
     }
     // gc_db_queries_total{operation, status} — operation × {success, error}
     for op in GC_DB_QUERY_OPERATIONS {
@@ -1570,6 +1589,9 @@ mod tests {
         present_at_zero(r#"gc_cors_preflight_total{origin_class="allowed",status="200"}"#);
         // db_queries: the rare error series that were previously masked.
         present_at_zero(r#"gc_db_queries_total{operation="atomic_assign",status="error"}"#);
+        present_at_zero(r#"gc_meeting_end_notifications_total{outcome="ended"}"#);
+        present_at_zero(r#"gc_meeting_end_notifications_total{outcome="already_ended"}"#);
+        present_at_zero(r#"gc_meeting_end_notifications_total{outcome="fenced"}"#);
         present_at_zero(r#"gc_mh_load_reports_total{outcome="accepted"}"#);
         present_at_zero(r#"gc_mh_load_reports_total{outcome="unknown_handler"}"#);
         // gc_mh_registrations_total: exactly the 6 series, `match` only on

@@ -546,4 +546,17 @@ done
 assert_message_field "${INT}" AcquireMediaHandlerResponse assignment
 assert_message_field "${INT}" RegisterMCResponse maxExcludeHandlerIds
 
+# Meeting-end safety (2026-11-15) — the incarnation fence on the MC↔GC end
+# path and the explicit client leave. `acknowledged` is reserved (absence with a
+# same-message positive control: the `outcome` that replaced it).
+assert_message_field "${INT}" AssignMeetingWithMhRequest assignmentId
+for field in controllerId assignmentId; do
+  assert_message_field "${INT}" NotifyMeetingEndedRequest "${field}"
+done
+assert_message_field "${INT}" NotifyMeetingEndedResponse outcome
+assert_message_field_absent "${INT}" NotifyMeetingEndedResponse acknowledged outcome
+assert_exported "${INT}" NotifyMeetingEndedOutcome
+assert_exported "${SIG}" LeaveRequest
+assert_oneof_case "${SIG}" leaveRequest
+
 echo "verify-codegen: all checks passed"

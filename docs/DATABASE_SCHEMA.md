@@ -222,7 +222,7 @@ CREATE TABLE meeting_controllers (
     current_participants INTEGER NOT NULL DEFAULT 0,
 
     -- Health
-    health_status VARCHAR(20) NOT NULL DEFAULT 'healthy',  -- 'healthy', 'degraded', 'unhealthy'
+    health_status VARCHAR(20) NOT NULL DEFAULT 'pending',  -- 'pending', 'healthy', 'degraded', 'unhealthy', 'draining'
     last_heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
     -- Metadata
@@ -236,6 +236,39 @@ CREATE INDEX idx_controllers_region ON meeting_controllers(region);
 CREATE INDEX idx_controllers_health ON meeting_controllers(health_status);
 CREATE INDEX idx_controllers_heartbeat ON meeting_controllers(last_heartbeat_at);
 ```
+
+### 7a. Meeting Assignments Table
+
+GC's (meeting, region) -> MC assignment, one row per pair (ADR-0010 §1, §3). Mirrors
+`migrations/20260121000001_meeting_assignments.sql` plus
+`migrations/20261115000001_meeting_assignment_id.sql`.
+
+```sql
+CREATE TABLE IF NOT EXISTS meeting_assignments (
+    meeting_id TEXT NOT NULL,
+    meeting_controller_id VARCHAR(255) NOT NULL REFERENCES meeting_controllers(controller_id),
+    region TEXT NOT NULL,
+    assigned_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    assigned_by_gc_id TEXT NOT NULL,
+    ended_at TIMESTAMPTZ,            -- NULL = live; set when the meeting ends (soft delete)
+    assignment_id UUID NOT NULL,     -- incarnation fence; NO default (every writer supplies it)
+    PRIMARY KEY (meeting_id, region)
+);
+
+CREATE INDEX IF NOT EXISTS idx_assignments_by_mc ON meeting_assignments(meeting_controller_id) WHERE ended_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_assignments_by_region ON meeting_assignments(meeting_id, region) WHERE ended_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_assignments_ended_at ON meeting_assignments(ended_at) WHERE ended_at IS NOT NULL;
+```
+
+- **Incarnations.** An ended row keeps its primary key and is REVIVED in place by the next join
+  (`atomic_assign`), so one meeting id has successive incarnations. `assignment_id` names one: GC mints
+  a random value per `AssignMeetingWithMh` attempt and writes it (insert, revive, re-point) only for the
+  attempt MC accepted. `NotifyMeetingEnded` ends a row only when `meeting_controller_id` AND
+  `assignment_id` both match, so a late or orphan notify can end nothing else.
+- **Liveness, not status.** Join reuse, the join failover re-point and the cleanup backstop all treat
+  a row's MC as alive while its `meeting_controllers.last_heartbeat_at` is younger than
+  `MC_STALENESS_THRESHOLD_SECONDS`, whatever its `health_status`.
+- **Retention**: ended rows are hard-deleted after `GC_RETENTION_DAYS`.
 
 ### 8. Media Handlers Table
 

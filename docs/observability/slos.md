@@ -314,7 +314,7 @@ none ships.
 > `docs/observability/metrics/mh-service.md` §Media Forward Path, limitations 2 and 3.
 
 Likewise the **sample ratio**, also landed:
-`MH_MEDIA_LATENCY_SAMPLE_RATIO` (optional; default `mh_service::config::DEFAULT_MEDIA_LATENCY_SAMPLE_RATIO`, cited rather than restated) is read once into
+`MH_MEDIA_LATENCY_SAMPLE_RATIO` (REQUIRED since 2026-11-15; value in `infra/services/mh-service/config.env`, cited rather than restated) is read once into
 `Config::media_latency_sample_ratio`, the sampler is constructed from that field, and
 `mh_media_latency_sample_ratio` publishes **that same field** — so the published ratio cannot drift
 from the applied one, and a component test asserts the equality. The sampling is **random per frame,

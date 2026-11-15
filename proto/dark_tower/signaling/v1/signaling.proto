@@ -1077,6 +1077,30 @@ message RedirectToMc {
   string reason = 3; // "migration", "rebalance", "capacity"
 }
 
+// A participant's deliberate leave (client -> MC).
+//
+// (a) Position on the stream, the only thing MC can see: the FIRST message
+//     must be a JoinRequest, so a LeaveRequest in its place is a protocol
+//     violation. A LeaveRequest after the JoinRequest takes effect once the
+//     join has completed; if the join fails, MC closes the stream and the
+//     leave is never read. (The SDK sends it only after its join settled --
+//     its own policy.) It carries no identity: the authenticated, bound
+//     stream IS the authority, so it can remove nobody but its sender.
+// (b) MC removes the sender AT ONCE (no reconnect grace), with
+//     `LEAVE_REASON_VOLUNTARY`, and ends the meeting immediately if the sender
+//     was its last participant.
+// (c) MC sends no reply: it closes the session itself. That close is the
+//     client's acknowledgement.
+// (d) The client sends it, then waits for MC's close only up to a bounded
+//     time before closing the transport itself (so disconnect stays bounded).
+// (e) A stream end WITHOUT a prior LeaveRequest keeps today's classification
+//     and grace; MC never reads close ORDER as a leave.
+// (f) Any message after a LeaveRequest on the same stream is ignored.
+//
+// EMPTY ON PURPOSE: no reason (the client can only leave voluntarily; it must
+// never be able to claim KICKED/CONNECTION_LOST/TIMEOUT), no target.
+message LeaveRequest {}
+
 // Notification of participant joining
 message ParticipantJoined {
   Participant participant = 1;
@@ -1781,6 +1805,8 @@ message ClientMessage {
     MediaConnectionUpdate media_connection_update = 11;
     // ADR-0036 §6: replaces SubscribeToLayout/UpdateLayout/UnsubscribeLayout.
     ReceiveCapability receive_capability = 12;
+    // Deliberate leave; rules at `LeaveRequest`.
+    LeaveRequest leave_request = 13;
   }
 
   // W3C Trace Context traceparent header value (RFC: ~55 chars,

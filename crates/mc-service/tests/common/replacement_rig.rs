@@ -108,7 +108,11 @@ impl Rig {
     pub async fn create(&self, meeting: &str, handlers: &[&str]) -> MeetingActorHandle {
         let infos: Vec<_> = handlers.iter().map(|h| mh_handler(h)).collect();
         self.c
-            .create_meeting(meeting.to_string(), handler_set(&infos))
+            .create_meeting(
+                meeting.to_string(),
+                ::common::meeting_lifecycle::AssignmentId::new_v4(),
+                handler_set(&infos),
+            )
             .await
             .unwrap();
         self.c

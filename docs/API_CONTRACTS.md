@@ -644,6 +644,16 @@ client reports itself muted, which is what makes unmute instantaneous and keeps
 > is no compatibility tolerance — MC and client deploy and revert together.
 
 
+#### LeaveRequest (Client → Server)
+
+```protobuf
+message LeaveRequest {}  // ClientMessage.leave_request = 13
+```
+
+The participant's deliberate leave: MC removes the sender at once (no reconnect
+grace) and closes the session. The rules live once, at `LeaveRequest` in
+`proto/dark_tower/signaling/v1/signaling.proto`.
+
 #### StreamQualityUpdate (Bidirectional)
 ```protobuf
 message StreamQualityUpdate {
@@ -880,20 +890,23 @@ enum HealthStatus {
 
 ### 5.3 Meeting Assignment
 
-**Request** (Global → Meeting Controller):
+**Request** (Global → Meeting Controller), `MeetingControllerService.AssignMeetingWithMh`:
 ```protobuf
-message AssignMeeting {
+message AssignMeetingWithMhRequest {
   string meeting_id = 1;
-  MeetingConfig config = 2;
-}
-
-message MeetingConfig {
-  string display_name = 1;
-  uint32 max_participants = 2;
-  bool enable_e2e_encryption = 3;
-  bool recording_enabled = 4;
+  repeated MhAssignment mh_assignments = 2;
+  string requesting_gc_id = 3;
+  string assignment_id = 4;  // GC-minted per attempt; names one incarnation
 }
 ```
+
+**End** (Meeting → Global Controller), `GlobalControllerService.NotifyMeetingEnded`:
+`NotifyMeetingEndedRequest{meeting_id, region, controller_id, assignment_id}` →
+`NotifyMeetingEndedResponse{outcome: ENDED | NOT_CURRENT}`.
+
+The fence rules (who mints `assignment_id`, the invariant, what GC ends, MC's
+retry rule, why `controller_id` is not authorization) live once, in
+`proto/dark_tower/internal/v1/internal.proto` at those messages.
 
 ## Error Handling
 

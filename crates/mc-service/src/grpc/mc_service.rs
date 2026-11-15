@@ -26,6 +26,7 @@ use crate::actors::MeetingControllerActorHandle;
 use crate::errors::McError;
 use crate::media_routing::{HandlerEndpoint, HandlerId, HandlerSetError, MeetingHandlers};
 use crate::redis::FencedRedisClient;
+use common::meeting_lifecycle::AssignmentId;
 use proto_gen::dark_tower::internal::v1::meeting_controller_service_server::MeetingControllerService;
 use proto_gen::dark_tower::internal::v1::{
     AssignMeetingWithMhRequest, AssignMeetingWithMhResponse, MhAssignment, RejectionReason,
@@ -136,17 +137,19 @@ impl McAssignmentService {
         None
     }
 
-    /// Validate GC's hand-off, store it in Redis, and return the meeting's
-    /// handler set built from the SAME stored value (ADR-0039 §3: the hand-off
-    /// is consumed once, at actor creation; MC never reads it back).
+    /// Validate GC's hand-off (pure: nothing is written) and return the
+    /// entries MC stores plus the meeting's handler set built from exactly
+    /// those entries (ADR-0039 §3: the hand-off is consumed once, at actor
+    /// creation; MC never reads it back).
     ///
-    /// Converts proto `MhAssignment` messages into `MhEndpointInfo` structs
-    /// and stores them as active/active peers.
-    async fn store_mh_assignments(
-        &self,
+    /// Converts proto `MhAssignment` messages into `MhEndpointInfo` structs.
+    /// The Redis write is separate ([`Self::store_mh_assignments`]) and runs
+    /// only AFTER the meeting was created, so a refused duplicate assign never
+    /// touches the live meeting's stored hand-off.
+    fn validate_mh_assignments(
         meeting_id: &str,
         mh_assignments: &[MhAssignment],
-    ) -> Result<MeetingHandlers, McError> {
+    ) -> Result<(Vec<crate::redis::MhEndpointInfo>, MeetingHandlers), McError> {
         // ANCHOR (DRY): these contract checks (empty `mh_assignments`; any
         // assignment failing `HandlerEndpoint::try_from(&MhAssignment)`
         // (`media_routing/placement.rs`) — empty
@@ -212,19 +215,25 @@ impl McAssignmentService {
             McError::Internal(format!("MH hand-off rejected: {e}"))
         })?;
 
-        // Store in Redis with fencing token
-        self.redis_client
-            .store_mh_assignment(meeting_id, &handlers)
-            .await?;
+        Ok((handlers, set))
+    }
 
+    /// Store a validated hand-off in Redis (with fencing token).
+    async fn store_mh_assignments(
+        &self,
+        meeting_id: &str,
+        handlers: &[crate::redis::MhEndpointInfo],
+    ) -> Result<(), McError> {
+        self.redis_client
+            .store_mh_assignment(meeting_id, handlers)
+            .await?;
         debug!(
             target: "mc.grpc.mc_service",
             meeting_id = %meeting_id,
             handler_count = handlers.len(),
             "Stored MH assignments"
         );
-
-        Ok(set)
+        Ok(())
     }
 }
 
@@ -326,112 +335,161 @@ impl MeetingControllerService for McAssignmentService {
                 "Rejecting meeting assignment"
             );
 
-            crate::observability::metrics::record_meeting_assignment(
-                "rejected",
-                Some(rejection_reason_label(reason)),
-            );
-
-            return Ok(Response::new(AssignMeetingWithMhResponse {
-                accepted: false,
-                rejection_reason: reason.into(),
-            }));
+            return Ok(Response::new(reject(reason)));
         }
 
-        // Store MH assignments in Redis. Distinguish a GC contract violation
-        // (InvalidArgument → INVALID_REQUEST, GC fails fast) from a genuine
-        // controller-side storage failure (Redis/etc. → UNHEALTHY, GC may retry
-        // elsewhere). Never blanket-map either direction.
-        let handlers = match self
-            .store_mh_assignments(meeting_id, &inner.mh_assignments)
-            .await
-        {
-            Ok(handlers) => handlers,
-            Err(e) => {
-                let reason = rejection_for_store_error(&e);
-                match reason {
-                    RejectionReason::InvalidRequest => {
-                        // The specific contract violation was already logged at error!
-                        // inside store_mh_assignments; record the rejection decision
-                        // without re-implicating MC health.
-                        warn!(
-                            target: "mc.grpc.mc_service",
-                            meeting_id = %meeting_id,
-                            rejection_reason = ?reason,
-                            "Rejecting assignment: GC sent an invalid request"
-                        );
-                    }
-                    _ => {
-                        error!(
-                            target: "mc.grpc.mc_service",
-                            meeting_id = %meeting_id,
-                            error = %e,
-                            rejection_reason = ?reason,
-                            "Failed to store MH assignments (controller-side error)"
-                        );
-                    }
-                }
-
-                crate::observability::metrics::record_meeting_assignment(
-                    "rejected",
-                    Some(rejection_reason_label(reason)),
-                );
-
-                return Ok(Response::new(AssignMeetingWithMhResponse {
-                    accepted: false,
-                    rejection_reason: reason.into(),
-                }));
-            }
+        let ValidatedAssign {
+            assignment_id,
+            stored,
+            handlers,
+        } = match validate_assign_request(&inner) {
+            Ok(validated) => validated,
+            Err(reason) => return Ok(Response::new(reject(reason))),
         };
 
-        // Create meeting actor, with its handler set (ADR-0039 §3)
-        match self
+        // Create the meeting BEFORE anything is written. A meeting MC already
+        // holds is refused here (Conflict, never adopted — the fence invariant
+        // in internal.proto), and a refused assign has touched nothing: the
+        // live meeting's stored hand-off survives a racing duplicate.
+        if let Err(e) = self
             .controller_handle
-            .create_meeting(meeting_id.clone(), handlers)
+            .create_meeting(meeting_id.clone(), assignment_id, handlers)
             .await
         {
-            Ok(()) => {
-                info!(
+            if matches!(e, McError::Conflict(_)) {
+                // An EXPECTED race, not a failure: two GCs placed the same
+                // first join here, and MC never adopts a second assignment for
+                // a meeting it holds (the fence invariant, internal.proto). The
+                // wire reason stays UNHEALTHY (GC tries another MC); the losing
+                // GC's row never names this MC.
+                warn!(
                     target: "mc.grpc.mc_service",
                     meeting_id = %meeting_id,
-                    gc_id = %gc_id,
-                    "Accepted meeting assignment"
+                    assignment_id = %assignment_id,
+                    "Duplicate assignment for a meeting this MC already holds refused (fence; \
+                     the held assignment stands)"
                 );
-
-                // Increment meeting count
-                self.current_meetings.fetch_add(1, Ordering::SeqCst);
-
-                crate::observability::metrics::record_meeting_assignment("success", None);
-
-                Ok(Response::new(AssignMeetingWithMhResponse {
-                    accepted: true,
-                    rejection_reason: RejectionReason::Unspecified.into(),
-                }))
+                return Ok(Response::new(reject(RejectionReason::Unhealthy)));
             }
-            Err(e) => {
+            error!(
+                target: "mc.grpc.mc_service",
+                meeting_id = %meeting_id,
+                error = %e,
+                "Failed to create meeting actor"
+            );
+            // `unhealthy` conflates this with the Redis-store path below.
+            // The log record immediately preceding is what distinguishes
+            // them; see mc-incident-response.md Scenario 6 root cause 6.
+            return Ok(Response::new(reject(RejectionReason::Unhealthy)));
+        }
+
+        // Store the hand-off. On failure the just-created meeting is REMOVED
+        // (released on its handlers, GC not told: GC never committed a row for
+        // an assignment MC refused) and the assignment is refused as before.
+        if let Err(e) = self.store_mh_assignments(meeting_id, &stored).await {
+            error!(
+                target: "mc.grpc.mc_service",
+                meeting_id = %meeting_id,
+                error = %e,
+                "Failed to store MH assignments (controller-side error); removing the meeting"
+            );
+            if let Err(remove_err) = self
+                .controller_handle
+                .remove_meeting(meeting_id.clone())
+                .await
+            {
                 error!(
                     target: "mc.grpc.mc_service",
                     meeting_id = %meeting_id,
-                    error = %e,
-                    "Failed to create meeting actor"
+                    error = %remove_err,
+                    "Could not remove the meeting created for a refused assignment"
                 );
-
-                // Clean up MH assignments
-                let _ = self.redis_client.delete_mh_assignment(meeting_id).await;
-
-                // `unhealthy` conflates this with the Redis-store path above.
-                // The log record immediately preceding is what distinguishes
-                // them; see mc-incident-response.md Scenario 6 root cause 6.
-                crate::observability::metrics::record_meeting_assignment(
-                    "rejected",
-                    Some(rejection_reason_label(RejectionReason::Unhealthy)),
-                );
-
-                Ok(Response::new(AssignMeetingWithMhResponse {
-                    accepted: false,
-                    rejection_reason: RejectionReason::Unhealthy.into(),
-                }))
             }
+            return Ok(Response::new(reject(rejection_for_store_error(&e))));
         }
+
+        info!(
+            target: "mc.grpc.mc_service",
+            meeting_id = %meeting_id,
+            gc_id = %gc_id,
+            assignment_id = %assignment_id,
+            "Accepted meeting assignment"
+        );
+        self.current_meetings.fetch_add(1, Ordering::SeqCst);
+        crate::observability::metrics::record_meeting_assignment("success", None);
+        Ok(Response::new(AssignMeetingWithMhResponse {
+            accepted: true,
+            rejection_reason: RejectionReason::Unspecified.into(),
+        }))
+    }
+}
+
+/// An `AssignMeetingWithMhRequest` that passed every GC contract check.
+struct ValidatedAssign {
+    assignment_id: AssignmentId,
+    /// The hand-off entries MC stores.
+    stored: Vec<crate::redis::MhEndpointInfo>,
+    /// The meeting's handler set, built from exactly `stored`.
+    handlers: MeetingHandlers,
+}
+
+/// GC contract checks, PURE (nothing written): the incarnation id, then the
+/// MH hand-off. A violation is `INVALID_REQUEST` (GC fails fast after verifying
+/// its own request); a hand-off that cannot form a handler set is a
+/// controller-side `UNHEALTHY`. The parse detail is logged as a bounded variant
+/// (no input echoed); the wire answer is the bare rejection reason.
+fn validate_assign_request(
+    inner: &AssignMeetingWithMhRequest,
+) -> Result<ValidatedAssign, RejectionReason> {
+    let meeting_id = &inner.meeting_id;
+    let assignment_id = AssignmentId::parse(&inner.assignment_id).map_err(|e| {
+        warn!(
+            target: "mc.grpc.mc_service",
+            meeting_id = %meeting_id,
+            reason = %e,
+            "Rejecting assignment: assignment_id is invalid (GC contract violation)"
+        );
+        RejectionReason::InvalidRequest
+    })?;
+    let (stored, handlers) =
+        McAssignmentService::validate_mh_assignments(meeting_id, &inner.mh_assignments).map_err(
+            |e| {
+                let reason = rejection_for_store_error(&e);
+                if reason == RejectionReason::InvalidRequest {
+                    warn!(
+                        target: "mc.grpc.mc_service",
+                        meeting_id = %meeting_id,
+                        rejection_reason = ?reason,
+                        "Rejecting assignment: GC sent an invalid request"
+                    );
+                } else {
+                    error!(
+                        target: "mc.grpc.mc_service",
+                        meeting_id = %meeting_id,
+                        error = %e,
+                        rejection_reason = ?reason,
+                        "GC's MH hand-off cannot form a handler set (controller-side)"
+                    );
+                }
+                reason
+            },
+        )?;
+    Ok(ValidatedAssign {
+        assignment_id,
+        stored,
+        handlers,
+    })
+}
+
+/// A refusal, counted: `mc_meeting_assignments_total{status="rejected"}`.
+fn reject(reason: RejectionReason) -> AssignMeetingWithMhResponse {
+    crate::observability::metrics::record_meeting_assignment(
+        "rejected",
+        Some(rejection_reason_label(reason)),
+    );
+    AssignMeetingWithMhResponse {
+        accepted: false,
+        rejection_reason: reason.into(),
     }
 }
 
@@ -626,5 +684,37 @@ mod tests {
         // Exactly at threshold (current + estimate == max)
         // 90 participants + 10 estimate = 100, which is NOT > 100, so should accept
         assert_eq!(check_capacity(false, 0, 100, 90, 100), None);
+    }
+
+    fn assign_request(assignment_id: &str) -> AssignMeetingWithMhRequest {
+        AssignMeetingWithMhRequest {
+            meeting_id: "m-assign".to_string(),
+            mh_assignments: vec![MhAssignment {
+                mh_id: "mh-1".to_string(),
+                webtransport_endpoint: "https://mh-1:4434".to_string(),
+                grpc_endpoint: "http://mh-1:50053".to_string(),
+            }],
+            requesting_gc_id: "gc-1".to_string(),
+            assignment_id: assignment_id.to_string(),
+        }
+    }
+
+    /// The incarnation id is a GC contract field: empty, malformed and nil
+    /// are INVALID_REQUEST (no zero-means-any), checked before anything is
+    /// written; a valid one passes through as the parsed value.
+    #[test]
+    fn an_invalid_assignment_id_is_an_invalid_request() {
+        for bad in ["", "not-a-uuid", "00000000-0000-0000-0000-000000000000"] {
+            assert_eq!(
+                validate_assign_request(&assign_request(bad)).err(),
+                Some(RejectionReason::InvalidRequest),
+                "{bad:?} must be refused"
+            );
+        }
+        let good = AssignmentId::new_v4();
+        let validated =
+            validate_assign_request(&assign_request(&good.to_string())).expect("valid request");
+        assert_eq!(validated.assignment_id, good);
+        assert_eq!(validated.stored.len(), 1);
     }
 }

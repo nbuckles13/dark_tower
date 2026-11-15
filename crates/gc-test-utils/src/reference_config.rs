@@ -6,8 +6,8 @@
 //! retyping them, so a change in config.env flows into every such test. Tests
 //! ABOUT freshness or config validation set their own values.
 
-use gc_service::config::MhRegistryConfig;
 pub use gc_service::config::MH_REGISTRY_KEYS;
+use gc_service::config::{McAssignmentConfig, MhRegistryConfig};
 use std::collections::HashMap;
 
 /// The shipped GC ConfigMap source, compiled in.
@@ -50,6 +50,18 @@ pub fn parse_env_file(text: &str) -> HashMap<String, String> {
     vars
 }
 
+/// Every key of the shipped config.env with its shipped value (some, like the
+/// MH topology allowlists, are deliberately empty there and rendered per
+/// deploy; [`crate::fill_required_config`] supplies test values for those).
+///
+/// # Panics
+///
+/// If config.env is malformed.
+#[must_use]
+pub fn reference_config_vars() -> HashMap<String, String> {
+    parse_env_file(GC_CONFIG_ENV)
+}
+
 /// The shipped values of the five `GC_MH_*` registry keys.
 ///
 /// # Panics
@@ -82,6 +94,18 @@ pub fn reference_mh_registry() -> MhRegistryConfig {
         .unwrap_or_else(|e| panic!("shipped MH registry config is invalid: {e}"))
 }
 
+/// The shipped MC liveness threshold and accept->commit budget, parsed by
+/// GC's own `McAssignmentConfig::from_vars`.
+///
+/// # Panics
+///
+/// If the shipped values are missing or do not pass GC's validation.
+#[must_use]
+pub fn reference_mc_assignment() -> McAssignmentConfig {
+    McAssignmentConfig::from_vars(&reference_config_vars())
+        .unwrap_or_else(|e| panic!("shipped MC assignment config is invalid: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,6 +135,35 @@ mod tests {
     #[should_panic(expected = "duplicates key A")]
     fn duplicate_key_panics() {
         let _ = parse_env_file("A=1\nA=2\n");
+    }
+
+    /// The shipped drain must end before Kubernetes' SIGKILL: the GC
+    /// Deployment's `terminationGracePeriodSeconds` exceeds `GC_DRAIN_SECONDS`
+    /// (and `MAX_DRAIN`, so no valid value can outlive it). Both values are
+    /// read from the shipped files, never retyped.
+    #[test]
+    fn shipped_drain_ends_before_the_termination_grace_period() {
+        const DEPLOYMENT: &str = include_str!("../../../infra/services/gc-service/deployment.yaml");
+        let grace: u64 = DEPLOYMENT
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("terminationGracePeriodSeconds:"))
+            .expect("deployment.yaml sets terminationGracePeriodSeconds")
+            .trim()
+            .parse()
+            .expect("terminationGracePeriodSeconds is an integer");
+        let drain: u64 = reference_config_vars()
+            .get("GC_DRAIN_SECONDS")
+            .expect("config.env sets GC_DRAIN_SECONDS")
+            .parse()
+            .expect("GC_DRAIN_SECONDS is an integer");
+        assert!(
+            drain < grace,
+            "drain {drain}s must end before SIGKILL at {grace}s"
+        );
+        assert!(
+            gc_service::config::MAX_DRAIN.as_secs() < grace,
+            "MAX_DRAIN must stay below terminationGracePeriodSeconds ({grace}s)"
+        );
     }
 
     #[test]

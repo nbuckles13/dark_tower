@@ -218,6 +218,9 @@ export function installE2EHooks(
     window.__darktower_test__ = bus;
 
     session.on('stateChange', (state) => bus.emit({ type: 'stateChange', state }));
+    // How `disconnect()`'s deliberate leave ended (a bounded scalar): the e2e
+    // leave helpers ASSERT `acknowledged` (MC removed the participant at once).
+    session.on('left', (outcome) => bus.emit({ type: 'left', outcome }));
     // The handler-set history (ADR-0039 §4): field-by-field, never tokens.
     const recordHandlerSet = (view: HandlerSetView): void => {
       const projected: BusHandlerSet = {

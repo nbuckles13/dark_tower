@@ -81,7 +81,11 @@ impl Rig {
     async fn create(&self, meeting: &str, handlers: &[&str]) -> MeetingActorHandle {
         let infos: Vec<_> = handlers.iter().map(|h| mh_handler(h)).collect();
         self.c
-            .create_meeting(meeting.to_string(), handler_set(&infos))
+            .create_meeting(
+                meeting.to_string(),
+                ::common::meeting_lifecycle::AssignmentId::new_v4(),
+                handler_set(&infos),
+            )
             .await
             .unwrap();
         self.c
@@ -582,7 +586,10 @@ async fn a_bulk_released_sender_id_is_never_reissued() {
     let _a = r.join("m", "a").await;
     let sa = r.connect("m", "a", H_A, "Ka").await;
     assert_ne!(sa, 0);
-    meeting.participant_leave("a".into()).await.unwrap();
+    meeting
+        .participant_leave("a".into(), "conn-a".into())
+        .await
+        .unwrap();
     assert_eq!(
         meeting.probe_handler_for_test(H_A).await.unwrap().bindings,
         vec!["Ka"],

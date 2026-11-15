@@ -1599,10 +1599,10 @@ would silently become an estimate of an estimate.
 - **Usage**: Interpretation input for the histogram above. Read it before reading a rate off `_count`.
 
 Published from **the same configuration field the sampler draws against**
-(`MH_MEDIA_LATENCY_SAMPLE_RATIO`, optional; the default is
-`mh_service::config::DEFAULT_MEDIA_LATENCY_SAMPLE_RATIO` and is deliberately not
-restated here, because a number written into a document is a second encoding of
-a config value). A ratio computed
+(`MH_MEDIA_LATENCY_SAMPLE_RATIO`, REQUIRED since 2026-11-15; its value lives in
+`infra/services/mh-service/config.env` and is deliberately not restated here,
+because a number written into a document is a second encoding of a config
+value). A ratio computed
 separately from the one in force is a gauge that lies exactly when someone is
 using it to interpret a histogram. Not to be confused with `OTEL_SAMPLE_RATE`,
 which is trace head-sampling with a different owner and a different consumer.

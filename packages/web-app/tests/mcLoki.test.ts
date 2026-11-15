@@ -11,6 +11,7 @@ import {
   MC_CLEAN_CLOSE,
   MC_CREATED,
   MC_GRACE_EXPIRED,
+  MC_LEAVE_REQUEST,
   MC_MEETING_ENDED,
   MC_MEETING_RELEASED,
   MEETING_ID_UNRESOLVED,
@@ -22,6 +23,7 @@ import {
   classifyMember,
   classifyQueryRange,
   createdAnchor,
+  departureEntries,
   logqlFilter,
   matchingEntries,
   meetingEndBudgetMs,
@@ -58,6 +60,7 @@ describe('drift pins (one Rust home each)', () => {
     ['MC_MEETING_RELEASED', MC_MEETING_RELEASED],
     ['MC_CLEAN_CLOSE', MC_CLEAN_CLOSE],
     ['MC_GRACE_EXPIRED', MC_GRACE_EXPIRED],
+    ['MC_LEAVE_REQUEST', MC_LEAVE_REQUEST],
   ])('loki.rs %s', (name, line) => {
     expect(logLineConst(loki, name)).toEqual(line);
   });
@@ -158,7 +161,6 @@ describe('verdicts', () => {
   test('departure-never-seen: a participant id no departure names', () => {
     const ms = [member('A', ['pa']), member('B', ['pb'])];
     expect(missingDepartures(ms, [entry(1, { participant_id: 'pa' })])).toEqual(['B']);
-    // Clean close OR grace expiry both count (the caller merges both lines).
     expect(
       missingDepartures(ms, [
         entry(1, { participant_id: 'pa' }),
@@ -172,6 +174,32 @@ describe('verdicts', () => {
         entry(2, { participant_id: 'px' }),
       ]),
     ).toEqual(['B']);
+  });
+
+  /** A raw Loki value for `line` naming meeting `ID` and participant `pid`. */
+  const rawLine = (ts: number, line: typeof MC_LEAVE_REQUEST, pid: string) => ({
+    tsNs: BigInt(ts),
+    line: JSON.stringify({
+      target: line.target,
+      fields: { message: line.message, meeting_id: ID, participant_id: pid },
+    }),
+  });
+
+  test('ONLY the LeaveRequest line is a departure', () => {
+    const ms = [member('A', ['pa'])];
+    const ds = departureEntries(ID, [rawLine(1, MC_LEAVE_REQUEST, 'pa')]);
+    expect(missingDepartures(ms, ds)).toEqual([]);
+  });
+
+  test('ADVERSE: a departure proven only by a grace-expiry (or clean-close) line FAILS the proof', () => {
+    // The leave never reached MC: it held the participant through its grace.
+    // Counting this would let a P4 regression pass, one grace slower.
+    const ms = [member('A', ['pa'])];
+    for (const line of [MC_GRACE_EXPIRED, MC_CLEAN_CLOSE]) {
+      const ds = departureEntries(ID, [rawLine(1, line, 'pa')]);
+      expect(ds).toEqual([]);
+      expect(missingDepartures(ms, ds)).toEqual(['A']);
+    }
   });
 
   test('created-never-seen; the anchor is the newest created line, never below the scope', () => {

@@ -563,7 +563,11 @@ async fn a_later_assignment_change_does_not_alter_a_live_meetings_handlers() {
     // Redis record) cannot reach the actor — the create is refused.
     let reassign = stack
         .controller_handle
-        .create_meeting("t5".to_string(), handler_set(&[mh_handler("mh-evil")]))
+        .create_meeting(
+            "t5".to_string(),
+            ::common::meeting_lifecycle::AssignmentId::new_v4(),
+            handler_set(&[mh_handler("mh-evil")]),
+        )
         .await;
     assert!(
         matches!(reassign, Err(McError::Conflict(_))),
@@ -659,7 +663,10 @@ async fn a_rotation_during_the_park_releases_the_joiner_with_the_current_kek() {
     assert!(is_parked(&a).await && is_parked(&b).await);
 
     // B leaves while both are parked; the leave rotation fires.
-    meeting.participant_leave("b".to_string()).await.unwrap();
+    meeting
+        .participant_leave("b".to_string(), "conn-b".to_string())
+        .await
+        .unwrap();
     assert!(
         meeting.force_kek_rotation().await.unwrap(),
         "a leave was pending"

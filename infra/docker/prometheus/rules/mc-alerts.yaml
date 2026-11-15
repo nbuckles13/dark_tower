@@ -479,8 +479,8 @@ groups:
       - alert: MCLowConnectionCount
         # THE NEVER-JOINED-MEETING LEAK DETECTOR (join-window devloop,
         # 2026-11-12). A meeting nobody has joined is LEGAL for up to its join
-        # window (MC_MEETING_JOIN_WINDOW_SECONDS, at most the derived default
-        # `MAX_JOIN_WINDOW`, actors/meeting_timers.rs), so zero connections
+        # window (MC_MEETING_JOIN_WINDOW_SECONDS, required, at most the derived
+        # ceiling `MAX_JOIN_WINDOW`, actors/meeting_timers.rs), so zero connections
         # with meetings held is normal for that long. `for:` is therefore at
         # least MAX_JOIN_WINDOW + LIFETIME_TICK plus margin — pinned by
         # `meeting_timers::tests::low_connection_alert_outlasts_every_legal_join_window`.
@@ -1233,20 +1233,44 @@ groups:
           impact: "Rejoins of that meeting were held until the deadline; one handler may hold a leaked registration."
           runbook_url: "docs/runbooks/mc-incident-response.md#scenario-20-meeting-teardown-failing--mh-budget-ratchet"
 
-      - alert: MCNotifyMeetingEndedFailing
-        # A GC-coordination failure with a user-visible cost: GC keeps reusing
-        # an ended meeting's assignment, and joins to it fail until MC restarts.
+      - alert: MCNotifyMeetingEndedRejected
+        # A DEFECT, not an outage: GC refused MC's NotifyMeetingEnded as
+        # invalid, or answered with no outcome. Never retried, so final.
         expr: |
-          sum(increase(mc_gc_notify_meeting_ended_total{status="error"}[15m])) > 0
+          sum(increase(mc_gc_notify_meeting_ended_total{outcome="rejected"}[15m])) > 0
         for: 0m
         labels:
           severity: warning
           service: mc-service
           component: gc-coordination
         annotations:
-          summary: "MC could not tell GC that a meeting ended"
-          description: "mc_gc_notify_meeting_ended_total{status=\"error\"} rose. The notify is sent at most once for anything GC may have processed, so an error is final: GC keeps the ended meeting's assignment live, reuses it for the next join, and MC answers meeting_not_found. The mc.grpc.gc_client ERROR line names the meeting."
-          impact: "Joins to the affected meeting id fail with meeting_not_found until MC restarts or is marked unhealthy."
+          summary: "GC rejected MC's meeting-ended notification (defect)"
+          description: "mc_gc_notify_meeting_ended_total{outcome=\"rejected\"} rose: GC answered INVALID_ARGUMENT (a request MC built wrongly) or no outcome (a GC defect or version skew). Rejected notifications are not retried; the mc.grpc.gc_client ERROR line \"GC refused NotifyMeetingEnded as invalid\" or \"GC answered NotifyMeetingEnded with no outcome\" names the meeting."
+          impact: "GC keeps routing joins for the affected meeting id to this MC (which no longer holds it) until this MC stops heartbeating."
+          runbook_url: "docs/runbooks/mc-incident-response.md#scenario-20-meeting-teardown-failing--mh-budget-ratchet"
+
+      - alert: MCNotifyMeetingEndedStuck
+        # The user-visible symptom: a meeting MC ended that GC still routes
+        # joins to. Keyed on the AGE of the oldest unanswered notify, never on
+        # the pending COUNT (a count reads > 0 under routine churn — a notify
+        # milliseconds into a successful send) and never on the retried rate
+        # (one flaky attempt that later acks is not an incident). 120 s spans
+        # several capped-backoff retries.
+        expr: |
+          max(mc_gc_notify_meeting_ended_oldest_pending_age_seconds) > 120
+        # The age already integrates time and is republished every 5 s by the
+        # drain (NOTIFY_PENDING_PUBLISH_INTERVAL), so it lags the truth by at
+        # most that plus one scrape; `for: 30s` only rides out a single scrape
+        # (the rule-guard floor). It fires ~2.5-3 min after the notify was queued.
+        for: 30s
+        labels:
+          severity: warning
+          service: mc-service
+          component: gc-coordination
+        annotations:
+          summary: "A meeting-ended notification has been unanswered by GC for over 2 minutes"
+          description: "mc_gc_notify_meeting_ended_oldest_pending_age_seconds > 120: MC has retried telling GC that a meeting ended (capped backoff, retried until GC answers — safe, the notify is fenced by assignment_id) and GC has not answered. mc_gc_notify_meeting_ended_pending is the backlog; the mc.grpc.gc_client WARN lines name each meeting and the failure code."
+          impact: "Joins to each pending meeting id reach an MC that no longer holds it (meeting_not_found) until GC answers or this MC stops heartbeating (GC then fails the rows over)."
           runbook_url: "docs/runbooks/mc-incident-response.md#scenario-20-meeting-teardown-failing--mh-budget-ratchet"
 
       - alert: MCMeetingEndedNotificationsDropped
@@ -1260,7 +1284,7 @@ groups:
         annotations:
           summary: "MC dropped meeting-ended notifications before sending them"
           description: "mc_gc_meeting_ended_notifications_dropped_total rose: MC's notify queue was full, so a meeting's end was never reported to GC. Expected-empty (the queue is sized far above any burst): this is MC losing events, not GC being down."
-          impact: "GC keeps each affected meeting's assignment live; joins to those meeting ids fail until MC restarts."
+          impact: "GC keeps each affected meeting's assignment live; joins to those meeting ids reach an MC that no longer holds them until this MC stops heartbeating (GC then fails the rows over)."
           runbook_url: "docs/runbooks/mc-incident-response.md#scenario-20-meeting-teardown-failing--mh-budget-ratchet"
 
       # ====================================================================

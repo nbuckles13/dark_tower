@@ -211,12 +211,19 @@ impl MeetingActorHandle {
             .map_err(|e| McError::Internal(format!("response receive failed: {e}")))?
     }
 
-    /// Participant leaves the meeting (explicit leave).
-    pub async fn participant_leave(&self, participant_id: String) -> Result<(), McError> {
+    /// The participant's deliberate leave (`LeaveRequest`), sent on
+    /// `connection_id`: removed at once, no grace. A no-op when that connection
+    /// is not the participant's live one.
+    pub async fn participant_leave(
+        &self,
+        participant_id: String,
+        connection_id: String,
+    ) -> Result<(), McError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.sender
             .send(MeetingMessage::ParticipantLeave {
                 participant_id,
+                connection_id,
                 respond_to: tx,
             })
             .await
@@ -658,6 +665,18 @@ impl MeetingActorHandle {
     }
 }
 
+/// Whether `connection_id` is (or, once the participant is in grace, was) the
+/// participant's live connection. While a connection is attached, only THAT
+/// connection's leave or close acts on the participant; once none is attached
+/// (already in grace) the ending connection is the one that dropped, so it
+/// still may (the clean-close-after-loss race in `handle_disconnect`).
+fn is_live_connection(participant: &Participant, connection_id: &str) -> bool {
+    participant
+        .connection
+        .as_ref()
+        .is_none_or(|live| live.connection_id() == connection_id)
+}
+
 /// Participant state within a meeting.
 #[derive(Debug)]
 struct Participant {
@@ -912,6 +931,11 @@ impl MeetingActor {
     /// KEK. **Fail closed**: the meeting is not created. There is deliberately
     /// no fallback RNG and no default key — a predictable KEK would silently
     /// defeat every confidentiality property ADR-0036 §4 claims.
+    ///
+    /// Test builds only: an UNMANAGED actor (no controller wiring) runs the
+    /// fixed [`MeetingTimers::for_tests`]; production actors are always
+    /// spawned managed, with the configured timers.
+    #[cfg(any(test, feature = "test-seams"))]
     pub fn spawn(
         meeting_id: String,
         cancel_token: CancellationToken,
@@ -929,6 +953,7 @@ impl MeetingActor {
             master_secret,
             kek_lifecycle,
             handlers,
+            MeetingTimers::for_tests(),
             AdmissionEpoch::generate,
             |_| {},
         )
@@ -962,9 +987,9 @@ impl MeetingActor {
             master_secret,
             kek_lifecycle,
             handlers,
+            wiring.timers,
             AdmissionEpoch::generate,
             move |actor| {
-                actor.timers = wiring.timers;
                 actor.wiring = Some(wiring);
             },
         )
@@ -989,6 +1014,7 @@ impl MeetingActor {
         master_secret: SecretBox<Vec<u8>>,
         kek_lifecycle: Arc<KekLifecycle>,
         handlers: MeetingHandlers,
+        timers: MeetingTimers,
         build_admission: impl FnOnce(
             &ring::rand::SystemRandom,
         ) -> Result<
@@ -1076,7 +1102,7 @@ impl MeetingActor {
             replacement,
             planned: crate::media_routing::planned_transfer::PlannedTransfers::default(),
             end_cause: None,
-            timers: MeetingTimers::default(),
+            timers,
             created: Instant::now(),
             wiring: None,
         };
@@ -1171,13 +1197,13 @@ impl MeetingActor {
             master_secret,
             kek_lifecycle,
             handlers,
+            wiring
+                .as_ref()
+                .map_or_else(MeetingTimers::for_tests, |w| w.timers),
             |rng| AdmissionEpoch::with_seams(rng, sender_ids, reset_cursor),
             |actor| {
                 actor.media.apply_seams(seams);
                 actor.kek_debounce_manual = manual;
-                if let Some(wiring) = &wiring {
-                    actor.timers = wiring.timers;
-                }
                 actor.wiring = wiring;
                 if dial_refresh_seed.is_some() {
                     actor.dial_refresh =
@@ -1558,9 +1584,10 @@ impl MeetingActor {
 
             MeetingMessage::ParticipantLeave {
                 participant_id,
+                connection_id,
                 respond_to,
             } => {
-                let result = self.handle_leave(&participant_id).await;
+                let result = self.handle_leave(&participant_id, &connection_id).await;
                 let _ = respond_to.send(result);
             }
 
@@ -2075,10 +2102,26 @@ impl MeetingActor {
         }
 
         // Look up current participant status; if already gone (removed/left),
-        // there is nothing to do — keeps the double-notify path idempotent.
-        let Some(status) = self.participants.get(participant_id).map(|p| p.status) else {
+        // there is nothing to do — keeps the double-notify path idempotent
+        // (including the close that follows a LeaveRequest).
+        let Some(participant) = self.participants.get(participant_id) else {
             return;
         };
+        // Bound to the CURRENT connection (security C1): the end of a
+        // connection that is not the participant's live one (superseded by a
+        // reconnect) neither removes the participant nor starts a grace for
+        // the presence another connection now holds.
+        if !is_live_connection(participant, connection_id) {
+            debug!(
+                target: "mc.actor.meeting",
+                meeting_id = %self.meeting_id,
+                participant_id = %participant_id,
+                connection_id = %connection_id,
+                "Disconnect of a connection that is not the participant's live one; ignored"
+            );
+            return;
+        }
+        let status = participant.status;
 
         match cause {
             DisconnectCause::ClientClosed => {
@@ -2643,24 +2686,46 @@ impl MeetingActor {
         })
     }
 
-    /// Handle participant leaving.
+    /// The participant's deliberate leave (`LeaveRequest` on its own bound
+    /// signalling stream): removed AT ONCE — no reconnect grace — through the
+    /// single choke-point, with `LEAVE_REASON_VOLUNTARY`; the last leaver
+    /// ends the meeting through the same path as any emptied meeting.
+    ///
+    /// Bound to the CURRENT connection (security C1): a leave from a
+    /// connection that is not the participant's live one (stale, or
+    /// superseded by a reconnect) removes nobody. The transport close that
+    /// follows the leave then finds the participant gone and no-ops, so
+    /// nothing is counted twice.
     #[instrument(skip_all, fields(meeting_id = %self.meeting_id))]
-    async fn handle_leave(&mut self, participant_id: &str) -> Result<(), McError> {
-        if self.participants.contains_key(participant_id) {
-            debug!(
-                target: "mc.actor.meeting",
-                "Participant leaving"
-            );
-
+    async fn handle_leave(
+        &mut self,
+        participant_id: &str,
+        connection_id: &str,
+    ) -> Result<(), McError> {
+        if let Some(participant) = self.participants.get(participant_id) {
+            if !is_live_connection(participant, connection_id) {
+                debug!(
+                    target: "mc.actor.meeting",
+                    meeting_id = %self.meeting_id,
+                    participant_id = %participant_id,
+                    connection_id = %connection_id,
+                    "Leave from a connection that is not the participant's live one; ignored"
+                );
+                return Ok(());
+            }
             // Explicit voluntary leave — remove via the single choke-point
             // (emits mc_participant_leaves_total{reason="voluntary"}).
             self.remove_and_broadcast_left(participant_id, LeaveReason::Voluntary)
                 .await;
 
+            // THE departure line for a deliberate leave (pinned:
+            // env-tests `MC_LEAVE_REQUEST`, web-app e2e `mcLoki.ts`).
             info!(
                 target: "mc.actor.meeting",
+                meeting_id = %self.meeting_id,
+                participant_id = %participant_id,
                 remaining_participants = self.participants.len(),
-                "Participant left"
+                "Participant left (LeaveRequest) — removing immediately"
             );
 
             Ok(())
@@ -4470,7 +4535,9 @@ mod tests {
             .await;
 
         // Leave
-        let result = handle.participant_leave("part-1".to_string()).await;
+        let result = handle
+            .participant_leave("part-1".to_string(), "conn-1".to_string())
+            .await;
         assert!(result.is_ok());
 
         // The only participant is gone, so the meeting has ENDED (story 2 task
@@ -5039,7 +5106,10 @@ mod tests {
                 >= 1,
             "positive control: a was left pending"
         );
-        handle.participant_leave("a".to_string()).await.unwrap();
+        handle
+            .participant_leave("a".to_string(), "conn-a".to_string())
+            .await
+            .unwrap();
         self_mute(&handle, "fence", only(MediaKindLabel::Audio, true)).await;
 
         let frames = frames_until_mute_of(rx.get_mut("b").unwrap(), "fence").await;
@@ -5982,7 +6052,10 @@ mod tests {
                 DisconnectCause::ConnectionLost,
             )
             .await;
-        handle.participant_leave("host".to_string()).await.unwrap();
+        handle
+            .participant_leave("host".to_string(), "conn-host".to_string())
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert!(
             !task.is_finished(),

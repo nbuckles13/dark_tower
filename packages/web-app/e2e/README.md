@@ -169,7 +169,7 @@ rejection / misrouting / unobservable) automatically.
 | `server-mute.spec.ts`          | **Client STRUCTURAL mute** (restores the proof task 6 removed) | C mutes itself: `expectEgressFlatWhileMuted(C)` holds WHILE the other pairs advance; receivers see `avatar_client_muted` with `data-client-state=client_muted`. Unmute resumes. Compose: B client-mutes, is server-muted, client-unmutes — B's egress STAYS flat (the server mute still withholds the directive) and receivers stay flat, WHILE the other pairs advance.                                                                                                                                                                                                                                                                                                              |
 | `server-mute.spec.ts`          | **Non-host refusal** (@security M2)                            | The `forceHostControls` lever renders the affordance for a non-host; MC answers `FORBIDDEN`; the refused client stays joined (post-join `FORBIDDEN` no longer closes the connection) and B keeps being heard.                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `partial-connectivity.spec.ts` | **S10a** partial connectivity                                  | A on every handler; B and C each block one (the `blockHandlers` lever, by exact match against A's offered list). Connected sets proven first; A hears B and C, B and C each hear A (all layers); B and C see each other with `data-reachability=source_unreachable` from `unreachable_sender_ids`, in no slot, not muted; C's accepted count at B stays zero WHILE A's advances (and vice versa).                                                                                                                                                                                                                                                                                     |
-| `kek-rotation.spec.ts`         | **S6** joiner half                                             | A leave; both remaining clients' bus `kekGeneration` advance to the same generation; `dt_client_media_kek_updates_total{source="kek_update"}` and `dt_client_media_kek_generations_retained_total` each rise by ≥ the remaining-client count (a baseline→delta, not `increase()`, which cannot see a series born in the window); a joiner after the rotation holds that generation and opens every remaining sender's frames at all three layers. Budget from MC's config: grace + W.                                                                                                                                                                                                 |
+| `kek-rotation.spec.ts`         | **S6** joiner half                                             | A leave; both remaining clients' bus `kekGeneration` advance to the same generation; `dt_client_media_kek_updates_total{source="kek_update"}` and `dt_client_media_kek_generations_retained_total` each rise by ≥ the remaining-client count (a baseline→delta, not `increase()`, which cannot see a series born in the window); a joiner after the rotation holds that generation and opens every remaining sender's frames at all three layers. Budget from MC's config: W (the leave removes at once).                                                                                                                                                                                                 |
 
 **The token-only scan now covers telemetry** (`credentialScan.ts`): every
 recorded join window forces a metric export (`flushTelemetry` on the E2E bus)
@@ -237,7 +237,7 @@ events / MC video slot states, [3] each page's drops by reason and last
 | `client-mute-roster.spec.ts`              | R-15                       | Client mute is a ROSTER fact: an observer with 1+1 slots (filled by an earlier decoy; precondition asserted from the oracle and the observer's bus before and after every toggle) shows a participant OUTSIDE its slots with explicit mic/camera state from `existing_participants`, and follows each mic/camera toggle. An AUDIO-ONLY late joiner arrives via `ParticipantJoined` alone (no post-join report) under a positive-controlled DOM recorder (`fixtures.ts:installRosterStateRecorder`): its row is created with mic `live` / camera `not_published` ("camera: not publishing") and never renders anything else — there is no "unknown". |
 | `server-mute-video.spec.ts`               | R-16, R-18, R-15           | The host's per-kind DOM affordance: server video mute ends B's camera (counter flat beside the audio mover), every receiver shows `avatar_server_muted`, B's audio still heard. Server unmute resumes capture and raises the R-18 `alertdialog`, which survives Escape, a click outside and a real re-render (a member leaves); its inline action client-mutes at once. Client-muted, a server mute + unmute resumes nothing and shows no notice. The patched-client ingress-drop half is MH's Rust env-tests'.                                                                                                                                     |
 | `late-joiner-video.spec.ts`               | R-10, R-33                 | A late joiner sees three flowing publishers at three layers; no keyframe interval exists in the deployed profile (non-vacuous parse first); every publisher's keyframes-produced total advances across the join.                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| `kek-rotation-video.spec.ts`              | R-14                       | A leave rotates the KEK (grace + W from MC config, a liveness bound); consecutive windows spanning the rotation each pass all three layers on the remaining pairs (no fall-back, layer 2 advancing). Leaver lockout with video: the client integration test `sdk-core/src/media/lifecycle/__tests__/videoReceiver.test.ts` ("a video LEAVER cannot open post-rotation video").                                                                                                                                                                                                                                                                      |
+| `kek-rotation-video.spec.ts`              | R-14                       | A leave rotates the KEK (W from MC config, a liveness bound); consecutive windows spanning the rotation each pass all three layers on the remaining pairs (no fall-back, layer 2 advancing). Leaver lockout with video: the client integration test `sdk-core/src/media/lifecycle/__tests__/videoReceiver.test.ts` ("a video LEAVER cannot open post-rotation video").                                                                                                                                                                                                                                                                      |
 | `watched-only-video.spec.ts`              | R-8                        | An unwatched camera-mode publisher has no live track, `cameraTrackLive` false and a ZERO video send counter beside its audio mover; a watcher lights it (live track); the last watcher leaving ends the track.                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `video-codec-unavailable.spec.ts`         | R-28 (UI), R-8             | A test-owned init script makes `VideoEncoder.isConfigSupported` say no in ONE context: media start is refused as a whole (fault + error rendered, no mute controls, no `sendTracks`/`sendCounts`/`mediaFrameCounts`); a control context in the same meeting publishes video.                                                                                                                                                                                                                                                                                                                                                                        |
 | `partial-connectivity.spec.ts` (2nd test) | R-33                       | The S10a partition with M=2: unreachable peers only via `unreachable_sender_ids` (oracle-checked), video slots match the oracle, and across one window nothing from the unreachable peer arrives or renders while the slot showing A keeps verifying.                                                                                                                                                                                                                                                                                                                                                                                               |
@@ -273,9 +273,10 @@ fixture-teardown slot, so they also run when the test times out:
      The meeting id comes from the page's own GC join responses
      (`meeting-id-unresolved`), the incarnation from MC's created line
      (`created-never-seen`). Needs `E2E_LOKI_URL` (Layer 7 exports it). A
-     departure may be MC's grace expiry today (docs/TODO.md, "MC classifies
-     the browser SDK's CLEAN disconnect as `server_initiated`"), so this step
-     costs about one disconnect grace;
+     departure is ONLY MC's "Participant left (LeaveRequest)" line: the SDK's
+     `disconnect()` sends a LeaveRequest and MC removes the participant at
+     once, so this step costs about one log-ingest latency; a grace-expiry or
+     clean-close departure (a lost leave) FAILS it;
   3. `mh.sh drain --all --owner <run>` runs, with the leak check;
   4. no GC replica still counts a removed MH as selectable (the
      `gc_fleet::wait_removed_mh_unselectable` twin);
@@ -350,12 +351,15 @@ series is introduced. The bus carries refs and URLs only, never a `media_dial`
 token.
 
 **Wall clock (projected from current config, 2026-11-13).** One leg is the
-sum of: the BEFORE wait (an earlier spec's meeting outliving MC's 30 s
-disconnect grace, then two reads one scrape apart); `mh.sh up` plus its scrape
+sum of: the BEFORE wait (two reads one scrape apart; before the
+meeting-end-safety devloop an earlier spec's meeting could also outlive MC's 30 s
+disconnect grace — a deliberate leave now removes at once); `mh.sh up` plus its scrape
 (about 1 min; PLANNED does it twice); the placement search (expected 1.5
 attempts at m = 3, s = 2, derived maximum 13); the joins and pre-event hearing;
 the kill and in-place restart, or the drain (MH grace 35 s); resumption within
-the ceilings; then the AFTER steps (MC's grace again, the owner drain, and the
+the ceilings; then the AFTER steps (the meeting-end proof — one log-ingest
+latency since the meeting-end-safety devloop, no longer one MC grace — the
+owner drain, and the
 GC removal settle, whose budget is B 30 s + 2 × 5 s + 30 s). That comes to
 about 5–7 min per leg, about 20 min for the three, and about 30 min for the
 whole suite with the measured ~556 s. That is why `BROWSER_E2E_TIMEOUT`
@@ -587,17 +591,19 @@ Building blocks for the N+1 specs; each module header carries the detail.
   video specs measured **~556 s (9.1 min)** on the Kind cluster: the video specs
   ≈ 15 s (`multi-party-see`, `publish-mixes` mixes), ≈ 55 s each
   (`client-mute-video`, `server-mute-video`), **≈ 110 s `kek-rotation-video`**
-  (grace + W, like S6), ≈ 7–20 s the rest. That left the former 600 s default
+  (grace + W, like S6, before the meeting-end-safety devloop made the leave
+  immediate: now W), ≈ 7–20 s the rest. That left the former 600 s default
   no headroom, so `BROWSER_E2E_TIMEOUT` (`scripts/layer7.sh`) became **1500 s**
   (the measured suite under 40 %), restated in `devloop-validation.md` §6.7 and
   pinned by `scripts/layer7.test.sh`. Re-measure before changing it.
 - **Wall-clock budget (story 2)** — measured on the Layer-7 Kind cluster (story 2 task 15,
   2026-09-30), per test: S1 `multi-party-hear` ≈ 13 s; S2 `over-subscription` ≈ 8 s;
   S3 `server-mute` ≈ 16 s + client structural mute ≈ 11 s + non-host refusal ≈ 6 s;
-  S10a `partial-connectivity` ≈ 7 s; **S6 `kek-rotation` ≈ 100 s** (it waits out
-  MC's disconnect grace plus the rotation debounce W, both read from MC's config —
-  see the spec header); `solo-participant` ≈ 5 s; the story-1 specs ≈ 60 s
-  (dominated by the leave/rejoin test's grace path). **Whole suite ≈ 3.5–4 min**,
+  S10a `partial-connectivity` ≈ 7 s; **S6 `kek-rotation` ≈ 100 s** at the time
+  (it waited out MC's disconnect grace plus the rotation debounce W; since the
+  meeting-end-safety devloop the leave is immediate and S6 waits W alone — see
+  the spec header); `solo-participant` ≈ 5 s; the story-1 specs ≈ 60 s at the
+  time (dominated by the leave/rejoin test's then grace path). **Whole suite ≈ 3.5–4 min**,
   including the dev-server start and global setup, against the suite-wide
   `BROWSER_E2E_TIMEOUT` (`scripts/layer7.sh`, `DEVLOOP_BROWSER_E2E_TIMEOUT`) —
   under 40 % of it at the time (story 3 C-C1 raised it; see above). **Why the numbers
@@ -605,7 +611,7 @@ Building blocks for the N+1 specs; each module header carries the detail.
   emits `FAIL browser-e2e-failed` — the _same_ terminal status as a genuine
   assertion failure, in the implementer lane — so a timeout presents as a diff
   bug and sends triage hunting a defect that does not exist. S6 scales with
-  `MC_KEK_ROTATION_DEBOUNCE_SECONDS`: raising W (or the grace) is a wall-clock
+  `MC_KEK_ROTATION_DEBOUNCE_SECONDS`: raising W is a wall-clock
   decision for this suite. If headroom gets tight the fix is a deliberate
   `DEVLOOP_BROWSER_E2E_TIMEOUT` change, not a discovery at 3am.
 - **Cohort registration wall clock**: `global-setup.ts` runs N+1 full sign-up
@@ -616,22 +622,18 @@ Building blocks for the N+1 specs; each module header carries the detail.
 - **Peak concurrency**: at most `cohortSize(SUITE_AUDIO_RECEIVE_SLOTS)` = 4 browsing
   contexts at once (S1, S2, S3), each left gracefully and closed in a `finally`
   before the next test opens its own (`e2e/cohortContexts.ts`) — so peaks never
-  stack, and a leaver's MH connections (so its edges) drop at once. RESIDUAL:
-  MC today classifies the SDK's clean close as `server_initiated` and holds the
-  participant through its 30 s disconnect grace before the roster removal (a
-  meeting-controller follow-up in `docs/TODO.md`), so a previous test's
-  participant can outlive its test on MC; the S1 diagnostic's budget verdict is
-  the backstop if that ever reaches MH admission.
+  stack, and a leaver's MH connections (so its edges) drop at once. The leave
+  waits for the SDK's terminal `disconnected` state (MC acknowledged the
+  LeaveRequest) before the context closes, and MC removes the participant from
+  its roster at once.
 - **`retries: 0`** (ADR-0028): a failure is real. Fix it or delete the test —
   never mask with retries.
 - **Timeouts**: 120s/test ceiling; assertion-meaningful waits are tighter (5s
   roster propagation; 60s Prometheus budget for the join-side counter matching
-  the Rust Scenario 7 helper; the departure-side leave counter uses a wider ~90s
-  ceiling — a leave's worst case includes MC's disconnect grace path, so the
-  budget is derived from `MC_QUIC_MAX_IDLE_TIMEOUT + MC_DISCONNECT_GRACE_PERIOD +
-grace-check + scrape SLA`; see `mcMetrics.ts` and
-  `docs/observability/metrics/mc-service.md`. The leave/rejoin spec drives a
-  clean close, so in practice it settles in ~1 scrape interval).
+  the Rust Scenario 7 helper; the departure-side leave counter uses the same 60s scrape-SLA budget,
+  because the leave/rejoin spec first PROVES MC acknowledged the LeaveRequest
+  (`waitForLeaveAcknowledged`; a lost leave fails there, loudly) — so there is
+  no grace path to budget for; see `mcMetrics.ts`).
 
 ## Artifacts & triage
 

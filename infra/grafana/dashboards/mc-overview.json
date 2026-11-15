@@ -2436,7 +2436,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "NotifyMeetingEnded calls to GC - MC telling GC a meeting ENDED (emptied or closed) after its handlers were released (ADR-0010 \u00a73). Coarse status (success | error), like GC Heartbeat Status. Sent AT MOST ONCE for anything GC may have processed (retried only when the request provably never left MC), so an error is final for that meeting: GC keeps reusing the ended meeting's assignment and every join to that meeting id gets meeting_not_found from MC until MC restarts. Alert: MCNotifyMeetingEndedFailing.",
+      "description": "NotifyMeetingEnded attempts to GC - MC telling GC that the incarnation it held (assignment_id) ENDED, after its handlers were released (ADR-0010 \u00a73). outcome = acked (GC answered ENDED or NOT_CURRENT: done) | retried (this attempt failed; the notify stays pending) | rejected (GC refused it as invalid or answered with no outcome: a defect, never retried). The notify is fenced by controller_id + assignment_id, so MC retries it until GC answers; retried measures GC flakiness, not user impact. The user-visible symptom is the oldest-pending age (Notify backlog panel). Alerts: MCNotifyMeetingEndedRejected, MCNotifyMeetingEndedStuck.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2515,13 +2515,117 @@
             "uid": "$datasource"
           },
           "editorMode": "code",
-          "expr": "sum by (status) (increase(mc_gc_notify_meeting_ended_total[$__rate_interval]))",
-          "legendFormat": "notify-{{status}}",
+          "expr": "sum by (outcome) (increase(mc_gc_notify_meeting_ended_total[$__rate_interval]))",
+          "legendFormat": "notify-{{outcome}}",
           "range": true,
           "refId": "A"
         }
       ],
       "title": "GC Meeting-Ended Notifications",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Meeting-ended notifications MC holds unanswered by GC: pending (count) and the AGE of the oldest. While one is pending, GC still routes joins for that meeting id to this MC, which no longer holds it (meeting_not_found). The count reads > 0 under routine churn (a notify milliseconds into a successful send); the oldest-pending AGE is the stuck signal (MCNotifyMeetingEndedStuck: > 120 s). Both read 0 when nothing is pending.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 104
+      },
+      "id": 190,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max(mc_gc_notify_meeting_ended_pending)",
+          "legendFormat": "pending",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max(mc_gc_notify_meeting_ended_oldest_pending_age_seconds)",
+          "legendFormat": "oldest pending age (s)",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "GC Meeting-Ended Notify Backlog",
       "type": "timeseries"
     },
     {
@@ -2715,7 +2819,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "CONFIG ECHO of MC_MEETING_JOIN_WINDOW_SECONDS as the meeting actors enforce it: a meeting no participant joins within this long of its creation ends (cause=empty, reason=join_window_expired). Default derived from the meeting-token lifetime (see mc-service.md).",
+      "description": "CONFIG ECHO of MC_MEETING_JOIN_WINDOW_SECONDS as the meeting actors enforce it: a meeting no participant joins within this long of its creation ends (cause=empty, reason=join_window_expired). REQUIRED (no fallback); bounded by a floor of 5 s and a ceiling derived from the meeting-token lifetime (see mc-service.md).",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2840,7 +2944,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 104
+        "y": 112
       },
       "id": 28,
       "panels": [],
@@ -2922,7 +3026,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 105
+        "y": 113
       },
       "id": 29,
       "options": {
@@ -3015,7 +3119,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 105
+        "y": 113
       },
       "id": 30,
       "options": {
@@ -3130,7 +3234,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 105
+        "y": 113
       },
       "id": 31,
       "options": {
@@ -3254,7 +3358,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 113
+        "y": 121
       },
       "id": 32,
       "options": {
@@ -3363,7 +3467,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 113
+        "y": 121
       },
       "id": 33,
       "options": {
@@ -3456,7 +3560,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 121
+        "y": 129
       },
       "id": 53,
       "options": {
@@ -3549,7 +3653,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 121
+        "y": 129
       },
       "id": 52,
       "options": {
@@ -3642,7 +3746,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 129
+        "y": 137
       },
       "id": 54,
       "options": {
@@ -3682,7 +3786,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 137
+        "y": 145
       },
       "id": 41,
       "panels": [],
@@ -3764,7 +3868,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 138
+        "y": 146
       },
       "id": 42,
       "options": {
@@ -3880,7 +3984,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 138
+        "y": 146
       },
       "id": 43,
       "options": {
@@ -3995,7 +4099,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 146
+        "y": 154
       },
       "id": 44,
       "options": {
@@ -4092,7 +4196,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 154
+        "y": 162
       },
       "id": 46,
       "options": {
@@ -4185,7 +4289,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 162
+        "y": 170
       },
       "id": 47,
       "options": {
@@ -4278,7 +4382,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 162
+        "y": 170
       },
       "id": 48,
       "options": {
@@ -4371,7 +4475,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 170
+        "y": 178
       },
       "id": 49,
       "options": {
@@ -4410,7 +4514,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Transport disconnects by transport-authenticated cause (task #64). client_closed = clean close (immediate removal); connection_lost = idle-timeout/abrupt loss (grace kept for reconnection); server_initiated = local close. connection_lost rising while leaves{timeout} stays flat = healthy reconnects; both rising together = involuntary-departure incident.",
+      "description": "Transport disconnects by transport-authenticated cause (task #64). client_closed = clean close (immediate removal); connection_lost = idle-timeout/abrupt loss (grace kept for reconnection); server_initiated = local close (shutdown/drain) of a participant still rostered. A deliberate leave (LeaveRequest) removes the participant before its transport ends and emits NO disconnect (it shows as leaves{voluntary}). connection_lost rising while leaves{timeout} stays flat = healthy reconnects; both rising together = involuntary-departure incident.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -4464,7 +4568,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 170
+        "y": 178
       },
       "id": 50,
       "options": {
@@ -4557,7 +4661,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 178
+        "y": 186
       },
       "id": 51,
       "options": {
@@ -4650,7 +4754,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 186
+        "y": 194
       },
       "id": 182,
       "options": {
@@ -4743,7 +4847,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 186
+        "y": 194
       },
       "id": 183,
       "options": {
@@ -4836,7 +4940,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 194
+        "y": 202
       },
       "id": 184,
       "options": {

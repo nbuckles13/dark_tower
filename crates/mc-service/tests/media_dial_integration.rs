@@ -458,7 +458,10 @@ async fn a_departed_participant_gets_no_refresh() {
     let meeting = spawn_meeting("dial-depart", &handlers);
     let mut a = join(&meeting, "a", &mh).await;
     let mut b = join(&meeting, "b", &mh).await;
-    meeting.participant_leave("a".into()).await.unwrap();
+    meeting
+        .participant_leave("a".into(), "conn-a".into())
+        .await
+        .unwrap();
     run_ready().await;
     let _ = test_common::drain_frames(&mut a.rx);
     let _ = test_common::drain_frames(&mut b.rx);

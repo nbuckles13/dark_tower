@@ -397,7 +397,7 @@ curl -i -X POST http://localhost:8080/api/v1/telemetry/v1/metrics \
 rm -f /tmp/oversize-otlp.bin
 ```
 
-Expected: `HTTP/1.1 413 Payload Too Large` with body code `PAYLOAD_TOO_LARGE`. The size check (`body.len() > telemetry_proxy_max_bytes`; default `DEFAULT_TELEMETRY_PROXY_MAX_BYTES` = 262144) runs FIRST — before content-type and before OTLP decode — so the oversize body is rejected regardless of content. A body above 512 KiB (2×) is instead rejected by the route `DefaultBodyLimit` layer (still 413, but no `rejected_size` metric).
+Expected: `HTTP/1.1 413 Payload Too Large` with body code `PAYLOAD_TOO_LARGE`. The size check (`body.len() > telemetry_proxy_max_bytes`; `TELEMETRY_PROXY_MAX_BYTES` in config.env, reference 262144) runs FIRST — before content-type and before OTLP decode — so the oversize body is rejected regardless of content. A body above 512 KiB (2×) is instead rejected by the route `DefaultBodyLimit` layer (still 413, but no `rejected_size` metric).
 
 **(f) Telemetry proxy — per-user RATE-LIMIT burst → 202s then 429s**
 
@@ -420,7 +420,7 @@ for i in $(seq 1 70); do
 done | sort | uniq -c
 ```
 
-Expected: a mix of `202` then `429` — roughly the first ~60 return **202** and the remainder return **429** (`RATE_LIMIT_EXCEEDED`). The per-user limiter is a `governor` GCRA quota of `DEFAULT_TELEMETRY_PROXY_RATE_LIMIT_PER_MINUTE` = 60 requests/minute keyed on JWT `sub`, so burst capacity is 60 and cells replenish at ~1/second — the exact 202/429 split depends on how long the loop takes. The 429 rejection (`status="rejected_rate"`, and `gc_telemetry_rate_limited_total{reason="per_user"}`) fires before OTLP decode/forward.
+Expected: a mix of `202` then `429` — roughly the first ~60 return **202** and the remainder return **429** (`RATE_LIMIT_EXCEEDED`). The per-user limiter is a `governor` GCRA quota of `TELEMETRY_PROXY_RATE_LIMIT_PER_MINUTE` (config.env, reference 60) requests/minute keyed on JWT `sub`, so burst capacity is 60 and cells replenish at ~1/second — the exact 202/429 split depends on how long the loop takes. The 429 rejection (`status="rejected_rate"`, and `gc_telemetry_rate_limited_total{reason="per_user"}`) fires before OTLP decode/forward.
 
 ### 7. Monitor Metrics
 
@@ -527,6 +527,16 @@ back past MC-C.** An older GC sends 0, so every MC (re)registration fails fleet-
 meeting gets an MC. An older GC also answers `AcquireMediaHandler` with `UNIMPLEMENTED`. Before
 MC-C is deployed, GC rollback past GC-3 is safe (the field and rpc are additive and unused).
 
+**Rollback floor: incarnation fence (2026-11-15 meeting-end-safety; migration
+`20261115000001_meeting_assignment_id.sql`).** GC, MC and the proto changed together: MC refuses an
+`AssignMeetingWithMh` without a valid `assignment_id`, and GC refuses a `NotifyMeetingEnded` without
+`controller_id` + `assignment_id` (and answers with `outcome`, not `acknowledged`). **Roll GC and MC
+forward and back TOGETHER, never one across this change without the other.** An older GC sends no
+`assignment_id`, so every new meeting assignment is refused fleet-wide; an older MC's notify is
+refused as `INVALID_ARGUMENT` (and an older MC reads the new response as "not acknowledged"). The
+schema half is below (§Database Rollback Considerations): the new column is `NOT NULL` with no
+default, so an older GC image cannot insert assignments until the column is relaxed.
+
 **Step 1: Identify previous version**
 
 ```bash
@@ -613,6 +623,15 @@ psql $DATABASE_URL
 3. Or manually execute DOWN migration
 4. THEN rollback code
 
+**`20261115000001_meeting_assignment_id.sql` is backward-INCOMPATIBLE for an older GC image** (the
+`assignment_id UUID NOT NULL` column has no default, so a pre-fence GC's `INSERT` fails with
+SQLSTATE 23502 and no new meeting can be assigned). Migrations roll FORWARD only (sqlx keeps no
+down-migrations here). To run an older GC image, first apply a follow-up migration that relaxes the
+column — `ALTER TABLE meeting_assignments ALTER COLUMN assignment_id SET DEFAULT gen_random_uuid();`
+(or `DROP COLUMN assignment_id`) — and only THEN roll the GC (and, per the rollback floor above, MC)
+image back. Re-rolling forward to the fence: drop that default again in a further migration, so a
+writer that forgets the id fails loudly instead of minting one no MC knows.
+
 ---
 
 ## Configuration Reference
@@ -623,11 +642,27 @@ psql $DATABASE_URL
 |----------|----------|-------------|---------|---------|
 | `DATABASE_URL` | **Yes** | PostgreSQL connection string with TLS | None | `postgresql://gc_user:password@postgres.dark-tower.svc.cluster.local:5432/dark_tower?sslmode=verify-full` |
 | `AC_JWKS_URL` | **Yes** | Authentication Controller JWKS endpoint | None | `http://ac-service.dark-tower.svc.cluster.local:8082/.well-known/jwks.json` |
-| `AC_TOKEN_URL` | **Yes** | Authentication Controller token endpoint | None | `http://ac-service.dark-tower.svc.cluster.local:8082/api/v1/auth/service/token` |
+| `AC_INTERNAL_URL` | **Yes** | Authentication Controller base URL (service token + meeting/guest token requests) | None | `http://ac-service.dark-tower:8082` |
 | `GC_CLIENT_ID` | **Yes** | OAuth client ID for GC service | None | `gc-service` |
 | `GC_CLIENT_SECRET` | **Yes** | OAuth client secret for GC service | None | Secret value |
-| `BIND_ADDRESS` | No | TCP bind address for HTTP server | `0.0.0.0:8080` | `0.0.0.0:8080` |
-| `JWT_CLOCK_SKEW_SECONDS` | No | Allowed clock skew for JWT validation | `60` | `60` |
+| `BIND_ADDRESS` | **Yes** | TCP bind address for the HTTP server | Reference `0.0.0.0:8080` (config.env) | `0.0.0.0:8080` |
+| `GC_GRPC_BIND_ADDRESS` | **Yes** | TCP bind address for the gRPC server (MC/MH registration, heartbeats, `NotifyMeetingEnded`) | Reference `0.0.0.0:50051` | `0.0.0.0:50051` |
+| `GC_REGION` | **Yes** | This GC's deployment region (MC/MH placement, MH availability gauge) | Reference `local` (Kind) | `us-east-1` |
+| `JWT_CLOCK_SKEW_SECONDS` | **Yes** | Allowed clock skew for JWT validation, seconds; range [1, 600] | Reference `300` | `300` |
+| `RATE_LIMIT_RPM` | **Yes** | Per-client HTTP API rate limit, requests/minute; > 0 | Reference `100` | `100` |
+| `MC_STALENESS_THRESHOLD_SECONDS` | **Yes** | THE MC liveness threshold: the health checker marks MCs stale with it, and join reuse, join failover and the assignment-cleanup backstop all treat an MC whose heartbeat is younger as ALIVE, whatever its `health_status` (ADR-0010 §3). Must exceed the 10 s fast-heartbeat interval GC pushes to MCs, else startup fails. Raising it delays failover of a dead MC's meetings; lowering it toward the heartbeat interval risks failing over meetings of a live MC (a split meeting). | Reference `30` | `30` |
+| `GC_ASSIGN_COMMIT_BUDGET_MS` | **Yes** | Accept->commit budget: how long after GC sends `AssignMeetingWithMh` the assignment row may still commit; past it no row is written and the next MC is tried. Range [1, 2500] (half of MC's shortest join window, `common::meeting_lifecycle::MIN_MEETING_JOIN_WINDOW`). A breach the budget cannot stop shows as `gc_meeting_end_notifications_total{outcome="fenced"}` (`gc-incident-response.md`, Scenario 3). | Reference `2000` | `2000` |
+| `GC_CLEANUP_INTERVAL_SECONDS` | **Yes** | Assignment cleanup job interval; >= 1 | Reference `3600` | `3600` |
+| `GC_DRAIN_SECONDS` | **Yes** | Seconds GC keeps serving in-flight requests after SIGTERM; `0..=30`, must stay below `terminationGracePeriodSeconds` (35; a gc-test-utils test pins both). Missing, unparseable or out of range refuses boot (it used to be read with `unwrap_or(30)` and supplied by no manifest) | Reference `30` | `30` |
+| `GC_INACTIVITY_HOURS` | **Yes** | Backstop age floor: a row is ended only when its MC is no longer alive AND the row is older than this; >= 1 | Reference `1` | `1` |
+| `GC_RETENTION_DAYS` | **Yes** | Ended assignment rows are hard-deleted after this; >= 1 | Reference `7` | `7` |
+| `OTEL_COLLECTOR_ENDPOINT` | **Yes** | Telemetry-proxy forward base (bare `scheme://host:port`); an explicitly EMPTY value disables the proxy (503) | Reference `http://otel-collector.dark-tower:4318` | |
+| `TELEMETRY_PROXY_MAX_BYTES` | **Yes** | Telemetry proxy payload cap, bytes; > 0. env-test 31 reads the deployed value | Reference `262144` | `262144` |
+| `TELEMETRY_PROXY_RATE_LIMIT_PER_MINUTE` | **Yes** | Per-user (per pod) telemetry limit; > 0. env-test 31 reads the deployed value | Reference `60` | `60` |
+| `OTEL_SAMPLE_RATE` | **Yes** | Head-sampling ratio [0.0, 1.0] (validated by `init_otel` when OTel is enabled) | Reference `1.0` | `1.0` |
+| `DEPLOYMENT_ENVIRONMENT` | **Yes** | `deployment.environment` OTel resource attribute | Reference `development` | `production` |
+| `OTEL_ENABLED` / `OTLP_ENDPOINT` | No (modes) | GC's own span export; unset = off | `false` / empty | |
+| `CORS_ALLOWED_ORIGINS` | No (mode) | Browser CORS allowlist; unset or empty = fail-closed (no origin allowed). An entry that is not a valid header value fails startup naming it | empty | `http://localhost:5173` |
 | `RUST_LOG` | No | Logging level | `info` | `info,gc_service=debug` |
 | `GC_MH_LOAD_REPORT_INTERVAL_MS` | **Yes** | Load-report interval (ms) GC pushes to every MH in `RegisterMHResponse`; range [1000, 60000]. The MH staleness bound is derived from it: B = `GC_MH_STALENESS_MULTIPLIER` × this. Published as `gc_mh_load_report_interval_seconds` (GC's configured value, not the cadence running MHs use). **Not a one-step change**: an MH adopts the interval only when it registers, but a new B applies fleet-wide as soon as GC rolls, and every MH's live cadence must stay well below every GC replica's B. To lower it: roll GC, then roll the MH fleet so every MH re-registers and adopts the new interval (each new pod is a new incarnation): replace each MH with `./infra/kind/scripts/mh.sh up --owner <owner>` then `./infra/kind/scripts/mh.sh drain <k> --owner <owner>` (`<owner>` = the slot's owner in `mh.sh list`, normally `baseline`), one at a time (MH is a per-slot pool; never `rollout restart` an `mh-s<k>`). Rolling the MH fleet drains each replaced MH and MC moves its meetings (a small blip per meeting; only what is not moved by the drain deadline is shed), so schedule it like any MH roll ([`mh-deployment.md` §Rollout With Media Flowing](mh-deployment.md#rollout-with-media-flowing)); `./infra/kind/scripts/mh.sh upgrade` does not help here (it replaces only revision-stale MHs). Do the lowering in one step only if k × new interval stays comfortably above the old interval; otherwise raise the multiplier first, in a separate rollout. To raise it: keep the new interval well below the current B (k × old interval), or raise the multiplier first. **Alert derivation that cites it:** `GCMhRegistrationPingPong` (`gc-alerts.yaml`; `gc-incident-response.md` Scenario 14; holds while the interval is <= ~30 s, checked by env-test 33) assumes two live MHs on one address evict each other at this cadence (~2 supersedes per 10 s at the default, ~120 per 10 m against its `superseded >= 20` floor), and the `address_conflict` warning's `for:` is anchored to B; re-derive both if this value or k changes. | Reference `10000` (config.env) | `10000` |
 | `GC_MH_STALENESS_MULTIPLIER` | **Yes** | k in B = k × `GC_MH_LOAD_REPORT_INTERVAL_MS`, the ONE MH freshness bound (selection, stale sweep incl. draining, `gc_mh_available`); range [2, 10]. Published as `gc_mh_staleness_threshold_seconds`. Takes effect when GC rolls. Raising k is always safe; lowering k shrinks B immediately and follows the same cadence-below-every-replica's-B rule as the interval. | Reference `3` | `3` |
@@ -647,6 +682,8 @@ generations are never pruned, so a label-selector listing would mix stale and li
 kubectl get cm -n dark-tower "$(kubectl get deploy gc-service -n dark-tower -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="GC_MH_WT_ALLOWED_HOSTS")].valueFrom.configMapKeyRef.name}')" -o yaml | grep GC_MH_
 ```
 
+Every key marked **Yes** has no compiled-in default (2026-11-15: no setting
+silently substitutes a value); a missing one fails startup as in the table below.
 The `GC_MH_*` registry and allowlist keys have no compiled-in default. The five registry keys' reference
 values live in `infra/services/gc-service/config.env`; of the five allowlist keys only
 `GC_MH_GRPC_ALLOWED_SCHEMES` does, and the four topology keys are EMPTY there by design (a converge that skips
@@ -661,7 +698,7 @@ rendered allowlist keys, the render input (kind-config / helper port table / MH 
 | Cause | Signal | Where the answer is |
 |---|---|---|
 | Key absent from the `gc-service-config` ConfigMap (the Deployment's `configMapKeyRef` is hard) | `CreateContainerConfigError`: no container ever runs | `kubectl describe pod -n dark-tower -l app=gc-service` names the missing key. `kubectl logs` is **empty** |
-| Key present but out of range, non-numeric, or retention ≤ the staleness bound; or an allowlist key EMPTY (render skipped) or malformed | `CrashLoopBackOff` | `kubectl logs --previous -n dark-tower -l app=gc-service --tail=-1`: the `ConfigError` names the key |
+| Key present but out of range, non-numeric, or retention ≤ the staleness bound; or an allowlist key EMPTY (render skipped) or malformed; or a malformed `CORS_ALLOWED_ORIGINS` entry | `CrashLoopBackOff` | `kubectl logs --previous -n dark-tower -l app=gc-service --tail=-1`: the `ConfigError` names the key |
 
 The shared explanation of why the `kubectl logs` reflex misleads here is `mc-deployment.md`
 [§Config-failure triage](mc-deployment.md#config-failure-triage-three-signals-and-kubectl-logs-is-wrong-for-all-three).

@@ -112,7 +112,11 @@ async fn seed_participant(
     participant_id: &str,
 ) -> u32 {
     controller
-        .create_meeting(meeting_id.to_string(), test_common::default_handler_set())
+        .create_meeting(
+            meeting_id.to_string(),
+            ::common::meeting_lifecycle::AssignmentId::new_v4(),
+            test_common::default_handler_set(),
+        )
         .await
         .expect("create_meeting should succeed");
 
@@ -474,6 +478,7 @@ async fn one_user_with_two_participants_is_ambiguous_and_fails_closed() {
     controller
         .create_meeting(
             "meeting-dual".to_string(),
+            ::common::meeting_lifecycle::AssignmentId::new_v4(),
             test_common::default_handler_set(),
         )
         .await

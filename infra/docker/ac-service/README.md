@@ -59,14 +59,27 @@ docker build -f infra/docker/ac-service/Dockerfile -t ac-service:latest .
 ```bash
 DATABASE_URL=postgresql://user:pass@host:5432/dbname
 AC_MASTER_KEY=<base64-encoded-32-byte-key>  # For key encryption at rest
+AC_HASH_SECRET=<base64-encoded->=32-byte-key>  # Correlation HMAC key (distinct from AC_MASTER_KEY)
+AC_CLUSTER_NAME=us-west                      # Signing-key kid prefix; ^[a-z0-9][a-z0-9-]{0,62}$
+BIND_ADDRESS=0.0.0.0:8082
+AC_DRAIN_SECONDS=30                          # 0..=30
+JWT_CLOCK_SKEW_SECONDS=300
+BCRYPT_COST=12
+AC_RATE_LIMIT_WINDOW_MINUTES=15
+AC_RATE_LIMIT_MAX_ATTEMPTS=5
+AC_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES=60
+AC_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS=5
+OTEL_SAMPLE_RATE=1.0
+DEPLOYMENT_ENVIRONMENT=development
 ```
+Every one of these is REQUIRED (no code defaults since 2026-11-15): a missing key
+refuses boot naming it. `infra/services/ac-service/config.env` is the complete set.
 
 ### Optional Environment Variables
 ```bash
-BIND_ADDRESS=0.0.0.0:8082              # Default bind address
 RUST_LOG=info                           # Logging level (debug, info, warn, error)
-CLUSTER_NAME=us                         # Cluster identifier (default: us)
-OTLP_ENDPOINT=http://otel:4317         # OpenTelemetry endpoint
+OTEL_ENABLED=false                      # Telemetry export switch (unset = off)
+OTLP_ENDPOINT=http://otel:4317         # OpenTelemetry endpoint (read only when enabled)
 ```
 
 ### Generating AC_MASTER_KEY
@@ -84,7 +97,8 @@ docker run -d \
   -p 8082:8082 \
   -e DATABASE_URL=postgresql://postgres:postgres@db:5432/dark_tower \
   -e AC_MASTER_KEY=$(openssl rand -base64 32) \
-  -e CLUSTER_NAME=us-west \
+  -e AC_HASH_SECRET=$(openssl rand -base64 32) \
+  --env-file infra/services/ac-service/config.env \
   dark-tower/ac-service:latest
 ```
 
@@ -98,8 +112,10 @@ services:
     environment:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/dark_tower
       AC_MASTER_KEY: ${AC_MASTER_KEY}
-      CLUSTER_NAME: us-west
+      AC_HASH_SECRET: ${AC_HASH_SECRET}
       RUST_LOG: info
+    env_file:
+      - infra/services/ac-service/config.env  # every required behaviour key
     depends_on:
       - postgres
 ```

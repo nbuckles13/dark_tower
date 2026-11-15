@@ -9,7 +9,6 @@
 //! (`MeetingEndCause::Empty(EmptyReason::JoinWindowExpired)`).
 
 use super::join_park::SDK_JOIN_DEADLINE;
-use crate::config::DEFAULT_DISCONNECT_GRACE_PERIOD_SECONDS;
 use common::jwt::JWT_EXP_LEEWAY_SECONDS;
 use common::meeting_token::MEETING_TOKEN_MAX_TTL_SECONDS;
 use std::time::Duration;
@@ -20,7 +19,7 @@ use std::time::Duration;
 /// does NOT ride this tick — it is an exact deadline.
 pub const LIFETIME_TICK: Duration = Duration::from_secs(5);
 
-/// The DERIVED default join window, and its ceiling:
+/// The DERIVED join-window CEILING (never a value MC runs: the key is required):
 /// `MEETING_TOKEN_MAX_TTL_SECONDS + JWT_EXP_LEEWAY_SECONDS + SDK_JOIN_DEADLINE`.
 ///
 /// Why: GC assigns the meeting (creating this actor) and then mints the
@@ -29,7 +28,7 @@ pub const LIFETIME_TICK: Duration = Duration::from_secs(5);
 /// deadline to be admitted (the few ms between assignment and mint fall inside
 /// that term). Past this, no credential issued at assignment can still produce
 /// a participant, so a still-empty meeting can only be a leak — and a window
-/// configured longer only re-opens the leak, so this is also the maximum.
+/// configured longer only re-opens the leak, so this is the maximum.
 ///
 /// Assumes AC's and MC's wall clocks are synced: `exp` is set on AC's clock
 /// and checked on MC's. If AC runs ahead, a token can outlive the window by
@@ -39,7 +38,9 @@ pub const MAX_JOIN_WINDOW: Duration =
     Duration::from_secs(MEETING_TOKEN_MAX_TTL_SECONDS as u64 + JWT_EXP_LEEWAY_SECONDS)
         .saturating_add(SDK_JOIN_DEADLINE);
 
-/// The smallest legal join window: [`LIFETIME_TICK`].
+/// The smallest legal join window: the shared floor
+/// `common::meeting_lifecycle::MIN_MEETING_JOIN_WINDOW` (GC bounds its
+/// accept->commit budget under it), equal to [`LIFETIME_TICK`] (asserted).
 ///
 /// Re-derived 2026-11-13 (operator direction: short configured windows in
 /// production and Kind; the previous floor `FIRST_JOIN_PARK_DEADLINE + SDK_JOIN_DEADLINE` = 23 s
@@ -72,7 +73,11 @@ pub const MAX_JOIN_WINDOW: Duration =
 /// end, and a 0 / sub-tick window is the degenerate "end every meeting at
 /// once" configuration. [`LIFETIME_TICK`] is therefore the floor; it is also
 /// above any normal GC-join → admission latency.
-pub const MIN_JOIN_WINDOW: Duration = LIFETIME_TICK;
+pub const MIN_JOIN_WINDOW: Duration = common::meeting_lifecycle::MIN_MEETING_JOIN_WINDOW;
+
+// The floor IS the observer tolerance: if the shared floor ever moves, the
+// tick (and this reasoning) must move with it.
+const _: () = assert!(MIN_JOIN_WINDOW.as_secs() == LIFETIME_TICK.as_secs());
 
 /// The two lifetime timers a meeting actor enforces. Built ONCE from config
 /// (`Config::meeting_timers`) and handed to every meeting actor; the config
@@ -87,12 +92,16 @@ pub struct MeetingTimers {
     pub disconnect_grace: Duration,
 }
 
-impl Default for MeetingTimers {
-    /// The same defaults `Config` applies to unset keys.
-    fn default() -> Self {
+impl MeetingTimers {
+    /// Fixed values for tests that do not exercise the timers (the window at
+    /// its ceiling, so it never fires mid-test; the base config's 30 s grace).
+    /// NOT a default: production builds timers only from required config.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[must_use]
+    pub fn for_tests() -> Self {
         Self {
             join_window: MAX_JOIN_WINDOW,
-            disconnect_grace: Duration::from_secs(DEFAULT_DISCONNECT_GRACE_PERIOD_SECONDS),
+            disconnect_grace: Duration::from_secs(30),
         }
     }
 }
@@ -114,7 +123,6 @@ mod tests {
         assert_eq!(MAX_JOIN_WINDOW, Duration::from_secs(975));
         assert_eq!(MIN_JOIN_WINDOW, LIFETIME_TICK);
         assert_eq!(MIN_JOIN_WINDOW, Duration::from_secs(5));
-        assert_eq!(MeetingTimers::default().join_window, MAX_JOIN_WINDOW);
     }
 
     const MC_ALERT_RULES: &str =

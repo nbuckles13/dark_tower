@@ -36,12 +36,13 @@
 //     since the pre-leave baseline, which says which side lost the increment.
 //
 // BUDGET: from MC's own configuration — W (`MC_KEK_ROTATION_DEBOUNCE_SECONDS`,
-// infra/services/mc-service/config.env) plus the disconnect grace (MC's config or
-// its code default). The leave is graceful, but MC today classifies the SDK's
-// clean disconnect as `server_initiated` and holds the participant through its
-// grace first (recorded in main.md), so the budget covers grace + W. If this ever
-// times out, compare `mc_meeting_kek_rotation_window_seconds` on the running MC
-// with the value read here. A liveness bound, never a latency gate.
+// infra/services/mc-service/config.env). The SDK's disconnect() sends a
+// LeaveRequest and MC removes the leaver AT ONCE (no disconnect grace), so the
+// leave rotation's debounce starts at the leave and the budget is W (+ the poll
+// margin). A timeout with the rotation landing about one grace late means the
+// LeaveRequest was lost (MC fell back to its grace); otherwise compare
+// `mc_meeting_kek_rotation_window_seconds` on the running MC with the value read
+// here. A liveness bound, never a latency gate.
 
 import { expect, test } from 'playwright/test';
 import {
@@ -64,7 +65,7 @@ import {
 import { expectHearsAtAllLayers } from './receiveEvidence.js';
 
 const TIMINGS = mcRotationBudget();
-/** Grace + W, the worst case from the leave to the rotation push. */
+/** W, the worst case from the (immediate) leave removal to the rotation push. */
 const ROTATION_BUDGET_MS = TIMINGS.budgetMs;
 /** Margin for joins, the post-rotation joiner and the Prometheus read-back. */
 const SCENARIO_MARGIN_MS = 150_000;
@@ -107,8 +108,8 @@ test.describe('story 2 S6 (joiner half): KEK rotation on leave', () => {
           },
           {
             message:
-              `the remaining clients did not both install a newer KEK generation within grace ` +
-              `(${TIMINGS.graceSeconds}s) + W (${TIMINGS.debounceSeconds}s) of the leave`,
+              `the remaining clients did not both install a newer KEK generation within ` +
+              `W (${TIMINGS.debounceSeconds}s) of the leave (+ the poll margin)`,
             timeout: ROTATION_BUDGET_MS + ROTATION_POLL_MARGIN_MS,
             intervals: [1_000],
           },

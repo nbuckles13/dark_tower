@@ -63,6 +63,7 @@ async fn a_grant_declared_while_registering_logs_reason_declared() {
     mh.hold_handler("mh-3");
     c.create_meeting(
         "m-log".to_string(),
+        ::common::meeting_lifecycle::AssignmentId::new_v4(),
         handler_set(&[mh_handler("mh-1"), mh_handler("mh-2")]),
     )
     .await

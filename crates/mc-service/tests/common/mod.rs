@@ -783,7 +783,7 @@ pub async fn build_test_stack_with_notifier(
     build_test_stack_with_timers(
         keypair_label,
         meeting_ended,
-        mc_service::actors::MeetingTimers::default(),
+        mc_service::actors::MeetingTimers::for_tests(),
     )
     .await
 }
@@ -850,19 +850,22 @@ pub fn mh_handler(mh_id: &str) -> MhEndpointInfo {
 /// Create `meeting_id` on the controller actor with `handlers` as GC's
 /// hand-off (ADR-0039 §3: the set is installed at creation), and record it.
 ///
-/// For single-handler scenarios prefer [`seed_meeting_with_mh`].
+/// For single-handler scenarios prefer [`seed_meeting_with_mh`]. Returns the
+/// `assignment_id` the meeting was created with (what its end notify must name).
 pub async fn seed_meeting_with_handlers(
     handles: &TestStackHandles,
     meeting_id: &str,
     handlers: Vec<MhEndpointInfo>,
-) {
+) -> ::common::meeting_lifecycle::AssignmentId {
     let set = handler_set(&handlers);
     handles.handoffs.insert(meeting_id, handlers);
+    let assignment_id = ::common::meeting_lifecycle::AssignmentId::new_v4();
     handles
         .controller_handle
-        .create_meeting(meeting_id.to_string(), set)
+        .create_meeting(meeting_id.to_string(), assignment_id, set)
         .await
         .expect("create_meeting");
+    assignment_id
 }
 
 /// The default hand-off (`mh-test-1`) for a meeting the caller creates itself
@@ -1314,16 +1317,23 @@ pub async fn connect(url: &str) -> wtransport::Connection {
         .expect("connect")
 }
 
-/// A `MeetingEndedNotifier` that records every meeting id it is told about.
+/// A `MeetingEndedNotifier` that records every (meeting id, assignment id) it
+/// is told about.
 #[derive(Default)]
 pub struct RecordingMeetingEnded {
-    ended: Mutex<Vec<String>>,
+    ended: Mutex<Vec<(String, ::common::meeting_lifecycle::AssignmentId)>>,
     notify: Notify,
 }
 
 impl RecordingMeetingEnded {
     /// Every meeting id reported, in order.
     pub fn ended(&self) -> Vec<String> {
+        self.ended_with_ids().into_iter().map(|(m, _)| m).collect()
+    }
+
+    /// Every (meeting id, assignment id) reported, in order: the incarnation
+    /// each end notify names (GC's fence).
+    pub fn ended_with_ids(&self) -> Vec<(String, ::common::meeting_lifecycle::AssignmentId)> {
         self.ended
             .lock()
             .expect("RecordingMeetingEnded poisoned")
@@ -1349,11 +1359,15 @@ impl RecordingMeetingEnded {
 }
 
 impl mc_service::actors::controller::MeetingEndedNotifier for RecordingMeetingEnded {
-    fn meeting_ended(&self, meeting_id: &str) {
+    fn meeting_ended(
+        &self,
+        meeting_id: &str,
+        assignment_id: ::common::meeting_lifecycle::AssignmentId,
+    ) {
         self.ended
             .lock()
             .expect("RecordingMeetingEnded poisoned")
-            .push(meeting_id.to_string());
+            .push((meeting_id.to_string(), assignment_id));
         self.notify.notify_one();
     }
 }

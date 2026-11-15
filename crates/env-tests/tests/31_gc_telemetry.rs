@@ -22,9 +22,9 @@
 //!
 //! # Prerequisites
 //! - Kind cluster with AC + GC deployed; AC `devtest` org seeded.
-//! - GC telemetry config = compiled defaults (the ConfigMap does NOT override
-//!   them): max payload 256 KiB, per-user rate limit 60/min (per-pod, in-memory).
-//!   See the reverse cross-ref comment in `infra/services/gc-service/config.env`.
+//! - GC telemetry config = the DEPLOYED `gc-service-config` values
+//!   (`TELEMETRY_PROXY_MAX_BYTES`, `TELEMETRY_PROXY_RATE_LIMIT_PER_MINUTE`,
+//!   per-pod in-memory limiter), read from the live GC pods' generation.
 //!
 //! Edge-sum (concurrent Σ P×(N+M)): 0
 
@@ -34,7 +34,9 @@ use env_tests::cluster::ClusterConnection;
 use env_tests::fixtures::auth_client::{
     TokenRequest, UserRegistrationRequest, DEV_TEST_CLIENT_ID, DEV_TEST_CLIENT_SECRET,
 };
+use env_tests::fixtures::deployment_config::fetch_configmap;
 use env_tests::fixtures::gc_client::GcClient;
+use env_tests::fixtures::gc_fleet::{deployed, live_gc_pods};
 use env_tests::fixtures::AuthClient;
 use prost::Message;
 use tokio::sync::OnceCell;
@@ -67,10 +69,35 @@ use env_tests::fixtures::PrometheusClient;
 /// The only Content-Type the proxy accepts (else 415).
 const PROTOBUF_CT: &str = "application/x-protobuf";
 
-/// A body comfortably above the 256 KiB handler cap but below the route's
-/// `2×` `DefaultBodyLimit` ceiling (512 KiB), so it reaches the HANDLER's
-/// load-bearing 413 gate rather than being dropped by the tower layer.
-const OVERSIZE_BYTES: usize = 300 * 1024;
+/// The DEPLOYED GC telemetry limits and the serving replica count, read from
+/// the live pods and their ONE `gc-service-config` generation (never retyped
+/// and never read from the source tree, which can differ from what runs).
+struct DeployedTelemetry {
+    max_bytes: usize,
+    burst: usize,
+    replicas: usize,
+}
+
+async fn deployed_telemetry() -> DeployedTelemetry {
+    let gc = live_gc_pods().await;
+    let cm = fetch_configmap(&gc.configmap);
+    let as_usize = |key: &str| {
+        usize::try_from(deployed(&cm, key))
+            .unwrap_or_else(|e| panic!("{key} does not fit usize: {e}"))
+    };
+    DeployedTelemetry {
+        max_bytes: as_usize("TELEMETRY_PROXY_MAX_BYTES"),
+        burst: as_usize("TELEMETRY_PROXY_RATE_LIMIT_PER_MINUTE"),
+        replicas: gc.serving.len(),
+    }
+}
+
+/// A body above the handler cap by 1/8 but below the route's `2×`
+/// `DefaultBodyLimit` ceiling, so it reaches the HANDLER's load-bearing 413
+/// gate rather than being dropped by the tower layer.
+fn oversize_bytes(max_bytes: usize) -> usize {
+    max_bytes + max_bytes / 8
+}
 
 // ============================================================================
 // Shared scaffolding (mirrors 24_join_flow.rs)
@@ -466,14 +493,14 @@ async fn test_metrics_oversize_returns_413() {
     let token = shared_user_token(cluster).await;
     let gc = GcClient::new(&cluster.gc_base_url);
 
-    // 300 KiB: above the 256 KiB handler cap, below the 512 KiB layer ceiling,
-    // so it exercises the handler's load-bearing 413 gate (not the tower layer).
+    // Above the handler cap, below the 2x layer ceiling, so it exercises the
+    // handler's load-bearing 413 gate (not the tower layer).
     let resp = gc
         .raw_ingest_telemetry(
             "metrics",
             Some(token),
             Some(PROTOBUF_CT),
-            vec![0u8; OVERSIZE_BYTES],
+            vec![0u8; oversize_bytes(deployed_telemetry().await.max_bytes)],
         )
         .await
         .expect("network request should succeed");
@@ -564,7 +591,7 @@ async fn test_traces_unauthenticated_returns_401() {
 ///
 /// The telemetry GCRA limiter is per-pod, in-memory (`handlers/telemetry.rs`),
 /// and GC runs 2 replicas behind a load-balancing NodePort, so a single user's
-/// requests are split across pods. We fire M concurrent POSTs (wall-clock ≪ the
+/// requests are split across pods. We fire m concurrent POSTs (wall-clock ≪ the
 /// 1/sec replenishment window) on a DEDICATED user `sub` so the burst is
 /// attributable and isolated from the shared user's window (matrix-d).
 #[tokio::test]
@@ -573,14 +600,13 @@ async fn test_metrics_rate_limit_returns_429() {
     let token = ratelimit_user_token(cluster).await;
     let gc = std::sync::Arc::new(GcClient::new(&cluster.gc_base_url));
 
-    // M=130 > replicas(2) × telemetry burst(60) = 120 ⇒ ≥1 pod exceeds burst ⇒ ≥1 429 guaranteed.
-    // COUPLED to: gc-service replicas (deployment.yaml:10) AND TELEMETRY_PROXY_RATE_LIMIT_PER_MINUTE
-    // (compiled default 60; NOT set in gc-service/config.env today — if a ConfigMap later sets
-    // it, burst changes too). Recompute M > replicas × burst if either moves (3 replicas ⇒ M ≥ 181).
-    const M: usize = 130;
+    // m > serving replicas × telemetry burst ⇒ ≥1 pod exceeds its burst ⇒ ≥1 429
+    // guaranteed. Both are read from the live deployment.
+    let deployed = deployed_telemetry().await;
+    let m = deployed.replicas * deployed.burst + 10;
 
     let mut set = tokio::task::JoinSet::new();
-    for _ in 0..M {
+    for _ in 0..m {
         let gc = gc.clone();
         set.spawn(async move {
             gc.raw_ingest_telemetry(
@@ -607,15 +633,15 @@ async fn test_metrics_rate_limit_returns_429() {
     // PRIMARY (collector-independent: the GCRA `check_key` precedes the collector forward).
     assert!(
         n_429 >= 1,
-        "expected >=1 of {M} concurrent telemetry POSTs to be rate-limited (429); \
+        "expected >=1 of {m} concurrent telemetry POSTs to be rate-limited (429); \
          got n_202={n_202} n_429={n_429} n_other={n_other} n_err={n_err}. \
-         M must exceed replicas x burst (2 x 60 = 120) — check gc-service replicas/burst if this drifted."
+         m must exceed replicas x burst (both read from the live deployment)."
     );
     // SECONDARY collector-liveness (matrix b): some POSTs were accepted + forwarded.
     // Under a down collector these would be 502 (counted in n_other), failing loudly here.
     assert!(
         n_202 >= 1,
-        "expected >=1 accepted (202) among {M} POSTs; got n_202={n_202} n_429={n_429} \
+        "expected >=1 accepted (202) among {m} POSTs; got n_202={n_202} n_429={n_429} \
          n_other={n_other} n_err={n_err} (all-non-202 suggests the GC->collector forward is failing)"
     );
 }

@@ -137,7 +137,7 @@ impl TestMeetingServer {
             ("GC_CLIENT_SECRET".to_string(), "test-gc-secret".to_string()),
         ]);
 
-        vars.extend(gc_test_utils::mh_config_vars());
+        gc_test_utils::fill_required_config(&mut vars);
         let config = Config::from_vars(&vars)
             .map_err(|e| anyhow::anyhow!("Failed to create config: {}", e))?;
 
@@ -234,7 +234,7 @@ impl TestMeetingServer {
             ("GC_CLIENT_SECRET".to_string(), "test-gc-secret".to_string()),
         ]);
 
-        vars.extend(gc_test_utils::mh_config_vars());
+        gc_test_utils::fill_required_config(&mut vars);
         let config = Config::from_vars(&vars)
             .map_err(|e| anyhow::anyhow!("Failed to create config: {}", e))?;
 
@@ -2439,10 +2439,14 @@ async fn test_join_sticky_two_users_same_mc_single_assign_rpc(pool: PgPool) -> R
     );
 
     // Tie "same MC" to the persisted assignment, not just two bodies agreeing.
-    let persisted =
-        McAssignmentService::get_assignment(&server.pool, &meeting_id.to_string(), "test-region")
-            .await?
-            .expect("assignment row persisted by the first join");
+    let persisted = McAssignmentService::get_assignment(
+        &server.pool,
+        &meeting_id.to_string(),
+        "test-region",
+        gc_test_utils::reference_mc_assignment().mc_staleness(),
+    )
+    .await?
+    .expect("assignment row persisted by the first join");
     assert_eq!(persisted.mc_id, first_mc);
 
     assert_eq!(

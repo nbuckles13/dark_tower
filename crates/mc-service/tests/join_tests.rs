@@ -559,6 +559,7 @@ async fn test_actor_level_join_success() {
     controller
         .create_meeting(
             "meeting-actor".to_string(),
+            ::common::meeting_lifecycle::AssignmentId::new_v4(),
             test_common::default_handler_set(),
         )
         .await
@@ -646,6 +647,7 @@ async fn test_actor_level_second_joiner_sees_first_in_roster() {
     controller
         .create_meeting(
             "meeting-roster".to_string(),
+            ::common::meeting_lifecycle::AssignmentId::new_v4(),
             test_common::default_handler_set(),
         )
         .await
@@ -726,6 +728,7 @@ async fn test_join_records_display_name_resolution_outcome_metric() {
     controller
         .create_meeting(
             "meeting-dn-metric".to_string(),
+            ::common::meeting_lifecycle::AssignmentId::new_v4(),
             test_common::default_handler_set(),
         )
         .await

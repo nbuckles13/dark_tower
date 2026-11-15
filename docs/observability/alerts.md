@@ -343,7 +343,7 @@ rate(container_cpu_usage_seconds_total{container="gc-service"}[5m]) > 0.80
      docs/observability/metrics/gc-service.md (:74 + cardinality table) and the
      gc-incident-response.md legend — edit all in lockstep. -->
 **Response**:
-1. **Break down by `rejection_reason` FIRST** (`sum by(rejection_reason) (increase(gc_mc_assignments_total{status!="success"}[5m]))`). Emitted values: `at_capacity`, `draining`, `unhealthy`, `unspecified`, `no_mcs_available`, `invalid_request`.
+1. **Break down by `rejection_reason` FIRST** (`sum by(rejection_reason) (increase(gc_mc_assignments_total{status!="success"}[5m]))`). Emitted values: `at_capacity`, `draining`, `unhealthy`, `unspecified`, `no_mcs_available`, `invalid_request`, `commit_budget_exceeded` (GC could not commit the row in time — GC→DB latency, not the MC fleet; do not scale MCs).
 2. Check MC pod health and heartbeat in database.
 3. **Scale MC ONLY for a genuine capacity reason** (`at_capacity`, or `no_mcs_available` with an empty/unhealthy pool). Do **NOT** scale for `invalid_request` — that is a GC-side contract violation, not a fleet problem; follow Scenario F (do not scale, escalate to the GC owner).
 
@@ -1130,24 +1130,39 @@ sum(increase(mc_media_teardown_fence_backstop_total[30m])) > 0
 ```
 `for: 0m`
 
-#### MCNotifyMeetingEndedFailing
+#### MCNotifyMeetingEndedRejected
 
 **Severity**: Warning
-**Condition**: Any `mc_gc_notify_meeting_ended_total{status="error"}` in 15 minutes. The notify is at-most-once, so an error is final.
-**Impact**: Joins to the affected meeting id fail with `meeting_not_found` until MC restarts or is marked unhealthy.
+**Condition**: Any `mc_gc_notify_meeting_ended_total{outcome="rejected"}` in 15 minutes: GC refused a `NotifyMeetingEnded` as invalid (`INVALID_ARGUMENT`, an MC defect) or answered with no outcome (a GC defect or version skew). A rejected notify is never retried.
+**Impact**: GC keeps routing joins for the affected meeting id to this MC (which no longer holds it) until this MC stops heartbeating.
 **Runbook**: [Scenario 20: Meeting Teardown Failing / MH Budget Ratchet](../runbooks/mc-incident-response.md#scenario-20-meeting-teardown-failing--mh-budget-ratchet)
 
 **PromQL**:
 ```promql
-sum(increase(mc_gc_notify_meeting_ended_total{status="error"}[15m])) > 0
+sum(increase(mc_gc_notify_meeting_ended_total{outcome="rejected"}[15m])) > 0
 ```
 `for: 0m`
+
+#### MCNotifyMeetingEndedStuck
+
+**Severity**: Warning
+**Condition**: The oldest meeting-ended notification MC holds unanswered by GC is older than 120 s. The notify is fenced by `controller_id` + `assignment_id`, so MC retries it (capped backoff) until GC answers; 120 s spans several retries. Keyed on the AGE, never on the pending count (a count reads > 0 under routine churn) nor on the `retried` rate (a flaky attempt that later acks harmed nobody).
+**Impact**: Joins to each pending meeting id reach an MC that no longer holds it (`meeting_not_found`) until GC answers or this MC stops heartbeating (GC then fails the rows over).
+**Runbook**: [Scenario 20: Meeting Teardown Failing / MH Budget Ratchet](../runbooks/mc-incident-response.md#scenario-20-meeting-teardown-failing--mh-budget-ratchet)
+
+**PromQL**:
+```promql
+max(mc_gc_notify_meeting_ended_oldest_pending_age_seconds) > 120
+```
+`for: 30s`
+
+The age already integrates time; `for: 30s` only rides out one scrape.
 
 #### MCMeetingEndedNotificationsDropped
 
 **Severity**: Warning
 **Condition**: Any `mc_gc_meeting_ended_notifications_dropped_total` in 15 minutes: MC's notify queue was full.
-**Impact**: GC keeps each affected meeting's assignment live, and joins to those meeting ids fail until MC restarts.
+**Impact**: GC keeps each affected meeting's assignment live, and joins to those meeting ids reach an MC that no longer holds them until this MC stops heartbeating (GC then fails the rows over).
 **Runbook**: [Scenario 20: Meeting Teardown Failing / MH Budget Ratchet](../runbooks/mc-incident-response.md#scenario-20-meeting-teardown-failing--mh-budget-ratchet)
 
 **PromQL**:

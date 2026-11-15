@@ -38,7 +38,7 @@ import { bytesToHex } from '../media/frame/hex.js';
 import { MeetingApiClient } from '../http/MeetingApiClient.js';
 import { SignalingClient } from '../signaling/SignalingClient.js';
 import { SignalingCodec } from '../signaling/codecMap.js';
-import type { SignalingClientOptions } from '../signaling/SignalingClient.js';
+import type { LeaveOutcome, SignalingClientOptions } from '../signaling/SignalingClient.js';
 import type { JoinedEvent } from '../signaling/events.js';
 import { MediaTransport } from '../media/MediaTransport.js';
 import { bindSlotContinuity, type SlotContinuity } from './slotContinuity.js';
@@ -257,6 +257,38 @@ function closeReasonForError(err: unknown): CloseReason {
     }
   }
   return CloseReason.Unknown;
+}
+
+/**
+ * The deliberate leave, FIRST in `disconnect()` (intent order): `close()` queues
+ * the LeaveRequest and synchronously opens the leave window, so no inbound
+ * message reaches any sink while `disconnect()` clears the keys after it. MC
+ * removes the participant on the leave, never by close order. Reports the
+ * bounded {@link LeaveOutcome} through `onLeft`, then calls `onDisconnected`, once
+ * the signalling transport has closed (MC's acknowledgement, the leave bound, or
+ * a failed write); `not_sent` when there was no signalling session.
+ */
+function leaveSignaling(
+  signaling: SignalingClient | undefined,
+  onLeft: (outcome: LeaveOutcome) => void,
+  onDisconnected: () => void,
+): void {
+  let ended: Promise<LeaveOutcome> = Promise.resolve('not_sent');
+  if (signaling !== undefined) {
+    signaling.close();
+    ended = signaling.terminated;
+  }
+  void ended
+    .then((outcome) => {
+      try {
+        onLeft(outcome);
+      } finally {
+        onDisconnected(); // the terminal state even if a `left` listener threw
+      }
+    })
+    // An embedder listener throwing on `left` / `disconnected` must not surface
+    // as an unhandled rejection attributed to the SDK.
+    .catch(() => undefined);
 }
 
 /**
@@ -932,8 +964,8 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
   }
 
   /**
-   * Tear down ALL transports and drop token references (R-23). Idempotent: safe to
-   * call multiple times and from the `join()` failure path.
+   * Leave, tear down ALL transports and drop token references (R-23). Idempotent and
+   * synchronous; signalling closes within `LEAVE_ACK_TIMEOUT_MS` ({@link leaveSignaling}).
    */
   disconnect(): void {
     if (this.#torn) return;
@@ -948,17 +980,18 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
     try {
       this.#setState(MeetingSessionState.Disconnecting);
     } finally {
-      // Guard each teardown independently so a slow/throwing close can't abort the rest.
+      // Guard each teardown independently (a sync close() throw must not skip the rest).
+      try {
+        const end = () => this.#setState(MeetingSessionState.Disconnected);
+        leaveSignaling(this.#signaling, (o) => this.emit('left', o), end);
+      } catch {
+        // ignore
+      }
       this.#continuity?.end(); // before the teardown removals (slotContinuity.ts)
       try {
         this.#media?.disconnect();
       } catch {
         // ignore — best-effort teardown
-      }
-      try {
-        this.#signaling?.close();
-      } catch {
-        // ignore
       }
       try {
         // Stops capture (the microphone indicator), the codecs, the reader and
@@ -999,8 +1032,8 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
     }
     // R-23: no token references to drop — tokens are never stored on the instance
     // (held only as `join()`-scoped locals, GC-eligible once `join()` settles), and
-    // `SignalingClient` likewise keeps the join token off its instance. So teardown
-    // is transport-only; there is no persistent token holder to outlive disconnect.
+    // `SignalingClient` keeps the join token off its instance and drops its binding
+    // token synchronously in `close()`, so no token holder outlives disconnect.
   }
 
   // ----------------------------------------------------------------------------

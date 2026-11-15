@@ -17,6 +17,8 @@ pub enum ControllerMessage {
     /// Create a new meeting actor for the given meeting ID.
     CreateMeeting {
         meeting_id: String,
+        /// The incarnation GC assigned (echoed in the end notify).
+        assignment_id: common::meeting_lifecycle::AssignmentId,
         /// The meeting's handler set, from GC's hand-off (ADR-0039 §3).
         handlers: crate::media_routing::MeetingHandlers,
         /// Response channel for the meeting actor handle or error.
@@ -58,6 +60,7 @@ pub enum ControllerMessage {
     #[cfg(feature = "test-seams")]
     CreateMeetingWithSeams {
         meeting_id: String,
+        assignment_id: common::meeting_lifecycle::AssignmentId,
         handlers: crate::media_routing::MeetingHandlers,
         seams: super::meeting_media::MeetingSeams,
         respond_to: oneshot::Sender<Result<(), McError>>,
@@ -165,6 +168,10 @@ pub enum MeetingMessage {
     /// A participant is leaving the meeting (explicit leave, not disconnect).
     ParticipantLeave {
         participant_id: String,
+        /// The connection that sent the leave. Honoured ONLY if it is the
+        /// participant's live connection (a stale or superseded connection
+        /// removes nobody).
+        connection_id: String,
         /// Response channel for confirmation.
         respond_to: oneshot::Sender<Result<(), McError>>,
     },

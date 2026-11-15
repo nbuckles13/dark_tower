@@ -18,6 +18,7 @@
 
 use crate::errors::McError;
 use crate::media_routing::PolicyGenerations;
+use common::meeting_lifecycle::AssignmentId;
 
 use super::meeting::{MeetingActor, MeetingActorHandle, MeetingWiring};
 use super::meeting_media::{HandlerCensus, HandlerlessCensus, MutedSourceCensus};
@@ -60,8 +61,9 @@ const FENCE_BACKSTOP_MARGIN: Duration = Duration::from_secs(5);
 /// production implementation (`main.rs`) queues the notification for the GC
 /// client, which owns the send policy.
 pub trait MeetingEndedNotifier: Send + Sync {
-    /// The meeting `meeting_id` has ended and its handlers are released.
-    fn meeting_ended(&self, meeting_id: &str);
+    /// The meeting `meeting_id` — the incarnation GC assigned as
+    /// `assignment_id` — has ended and its handlers are released.
+    fn meeting_ended(&self, meeting_id: &str, assignment_id: AssignmentId);
 }
 
 /// The notifier for a controller with no GC to tell (tests that do not
@@ -70,7 +72,7 @@ pub trait MeetingEndedNotifier: Send + Sync {
 pub struct NoMeetingEndedNotifier;
 
 impl MeetingEndedNotifier for NoMeetingEndedNotifier {
-    fn meeting_ended(&self, _meeting_id: &str) {}
+    fn meeting_ended(&self, _meeting_id: &str, _assignment_id: AssignmentId) {}
 }
 
 /// Handle to the `MeetingControllerActor`.
@@ -103,6 +105,7 @@ impl MeetingControllerActorHandle {
     ///   state the KEK fleet gauges sample (ADR-0036 §4). Evicted on meeting
     ///   teardown, on the same sites as `policy_generations`.
     #[must_use]
+    #[cfg(any(test, feature = "test-seams"))]
     pub fn new(
         mc_id: String,
         metrics: Arc<ActorMetrics>,
@@ -119,7 +122,7 @@ impl MeetingControllerActorHandle {
             policy_generations,
             kek_lifecycle,
             Arc::new(NoMeetingEndedNotifier),
-            MeetingTimers::default(),
+            MeetingTimers::for_tests(),
         )
     }
 
@@ -152,9 +155,9 @@ impl MeetingControllerActorHandle {
             master_secret,
             policy_generations,
             kek_lifecycle,
+            timers,
         );
         actor.meeting_ended = meeting_ended;
-        actor.timers = timers;
         let teardowns = Arc::clone(&actor.teardowns);
 
         tokio::spawn(actor.run());
@@ -182,12 +185,14 @@ impl MeetingControllerActorHandle {
     pub async fn create_meeting(
         &self,
         meeting_id: String,
+        assignment_id: AssignmentId,
         handlers: crate::media_routing::MeetingHandlers,
     ) -> Result<(), McError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.sender
             .send(ControllerMessage::CreateMeeting {
                 meeting_id,
+                assignment_id,
                 handlers,
                 respond_to: tx,
             })
@@ -210,6 +215,7 @@ impl MeetingControllerActorHandle {
     pub async fn create_meeting_with_seams(
         &self,
         meeting_id: String,
+        assignment_id: AssignmentId,
         handlers: crate::media_routing::MeetingHandlers,
         seams: super::meeting_media::MeetingSeams,
     ) -> Result<(), McError> {
@@ -217,6 +223,7 @@ impl MeetingControllerActorHandle {
         self.sender
             .send(ControllerMessage::CreateMeetingWithSeams {
                 meeting_id,
+                assignment_id,
                 handlers,
                 seams,
                 respond_to: tx,
@@ -381,6 +388,8 @@ struct ManagedMeeting {
     task_handle: JoinHandle<()>,
     /// Meeting creation timestamp.
     created_at: i64,
+    /// The incarnation GC assigned; echoed in the end notify (the fence).
+    assignment_id: AssignmentId,
 }
 
 /// The `MeetingControllerActor` implementation.
@@ -465,16 +474,22 @@ struct TeardownFence {
     /// completion report (and so no cause) ever arrives — still knows whether
     /// GC must be told.
     cause: MeetingEndCause,
+    /// The ended incarnation's `assignment_id`, moved off the reaped meeting —
+    /// what the notify names. `None` only if the reap found no managed meeting
+    /// (then there is no incarnation MC can name; see `teardown_complete`).
+    assignment_id: Option<AssignmentId>,
 }
 
 /// A create parked behind a teardown fence.
 enum ParkedCreate {
     Plain(
+        AssignmentId,
         crate::media_routing::MeetingHandlers,
         tokio::sync::oneshot::Sender<Result<(), McError>>,
     ),
     #[cfg(feature = "test-seams")]
     WithSeams(
+        AssignmentId,
         crate::media_routing::MeetingHandlers,
         super::meeting_media::MeetingSeams,
         tokio::sync::oneshot::Sender<Result<(), McError>>,
@@ -484,11 +499,11 @@ enum ParkedCreate {
 impl ParkedCreate {
     fn respond(self, result: Result<(), McError>) {
         match self {
-            Self::Plain(_, respond_to) => {
+            Self::Plain(_, _, respond_to) => {
                 let _ = respond_to.send(result);
             }
             #[cfg(feature = "test-seams")]
-            Self::WithSeams(_, _, respond_to) => {
+            Self::WithSeams(_, _, _, respond_to) => {
                 let _ = respond_to.send(result);
             }
         }
@@ -525,6 +540,7 @@ impl MeetingControllerActor {
         master_secret: SecretBox<Vec<u8>>,
         policy_generations: Arc<PolicyGenerations>,
         kek_lifecycle: Arc<crate::media_admission::KekLifecycle>,
+        timers: MeetingTimers,
     ) -> Self {
         let mailbox = MailboxMonitor::new(ActorType::Controller, &mc_id);
         let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
@@ -548,7 +564,7 @@ impl MeetingControllerActor {
             handlerless_census: Arc::new(HandlerlessCensus::default()),
             handler_census: Arc::new(HandlerCensus::default()),
             meeting_ended: Arc::new(NoMeetingEndedNotifier),
-            timers: MeetingTimers::default(),
+            timers,
             teardowns: Arc::default(),
             shutdown_waiter: None,
         }
@@ -642,14 +658,20 @@ impl MeetingControllerActor {
         match message {
             ControllerMessage::CreateMeeting {
                 meeting_id,
+                assignment_id,
                 handlers,
                 respond_to,
             } => {
                 // Park, never await: see `TeardownFence`.
                 if self.tearing_down.contains_key(&meeting_id) {
-                    self.park_create(&meeting_id, ParkedCreate::Plain(handlers, respond_to));
+                    self.park_create(
+                        &meeting_id,
+                        ParkedCreate::Plain(assignment_id, handlers, respond_to),
+                    );
                 } else {
-                    let result = self.create_meeting(meeting_id, handlers).await;
+                    let result = self
+                        .create_meeting(meeting_id, assignment_id, handlers)
+                        .await;
                     let _ = respond_to.send(result);
                 }
             }
@@ -657,6 +679,7 @@ impl MeetingControllerActor {
             #[cfg(feature = "test-seams")]
             ControllerMessage::CreateMeetingWithSeams {
                 meeting_id,
+                assignment_id,
                 handlers,
                 seams,
                 respond_to,
@@ -664,11 +687,11 @@ impl MeetingControllerActor {
                 if self.tearing_down.contains_key(&meeting_id) {
                     self.park_create(
                         &meeting_id,
-                        ParkedCreate::WithSeams(handlers, seams, respond_to),
+                        ParkedCreate::WithSeams(assignment_id, handlers, seams, respond_to),
                     );
                 } else {
                     let result = self
-                        .create_meeting_with_seams(meeting_id, handlers, seams)
+                        .create_meeting_with_seams(meeting_id, assignment_id, handlers, seams)
                         .await;
                     let _ = respond_to.send(result);
                 }
@@ -759,9 +782,11 @@ impl MeetingControllerActor {
     async fn create_meeting(
         &mut self,
         meeting_id: String,
+        assignment_id: AssignmentId,
         handlers: crate::media_routing::MeetingHandlers,
     ) -> Result<(), McError> {
-        self.create_meeting_inner(meeting_id, handlers, None).await
+        self.create_meeting_inner(meeting_id, assignment_id, handlers, None)
+            .await
     }
 
     /// Test-only entry point threading construction overrides.
@@ -769,10 +794,11 @@ impl MeetingControllerActor {
     async fn create_meeting_with_seams(
         &mut self,
         meeting_id: String,
+        assignment_id: AssignmentId,
         handlers: crate::media_routing::MeetingHandlers,
         seams: super::meeting_media::MeetingSeams,
     ) -> Result<(), McError> {
-        self.create_meeting_inner(meeting_id, handlers, Some(seams))
+        self.create_meeting_inner(meeting_id, assignment_id, handlers, Some(seams))
             .await
     }
 
@@ -785,6 +811,7 @@ impl MeetingControllerActor {
     async fn create_meeting_inner(
         &mut self,
         meeting_id: String,
+        assignment_id: AssignmentId,
         handlers: crate::media_routing::MeetingHandlers,
         #[cfg(feature = "test-seams")] seams: Option<super::meeting_media::MeetingSeams>,
         #[cfg(not(feature = "test-seams"))] seams: Option<std::convert::Infallible>,
@@ -794,7 +821,10 @@ impl MeetingControllerActor {
             return Err(McError::Draining);
         }
 
-        // Check if meeting already exists (MINOR-001: don't include meeting_id in error)
+        // Check if meeting already exists (MINOR-001: don't include meeting_id in error).
+        // NEVER adopt: a second Assign for a held meeting is refused whatever
+        // its `assignment_id`, which is what makes "a live GC row (MC X, id i)
+        // implies X accepted i" true (internal.proto, AssignMeetingWithMhRequest).
         if self.meetings.contains_key(&meeting_id) {
             return Err(McError::Conflict("Meeting already exists".to_string()));
         }
@@ -869,6 +899,7 @@ impl MeetingControllerActor {
                 handle,
                 task_handle,
                 created_at,
+                assignment_id,
             },
         );
 
@@ -878,6 +909,9 @@ impl MeetingControllerActor {
             target: "mc.actor.controller",
             mc_id = %self.mc_id,
             meeting_id = %meeting_id,
+            // The incarnation GC assigned: joins this MC line to GC's
+            // "Ended meeting assignment(s)" / fenced lines in Loki.
+            assignment_id = %assignment_id,
             total_meetings = self.meetings.len(),
             "Meeting actor created"
         );
@@ -1267,7 +1301,9 @@ impl MeetingControllerActor {
         cause: MeetingEndCause,
         age: std::time::Duration,
     ) {
-        let reaped = self.meetings.remove(meeting_id).is_some();
+        let removed = self.meetings.remove(meeting_id);
+        let reaped = removed.is_some();
+        let assignment_id = removed.map(|m| m.assignment_id);
         if reaped {
             self.metrics.meeting_removed();
         }
@@ -1280,6 +1316,7 @@ impl MeetingControllerActor {
                     + FENCE_BACKSTOP_MARGIN,
                 waiting: Vec::new(),
                 cause,
+                assignment_id,
             });
         // ONE value feeds the log line and the counter, so they cannot
         // disagree. Recorded here (the reap), never at teardown completion, so
@@ -1293,6 +1330,7 @@ impl MeetingControllerActor {
             meeting_id = %meeting_id,
             cause = cause.label(),
             reason = cause.reason_label(),
+            assignment_id = ?assignment_id,
             // Monotonic age, from the actor's own creation Instant.
             age_ms = u64::try_from(age.as_millis()).unwrap_or(u64::MAX),
             total_meetings = self.meetings.len(),
@@ -1330,14 +1368,21 @@ impl MeetingControllerActor {
         }
         for create in fence.waiting {
             match create {
-                ParkedCreate::Plain(handlers, respond_to) => {
-                    let result = self.create_meeting(meeting_id.to_string(), handlers).await;
+                ParkedCreate::Plain(assignment_id, handlers, respond_to) => {
+                    let result = self
+                        .create_meeting(meeting_id.to_string(), assignment_id, handlers)
+                        .await;
                     let _ = respond_to.send(result);
                 }
                 #[cfg(feature = "test-seams")]
-                ParkedCreate::WithSeams(handlers, seams, respond_to) => {
+                ParkedCreate::WithSeams(assignment_id, handlers, seams, respond_to) => {
                     let result = self
-                        .create_meeting_with_seams(meeting_id.to_string(), handlers, seams)
+                        .create_meeting_with_seams(
+                            meeting_id.to_string(),
+                            assignment_id,
+                            handlers,
+                            seams,
+                        )
                         .await;
                     let _ = respond_to.send(result);
                 }
@@ -1349,7 +1394,21 @@ impl MeetingControllerActor {
         // unjoinable id, strictly worse than the release-crossing race that
         // lifting the fence has already accepted.
         if cause.notifies_gc() {
-            self.meeting_ended.meeting_ended(meeting_id);
+            match fence.assignment_id {
+                Some(assignment_id) => self.meeting_ended.meeting_ended(meeting_id, assignment_id),
+                // Unreachable by construction (a notifying cause comes from a
+                // meeting actor's clean exit, which the reap found managed).
+                // Loud, not silent: GC's row for this id stays live until the
+                // MC goes stale.
+                None => error!(
+                    target: "mc.actor.controller",
+                    mc_id = %self.mc_id,
+                    meeting_id = %meeting_id,
+                    cause = fence.cause.label(),
+                    "Meeting ended but no incarnation was recorded for it; GC cannot be told \
+                     (its assignment row stays live until this MC stops heartbeating)"
+                ),
+            }
         }
     }
 
@@ -1430,11 +1489,13 @@ mod tests {
             test_secret(),
             Arc::clone(&generations),
             crate::media_admission::fixtures::kek_lifecycle(),
+            MeetingTimers::for_tests(),
         );
 
         actor
             .create_meeting(
                 "meeting-reaped".to_string(),
+                ::common::meeting_lifecycle::AssignmentId::new_v4(),
                 crate::actors::meeting_media::test_handlers(),
             )
             .await
@@ -1514,6 +1575,7 @@ mod tests {
         let result = handle
             .create_meeting(
                 "meeting-123".to_string(),
+                ::common::meeting_lifecycle::AssignmentId::new_v4(),
                 crate::actors::meeting_media::test_handlers(),
             )
             .await;
@@ -1546,6 +1608,7 @@ mod tests {
         let result = handle
             .create_meeting(
                 "meeting-456".to_string(),
+                ::common::meeting_lifecycle::AssignmentId::new_v4(),
                 crate::actors::meeting_media::test_handlers(),
             )
             .await;
@@ -1555,6 +1618,7 @@ mod tests {
         let result = handle
             .create_meeting(
                 "meeting-456".to_string(),
+                ::common::meeting_lifecycle::AssignmentId::new_v4(),
                 crate::actors::meeting_media::test_handlers(),
             )
             .await;
@@ -1601,6 +1665,7 @@ mod tests {
         let result = handle
             .create_meeting(
                 "meeting-789".to_string(),
+                ::common::meeting_lifecycle::AssignmentId::new_v4(),
                 crate::actors::meeting_media::test_handlers(),
             )
             .await;
@@ -1642,12 +1707,14 @@ mod tests {
         let _ = handle
             .create_meeting(
                 "m1".to_string(),
+                ::common::meeting_lifecycle::AssignmentId::new_v4(),
                 crate::actors::meeting_media::test_handlers(),
             )
             .await;
         let _ = handle
             .create_meeting(
                 "m2".to_string(),
+                ::common::meeting_lifecycle::AssignmentId::new_v4(),
                 crate::actors::meeting_media::test_handlers(),
             )
             .await;
@@ -1676,6 +1743,7 @@ mod tests {
         let _ = handle
             .create_meeting(
                 "meeting-shutdown".to_string(),
+                ::common::meeting_lifecycle::AssignmentId::new_v4(),
                 crate::actors::meeting_media::test_handlers(),
             )
             .await;
@@ -1727,11 +1795,25 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[derive(Default)]
-    struct RecordingNotifier(std::sync::Mutex<Vec<String>>);
+    struct RecordingNotifier(std::sync::Mutex<Vec<(String, AssignmentId)>>);
+
+    impl RecordingNotifier {
+        fn ids(&self) -> Vec<String> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(m, _)| m.clone())
+                .collect()
+        }
+    }
 
     impl MeetingEndedNotifier for RecordingNotifier {
-        fn meeting_ended(&self, meeting_id: &str) {
-            self.0.lock().unwrap().push(meeting_id.to_string());
+        fn meeting_ended(&self, meeting_id: &str, assignment_id: AssignmentId) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((meeting_id.to_string(), assignment_id));
         }
     }
 
@@ -1746,6 +1828,7 @@ mod tests {
             test_secret(),
             test_generations(),
             crate::media_admission::fixtures::kek_lifecycle(),
+            MeetingTimers::for_tests(),
         );
         actor.meeting_ended = notifier;
         actor
@@ -1755,6 +1838,15 @@ mod tests {
     async fn a_backstop_lifted_fence_still_tells_gc_an_ended_meeting_ended() {
         let notifier = Arc::new(RecordingNotifier::default());
         let mut actor = backstop_actor(Arc::clone(&notifier));
+        let assignment = AssignmentId::new_v4();
+        actor
+            .create_meeting(
+                "m-empty".to_string(),
+                assignment,
+                crate::actors::meeting_media::test_handlers(),
+            )
+            .await
+            .expect("created");
         actor
             .reap_ended(
                 "m-empty",
@@ -1769,7 +1861,7 @@ mod tests {
         // Before the deadline nothing lifts (positive control on the timer).
         actor.expire_fences().await;
         assert_eq!(actor.tearing_down.len(), 2);
-        assert!(notifier.0.lock().unwrap().is_empty());
+        assert!(notifier.ids().is_empty());
 
         tokio::time::advance(
             crate::media_routing::teardown::TEARDOWN_MAX
@@ -1782,8 +1874,9 @@ mod tests {
         assert!(actor.tearing_down.is_empty(), "both fences lifted");
         assert_eq!(
             *notifier.0.lock().unwrap(),
-            vec!["m-empty".to_string()],
-            "the ended meeting is reported to GC on the backstop path; the shutdown one never is"
+            vec![("m-empty".to_string(), assignment)],
+            "the ended meeting is reported to GC on the backstop path, naming the incarnation \
+             it was created with; the shutdown one never is"
         );
 
         // A late real completion finds no fence and does not notify twice.
@@ -1814,6 +1907,7 @@ mod tests {
         actor
             .create_meeting(
                 "m-window".to_string(),
+                ::common::meeting_lifecycle::AssignmentId::new_v4(),
                 crate::actors::meeting_media::test_handlers(),
             )
             .await
@@ -1849,12 +1943,97 @@ mod tests {
         // A late real completion must neither notify nor count again.
         actor.teardown_complete("m-window", cause, false).await;
 
-        assert_eq!(*notifier.0.lock().unwrap(), vec!["m-window".to_string()]);
+        assert_eq!(notifier.ids(), vec!["m-window".to_string()]);
         snap.counter("mc_meetings_ended_total")
             .with_labels(&[("cause", "empty"), ("reason", "join_window_expired")])
             .assert_delta(1);
         snap.counter("mc_meetings_ended_total")
             .with_labels(&[("cause", "empty"), ("reason", "last_participant_left")])
             .assert_delta(0);
+    }
+
+    /// The fence invariant's MC half: a second create for a meeting the
+    /// controller holds is REFUSED whatever its `assignment_id` (never
+    /// adopted), and the held meeting keeps the incarnation it was created
+    /// with — which is the one its end notify names.
+    #[tokio::test(start_paused = true)]
+    async fn a_second_create_with_another_assignment_id_is_refused_and_never_adopted() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let mut actor = backstop_actor(Arc::clone(&notifier));
+        let first = AssignmentId::new_v4();
+        actor
+            .create_meeting(
+                "m-dup".to_string(),
+                first,
+                crate::actors::meeting_media::test_handlers(),
+            )
+            .await
+            .expect("created");
+        let second = actor
+            .create_meeting(
+                "m-dup".to_string(),
+                AssignmentId::new_v4(),
+                crate::actors::meeting_media::test_handlers(),
+            )
+            .await;
+        assert!(
+            matches!(second, Err(McError::Conflict(_))),
+            "a duplicate create must be refused, got {second:?}"
+        );
+        assert_eq!(actor.meetings["m-dup"].assignment_id, first);
+
+        actor
+            .reap_ended(
+                "m-dup",
+                MeetingEndCause::Empty(EmptyReason::LastParticipantLeft),
+                Duration::ZERO,
+            )
+            .await;
+        actor
+            .teardown_complete(
+                "m-dup",
+                MeetingEndCause::Empty(EmptyReason::LastParticipantLeft),
+                false,
+            )
+            .await;
+        assert_eq!(
+            *notifier.0.lock().unwrap(),
+            vec![("m-dup".to_string(), first)]
+        );
+    }
+
+    /// A create parked behind the previous incarnation's teardown keeps ITS
+    /// OWN `assignment_id`: the next end names the new incarnation, never the
+    /// one whose teardown it waited on.
+    #[tokio::test(start_paused = true)]
+    async fn a_parked_create_keeps_its_own_assignment_id() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let mut actor = backstop_actor(Arc::clone(&notifier));
+        let old = AssignmentId::new_v4();
+        let new = AssignmentId::new_v4();
+        let cause = MeetingEndCause::Empty(EmptyReason::LastParticipantLeft);
+        actor
+            .create_meeting(
+                "m-park".to_string(),
+                old,
+                crate::actors::meeting_media::test_handlers(),
+            )
+            .await
+            .expect("created");
+        actor.reap_ended("m-park", cause, Duration::ZERO).await;
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        actor.park_create(
+            "m-park",
+            ParkedCreate::Plain(new, crate::actors::meeting_media::test_handlers(), tx),
+        );
+        actor.teardown_complete("m-park", cause, false).await;
+        rx.try_recv()
+            .expect("answered")
+            .expect("the parked create ran");
+        assert_eq!(actor.meetings["m-park"].assignment_id, new);
+        assert_eq!(
+            *notifier.0.lock().unwrap(),
+            vec![("m-park".to_string(), old)]
+        );
     }
 }

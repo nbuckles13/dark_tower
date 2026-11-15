@@ -130,6 +130,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         health_bind_address = %config.health_bind_address,
         max_meetings = config.max_meetings,
         max_participants = config.max_participants,
+        // Required since meeting-end safety P2 (no Rust default): the effective
+        // values this process received.
+        gc_grpc_url = %config.gc_grpc_url,
+        meeting_join_window_seconds = config.meeting_join_window_seconds,
+        disconnect_grace_period_seconds = config.disconnect_grace_period_seconds,
+        clock_skew_seconds = config.clock_skew_seconds,
+        quic_max_idle_timeout_seconds = config.quic_max_idle_timeout_seconds,
+        otel_sample_rate = config.otel_sample_rate,
+        environment = %config.environment,
         // ADR-0036 §5/§6 client-signalling knobs, logged as EFFECTIVE values.
         //
         // The ConfigMap cannot answer "what did this process actually receive?" —

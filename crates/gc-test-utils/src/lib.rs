@@ -4,7 +4,8 @@
 //!
 //! This crate provides:
 //! - Server test harness (`TestGcServer` for E2E tests)
-//! - Shipped reference config (`reference_mh_registry_vars`, `reference_mh_registry`)
+//! - Shipped reference config (`reference_config_vars`, `fill_required_config`,
+//!   `reference_mh_registry_vars`, `reference_mh_registry`)
 //!
 //! ## Usage
 //!

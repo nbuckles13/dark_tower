@@ -26,7 +26,7 @@ pub fn mc_app_state(pool: PgPool, max_exclude_handler_ids: Option<u32>) -> Arc<A
         ("GC_CLIENT_ID".to_string(), "test-gc-client".to_string()),
         ("GC_CLIENT_SECRET".to_string(), "test-gc-secret".to_string()),
     ]);
-    vars.extend(gc_test_utils::mh_config_vars());
+    gc_test_utils::fill_required_config(&mut vars);
     if let Some(cap) = max_exclude_handler_ids {
         vars.insert("GC_MH_MAX_EXCLUDE_HANDLER_IDS".to_string(), cap.to_string());
     }
@@ -73,8 +73,8 @@ pub async fn seed_assignment(
 ) {
     sqlx::query(
         "INSERT INTO meeting_assignments \
-         (meeting_id, meeting_controller_id, region, assigned_by_gc_id, ended_at) \
-         VALUES ($1, $2, $3, 'gc-test', CASE WHEN $4 THEN NOW() ELSE NULL END)",
+         (meeting_id, meeting_controller_id, region, assigned_by_gc_id, ended_at, assignment_id) \
+         VALUES ($1, $2, $3, 'gc-test', CASE WHEN $4 THEN NOW() ELSE NULL END, gen_random_uuid())",
     )
     .bind(meeting_id)
     .bind(controller_id)

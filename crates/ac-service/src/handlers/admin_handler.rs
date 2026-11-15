@@ -238,9 +238,9 @@ pub async fn handle_rotate_keys(
         return Err(err);
     }
 
-    // Get cluster name from environment, default to "default" for development
-    // SECURITY FIX: Make cluster name configurable instead of hardcoded
-    let cluster_name = std::env::var("AC_CLUSTER_NAME").unwrap_or_else(|_| "default".to_string());
+    // The ONE cluster name (`AC_CLUSTER_NAME`, required and validated in Config)
+    // — the same value the initial signing key was minted under.
+    let cluster_name = state.config.cluster_name.clone();
 
     // SECURITY FIX: Use database transaction with advisory lock to prevent TOCTOU race condition
     // This ensures rate limit check and rotation are atomic
@@ -902,8 +902,6 @@ pub async fn handle_rotate_client_secret(
 mod tests {
     use super::*;
     use crate::config::Config;
-    use base64::{engine::general_purpose, Engine};
-    use std::collections::HashMap;
 
     /// Claims the admin middleware would have inserted.
     fn admin_claims() -> Extension<crypto::Claims> {
@@ -918,14 +916,7 @@ mod tests {
 
     /// Create a test config with required environment variables
     fn test_config() -> Config {
-        let master_key = general_purpose::STANDARD.encode([0u8; 32]);
-        let vars = HashMap::from([
-            (
-                "DATABASE_URL".to_string(),
-                "postgresql://localhost/test".to_string(),
-            ),
-            ("AC_MASTER_KEY".to_string(), master_key),
-        ]);
+        let vars = crate::config::test_support::complete_vars();
         Config::from_vars(&vars).expect("Test config should be valid")
     }
 

@@ -6,16 +6,19 @@
 //! # Architecture
 //!
 //! This service orchestrates the assignment flow:
-//! 1. Check for existing healthy assignment. If one exists, return it as-is:
+//! 1. Check for an existing LIVE assignment (its MC still heartbeats, whatever
+//!    its status). If one exists, return it as-is:
 //!    no MH selection, no MC notification (R-6 join stickiness — the meeting's
 //!    handler set was programmed into MC once per meeting INCARNATION, at its
 //!    first join, and MC owns it; an ENDED assignment is not "existing", so a
 //!    rejoin after the meeting ended starts a new incarnation below)
 //! 2. Otherwise select MHs for the meeting via weighted load balancing
 //! 3. Select a candidate MC via load balancing
-//! 4. Call MC via gRPC to notify of assignment (ADR-0010 Section 4a)
-//! 5. On acceptance, atomic DB write
-//! 6. On rejection, retry with different MC (max 3 attempts)
+//! 4. Mint a fresh `AssignmentId` for this attempt and call MC via gRPC with
+//!    it (ADR-0010 Section 4a)
+//! 5. On acceptance, atomic DB write within the accept->commit budget
+//! 6. On rejection, RPC failure or a missed budget, retry with a different MC
+//!    and a new id (max 3 attempts)
 //!
 //! # Security
 //!
@@ -23,16 +26,19 @@
 //! - All database operations use parameterized queries
 //! - Error messages are generic to prevent information leakage
 
-use crate::config::MhRegistryConfig;
+use crate::config::{McAssignmentConfig, MhRegistryConfig};
 use crate::errors::GcError;
 use crate::observability::metrics;
-use crate::repositories::{McAssignment, MeetingAssignmentsRepository};
+use crate::repositories::{
+    AssignmentId, AtomicAssignOutcome, EndAssignmentOutcome, McAssignment,
+    MeetingAssignmentsRepository,
+};
 use crate::services::mc_client::{McAssignmentResult, McClientTrait, McRejectionReason};
 use crate::services::mh_selection::{MhAssignmentInfo, MhSelection, MhSelectionService};
 use crate::services::weighted_pick::{weighted_random_select, SystemSelectionRng};
 use sqlx::PgPool;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::instrument;
 
 /// Maximum number of retry attempts for MC rejection per ADR-0010.
@@ -58,11 +64,28 @@ const MAX_MC_ASSIGNMENT_RETRIES: usize = 3;
 /// They are the same wire contract (`AssignMeetingWithMhRequest` validity) on the
 /// two sides of the RPC; if MC's definition of "malformed" changes, this predicate
 /// must change in lockstep, or GC will retry-vs-fail-fast on the wrong criterion.
+///
+/// MC's third `INVALID_REQUEST` condition, an empty/malformed/nil
+/// `assignment_id`, cannot occur on GC's side BY TYPE: the request carries an
+/// [`AssignmentId`] minted by `AssignmentId::new_v4` and rendered by its
+/// `Display`, and both sides validate through the one
+/// `common::meeting_lifecycle::AssignmentId::parse`. So it needs no runtime
+/// check here; were the id ever built from a raw string, it would.
 fn selection_is_malformed(handlers: &[MhAssignmentInfo]) -> bool {
     handlers.is_empty()
         || handlers.iter().any(|h| {
             h.mh_id.is_empty() || h.webtransport_endpoint.is_empty() || h.grpc_endpoint.is_empty()
         })
+}
+
+/// Why the most recent failed MC attempt failed (the terminal metric label).
+#[derive(Debug, Clone, Copy)]
+enum AttemptFailure {
+    /// MC refused the assignment.
+    Mc(McRejectionReason),
+    /// MC accepted, but GC could not commit the row within the
+    /// accept->commit budget (no row written).
+    CommitBudgetExceeded,
 }
 
 /// Service for MC assignment operations.
@@ -93,63 +116,75 @@ pub struct AssignmentWithMh {
 }
 
 impl McAssignmentService {
-    /// End a meeting assignment.
+    /// End ONE incarnation of a meeting's assignment, fenced (ADR-0010 §3).
     ///
-    /// Called when a meeting ends normally. Marks the assignment as ended
-    /// (soft delete) for audit trail.
+    /// Called for `NotifyMeetingEnded`. Ends the row only when it is live and
+    /// names both `controller_id` and `assignment_id`; see
+    /// [`MeetingAssignmentsRepository::end_assignment`]. This is the single
+    /// INFO record of an end; the caller logs the other outcomes.
     ///
     /// # Arguments
     ///
     /// * `pool` - Database connection pool
-    /// * `meeting_id` - Meeting to end assignment for
-    /// * `region` - Optional region (if None, ends all regional assignments)
-    ///
-    /// # Returns
-    ///
-    /// Number of assignments ended.
-    #[instrument(skip_all, fields(meeting_id = %meeting_id))]
+    /// * `meeting_id` - Meeting the notify names
+    /// * `region` - Region the notify names
+    /// * `controller_id` - The notifying MC (self-asserted; a narrowing match)
+    /// * `assignment_id` - The incarnation MC is ending
+    #[instrument(skip_all, fields(meeting_id = %meeting_id, region = %region))]
     pub async fn end_assignment(
         pool: &PgPool,
         meeting_id: &str,
-        region: Option<&str>,
-    ) -> Result<u64, GcError> {
-        let count = MeetingAssignmentsRepository::end_assignment(pool, meeting_id, region).await?;
+        region: &str,
+        controller_id: &str,
+        assignment_id: AssignmentId,
+    ) -> Result<EndAssignmentOutcome, GcError> {
+        let outcome = MeetingAssignmentsRepository::end_assignment(
+            pool,
+            meeting_id,
+            region,
+            controller_id,
+            assignment_id,
+        )
+        .await?;
 
-        if count > 0 {
+        if outcome == EndAssignmentOutcome::Ended {
             tracing::info!(
                 target: "gc.service.assignment",
                 meeting_id = %meeting_id,
-                region = ?region,
-                count = count,
+                region = %region,
+                mc_id = %controller_id,
+                assignment_id = %assignment_id,
                 "Ended meeting assignment(s)"
             );
         }
 
-        Ok(count)
+        Ok(outcome)
     }
 
-    /// Get existing assignment for a meeting.
-    ///
-    /// Returns the current healthy assignment if one exists.
+    /// Get the live assignment for a meeting (its MC still heartbeats).
     ///
     /// # Arguments
     ///
     /// * `pool` - Database connection pool
     /// * `meeting_id` - Meeting to look up
     /// * `region` - Region to look up in
+    /// * `mc_staleness` - MC liveness threshold
     // Allow: Used in tests; will be used for future status endpoints
     #[instrument(skip_all, fields(meeting_id = %meeting_id, region = %region))]
     pub async fn get_assignment(
         pool: &PgPool,
         meeting_id: &str,
         region: &str,
+        mc_staleness: Duration,
     ) -> Result<Option<McAssignment>, GcError> {
-        MeetingAssignmentsRepository::get_healthy_assignment(pool, meeting_id, region).await
+        MeetingAssignmentsRepository::get_live_assignment(pool, meeting_id, region, mc_staleness)
+            .await
     }
 
     /// Assign a meeting with MH selection and MC notification (ADR-0010 Section 4a).
     ///
-    /// If the meeting already has a healthy assignment, it is returned as-is
+    /// If the meeting already has a LIVE assignment (its MC still heartbeats,
+    /// whatever its `health_status`), it is returned as-is
     /// with `mh_selection: None` — no MH selection and no MC call, so this path
     /// does not depend on a live MH pool (R-6). Otherwise this is the new
     /// assignment flow that:
@@ -165,11 +200,12 @@ impl McAssignmentService {
     /// * `region` - Region to assign in
     /// * `gc_id` - ID of this GC instance
     /// * `mh_registry` - MH staleness bound and initial handler count for selection
+    /// * `mc_assignment` - MC liveness threshold and accept->commit budget
     ///
     /// # Returns
     ///
     /// Returns `AssignmentWithMh`: the MC assignment, plus `Some(selection)` for a
-    /// new assignment or `None` when an existing healthy assignment was reused.
+    /// new assignment or `None` when an existing live assignment was reused.
     ///
     /// # Errors
     ///
@@ -185,19 +221,28 @@ impl McAssignmentService {
         region: &str,
         gc_id: &str,
         mh_registry: &MhRegistryConfig,
+        mc_assignment: &McAssignmentConfig,
     ) -> Result<AssignmentWithMh, GcError> {
         // Start timing for metrics (ADR-0011)
         let start = Instant::now();
+        let mc_staleness = mc_assignment.mc_staleness();
 
-        // Step 1: Check for existing healthy assignment
-        if let Some(existing) =
-            MeetingAssignmentsRepository::get_healthy_assignment(pool, meeting_id, region).await?
+        // Step 1: Check for an existing LIVE assignment. Liveness, not status:
+        // a draining/degraded MC still holds the meeting, and placing this
+        // joiner anywhere else would split it.
+        if let Some(existing) = MeetingAssignmentsRepository::get_live_assignment(
+            pool,
+            meeting_id,
+            region,
+            mc_staleness,
+        )
+        .await?
         {
             tracing::debug!(
                 target: "gc.service.assignment",
                 meeting_id = %meeting_id,
                 mc_id = %existing.mc_id,
-                "Existing healthy assignment reused; handler owned by MC, no MH selection performed"
+                "Existing live assignment reused; handler owned by MC, no MH selection performed"
             );
 
             // Reuse path (R-6): return the already-assigned MC WITHOUT selecting MHs.
@@ -299,12 +344,12 @@ impl McAssignmentService {
 
         // Step 3: Get candidate MCs and try assignment with retry
         let mut tried_mcs: Vec<String> = Vec::new();
-        let mut last_rejection_reason: Option<McRejectionReason> = None;
+        let mut last_failure: Option<AttemptFailure> = None;
 
         for attempt in 1..=MAX_MC_ASSIGNMENT_RETRIES {
             // Get candidate MCs, excluding ones we've already tried
             let mut candidates =
-                MeetingAssignmentsRepository::get_candidate_mcs(pool, region).await?;
+                MeetingAssignmentsRepository::get_candidate_mcs(pool, region, mc_staleness).await?;
 
             // Filter out already-tried MCs
             candidates.retain(|c| !tried_mcs.contains(&c.controller_id));
@@ -339,9 +384,23 @@ impl McAssignmentService {
                 "Attempting MC assignment"
             );
 
-            // Step 4: Call MC to notify of assignment BEFORE writing to DB
+            // Step 4: Call MC to notify of assignment BEFORE writing to DB,
+            // as a FRESH incarnation per attempt: if an earlier attempt's MC
+            // accepted ambiguously (timeout), its orphan and this attempt's
+            // meeting never share an id, so neither's notify can end the
+            // other's row. The accept->commit budget runs from the SEND:
+            // MC's join window starts no earlier than its acceptance.
+            let assignment_id = AssignmentId::new_v4();
+            let sent_at = Instant::now();
+            let deadline = sent_at + mc_assignment.commit_budget();
             let result = mc_client
-                .assign_meeting(&mc_endpoint, meeting_id, &mh_selection.handlers, gc_id)
+                .assign_meeting(
+                    &mc_endpoint,
+                    meeting_id,
+                    assignment_id,
+                    &mh_selection.handlers,
+                    gc_id,
+                )
                 .await;
 
             match result {
@@ -350,18 +409,34 @@ impl McAssignmentService {
                         target: "gc.service.assignment",
                         meeting_id = %meeting_id,
                         mc_id = %mc_id,
+                        assignment_id = %assignment_id,
                         "MC accepted assignment"
                     );
 
-                    // Step 5: MC accepted, now write to DB
-                    let assignment = MeetingAssignmentsRepository::atomic_assign(
+                    // Step 5: MC accepted, now write to DB (within the budget)
+                    let outcome = MeetingAssignmentsRepository::atomic_assign(
                         pool,
                         meeting_id,
                         region,
                         selected_mc,
                         gc_id,
+                        assignment_id,
+                        mc_staleness,
+                        deadline,
                     )
                     .await?;
+
+                    let assignment = match outcome {
+                        AtomicAssignOutcome::Assigned { assignment, .. } => assignment,
+                        AtomicAssignOutcome::BudgetExceeded => {
+                            // No row written; the accepting MC holds a fenced
+                            // orphan that ends at its join window. Try the next
+                            // MC with a new id. (WARN logged by the repository.)
+                            last_failure = Some(AttemptFailure::CommitBudgetExceeded);
+                            tried_mcs.push(mc_id);
+                            continue;
+                        }
+                    };
 
                     tracing::info!(
                         target: "gc.service.assignment",
@@ -395,7 +470,8 @@ impl McAssignmentService {
                             // request the same way, so retrying cannot succeed and would
                             // only burn the budget and falsely record a "sick fleet".
                             // Fail fast (adjudicated behaviour) — a GC contract violation.
-                            last_rejection_reason = Some(McRejectionReason::InvalidRequest);
+                            last_failure =
+                                Some(AttemptFailure::Mc(McRejectionReason::InvalidRequest));
                             tracing::error!(
                                 target: "gc.service.assignment",
                                 meeting_id = %meeting_id,
@@ -408,7 +484,7 @@ impl McAssignmentService {
                         // GC's request was well-formed, so this MC is misreporting.
                         // Treat it as a controller problem and preserve failover: retry
                         // the rest of the pool rather than letting one peer veto assignment.
-                        last_rejection_reason = Some(McRejectionReason::Unhealthy);
+                        last_failure = Some(AttemptFailure::Mc(McRejectionReason::Unhealthy));
                         tracing::error!(
                             target: "gc.service.assignment",
                             meeting_id = %meeting_id,
@@ -420,7 +496,7 @@ impl McAssignmentService {
                         continue;
                     }
 
-                    last_rejection_reason = Some(reason);
+                    last_failure = Some(AttemptFailure::Mc(reason));
                     tracing::warn!(
                         target: "gc.service.assignment",
                         meeting_id = %meeting_id,
@@ -462,14 +538,25 @@ impl McAssignmentService {
         //     description — illustrative triage prose, not a complete enumeration)
         //   crates/gc-service/tests/mc_assignment_metrics_integration.rs (ALL_REJECTION_REASONS)
         //   crates/gc-service/src/observability/metrics.rs (metric-cluster test array)
-        let (status, rejection_reason) = match last_rejection_reason {
-            Some(McRejectionReason::AtCapacity) => ("rejected", Some("at_capacity")),
-            Some(McRejectionReason::Draining) => ("rejected", Some("draining")),
-            Some(McRejectionReason::Unhealthy) => ("rejected", Some("unhealthy")),
-            Some(McRejectionReason::Unspecified) => ("rejected", Some("unspecified")),
+        let (status, rejection_reason) = match last_failure {
+            Some(AttemptFailure::Mc(McRejectionReason::AtCapacity)) => {
+                ("rejected", Some("at_capacity"))
+            }
+            Some(AttemptFailure::Mc(McRejectionReason::Draining)) => ("rejected", Some("draining")),
+            Some(AttemptFailure::Mc(McRejectionReason::Unhealthy)) => {
+                ("rejected", Some("unhealthy"))
+            }
+            Some(AttemptFailure::Mc(McRejectionReason::Unspecified)) => {
+                ("rejected", Some("unspecified"))
+            }
             // GC contract violation surfaced by MC — a GC fault, not a rejection
             // of a healthy request, so status="error" (groups with no_mcs_available).
-            Some(McRejectionReason::InvalidRequest) => ("error", Some("invalid_request")),
+            Some(AttemptFailure::Mc(McRejectionReason::InvalidRequest)) => {
+                ("error", Some("invalid_request"))
+            }
+            // MC accepted but GC could not commit the row in time (DB latency or
+            // pool exhaustion): a GC-side failure, not an MC rejection.
+            Some(AttemptFailure::CommitBudgetExceeded) => ("error", Some("commit_budget_exceeded")),
             None => ("error", Some("no_mcs_available")),
         };
         metrics::record_mc_assignment(status, rejection_reason, start.elapsed());
@@ -478,16 +565,25 @@ impl McAssignmentService {
         // and returns a fixed client body; no meeting_id/mh_id/endpoint here).
         // Exhaustive (no catch-all), mirroring the metric match above so a future
         // RejectionReason variant compile-fails here too, not just at the metric match.
-        let reason_str = match last_rejection_reason {
-            Some(McRejectionReason::AtCapacity) => "All meeting controllers are at capacity",
-            Some(McRejectionReason::Draining) => "All meeting controllers are draining",
-            Some(McRejectionReason::Unhealthy) => "All meeting controllers are unhealthy",
-            Some(McRejectionReason::InvalidRequest) => {
+        let reason_str = match last_failure {
+            Some(AttemptFailure::Mc(McRejectionReason::AtCapacity)) => {
+                "All meeting controllers are at capacity"
+            }
+            Some(AttemptFailure::Mc(McRejectionReason::Draining)) => {
+                "All meeting controllers are draining"
+            }
+            Some(AttemptFailure::Mc(McRejectionReason::Unhealthy)) => {
+                "All meeting controllers are unhealthy"
+            }
+            Some(AttemptFailure::Mc(McRejectionReason::InvalidRequest)) => {
                 "Meeting assignment request was invalid (GC contract violation)"
             }
             // A controller responded with a reason GC doesn't recognize (not "no MCs").
-            Some(McRejectionReason::Unspecified) => {
+            Some(AttemptFailure::Mc(McRejectionReason::Unspecified)) => {
                 "A meeting controller rejected the assignment for an unrecognized reason"
+            }
+            Some(AttemptFailure::CommitBudgetExceeded) => {
+                "The assignment could not be recorded in time"
             }
             None => "No meeting controllers available",
         };
@@ -498,8 +594,8 @@ impl McAssignmentService {
         // bad request. The in-loop error! already logged the cause; the terminal log
         // here must NOT claim "after N attempts" (only one MC was tried).
         if matches!(
-            last_rejection_reason,
-            Some(McRejectionReason::InvalidRequest)
+            last_failure,
+            Some(AttemptFailure::Mc(McRejectionReason::InvalidRequest))
         ) {
             tracing::error!(
                 target: "gc.service.assignment",

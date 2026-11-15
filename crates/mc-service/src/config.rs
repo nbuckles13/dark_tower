@@ -20,44 +20,12 @@ use thiserror::Error;
 
 use crate::actors::meeting_timers::{MAX_JOIN_WINDOW, MIN_JOIN_WINDOW};
 
-/// Default WebTransport bind address.
-pub const DEFAULT_WEBTRANSPORT_BIND_ADDRESS: &str = "0.0.0.0:4433";
-
-/// Default gRPC bind address for GC communication.
-pub const DEFAULT_GRPC_BIND_ADDRESS: &str = "0.0.0.0:50052";
-
-/// Default health endpoint bind address.
-pub const DEFAULT_HEALTH_BIND_ADDRESS: &str = "0.0.0.0:8081";
-
-/// Default clock skew allowance in seconds (ADR-0023).
-pub const DEFAULT_CLOCK_SKEW_SECONDS: u64 = 5;
-
-/// Default participant disconnect grace period in seconds (ADR-0023).
-pub const DEFAULT_DISCONNECT_GRACE_PERIOD_SECONDS: u64 = 30;
-
-/// Default QUIC max-idle-timeout in seconds for the WebTransport server.
-///
-/// This is the ONLY detector for a crash / network-loss departure (a clean tab
-/// close is caught immediately by `Connection::closed()`; see
-/// `webtransport::connection`). It is deliberately set to a few seconds:
-/// - fast enough that an abrupt departure is detected promptly, and
-/// - paired with a keep-alive interval (`< idle`) so a healthy-but-quiet
-///   connection is kept alive and is NEVER spuriously idle-timed-out.
-///
-/// The effective timeout is `min(this, peer_idle_timeout)`, so this value
-/// governs versus the browser's larger default. It also bounds the documented
-/// worst-case crash roster-remove latency (`idle_timeout + grace_period +
-/// grace_check_interval`).
-pub const DEFAULT_QUIC_MAX_IDLE_TIMEOUT_SECONDS: u64 = 10;
+// No behaviour or topology key has a Rust default (meeting-end-safety P2):
+// every one is REQUIRED, set in the base `config.env` and read by a hard ref,
+// so a missing key refuses boot instead of running a value nobody configured.
 
 /// Default MC instance ID prefix.
 pub const DEFAULT_MC_ID_PREFIX: &str = "mc";
-
-/// Default OTLP sample rate (R-55). 1.0 in dev; tune down for prod.
-pub const DEFAULT_OTEL_SAMPLE_RATE: f64 = 1.0;
-
-/// Default deployment environment (R-55, OTel resource attribute).
-pub const DEFAULT_ENVIRONMENT: &str = "development";
 
 // ============================================================================
 // Bounds on the ADR-0036 client-signalling knobs
@@ -276,27 +244,15 @@ fn parse_unit_fraction(
     })
 }
 
-/// An OPTIONAL seconds value: absent = `default`; present but unparseable or
-/// above `max` refuses boot (never a silent fallback).
-fn optional_seconds(
-    vars: &HashMap<String, String>,
-    name: &str,
-    max: u64,
-    default: u64,
-) -> Result<u64, ConfigError> {
-    vars.get(name)
-        .map(|raw| bounded(name, raw, 0, max))
-        .transpose()
-        .map(|v| v.unwrap_or(default))
-}
-
 /// Floor for `MC_MAX_MEETINGS` / `MC_MAX_PARTICIPANTS`: a cap of 0 is a silent
 /// total outage, so it is not a valid value.
 pub const MIN_CAPACITY_CAP: u32 = 1;
 
 /// Meeting Controller configuration.
 ///
-/// Loaded from environment variables with sensible defaults.
+/// Loaded from environment variables. Every behaviour and topology key is
+/// REQUIRED (no code defaults); only identity (`MC_ID`) and the telemetry
+/// export switch (`OTEL_ENABLED`, `OTLP_ENDPOINT`) have an unset meaning.
 /// Sensitive fields are redacted in Debug output.
 #[derive(Clone)]
 #[allow(dead_code)] // Fields used in Phase 6b+
@@ -329,20 +285,27 @@ pub struct Config {
     /// Maximum total participants across all meetings.
     pub max_participants: u32,
 
-    /// Clock skew allowance in seconds (default: 5, per ADR-0023).
+    /// Clock skew allowance in seconds (ADR-0023; `MC_CLOCK_SKEW_SECONDS`,
+    /// REQUIRED, bounded `0..=common::jwt::MAX_CLOCK_SKEW`).
     pub clock_skew_seconds: u64,
 
-    /// Participant disconnect grace period in seconds (default: 30, per ADR-0023).
+    /// Reconnect grace for a participant whose connection was LOST, in seconds
+    /// (ADR-0023; `MC_DISCONNECT_GRACE_PERIOD_SECONDS`, REQUIRED, bounded
+    /// `0..=BINDING_TOKEN_TTL`). A deliberate leave never waits on it.
     /// Enforced by every meeting actor via [`Self::meeting_timers`].
     pub disconnect_grace_period_seconds: u64,
 
     /// How long a meeting no participant has joined is kept before it ends
-    /// (`MC_MEETING_JOIN_WINDOW_SECONDS`). OPTIONAL: unset = the derived
-    /// default `actors::meeting_timers::MAX_JOIN_WINDOW`; bounded to
-    /// `MIN_JOIN_WINDOW..=MAX_JOIN_WINDOW`, fail-loud.
+    /// (`MC_MEETING_JOIN_WINDOW_SECONDS`). REQUIRED, bounded to
+    /// `MIN_JOIN_WINDOW..=MAX_JOIN_WINDOW` (the derived value is a ceiling,
+    /// never a fallback), fail-loud.
     pub meeting_join_window_seconds: u64,
 
-    /// QUIC max-idle-timeout in seconds for the WebTransport server (default: 10).
+    /// QUIC max-idle-timeout in seconds for the WebTransport server
+    /// (`MC_QUIC_MAX_IDLE_TIMEOUT_SECONDS`, REQUIRED). The ONLY detector of a
+    /// crash / network-loss departure; paired with a keep-alive below it so a
+    /// quiet healthy connection is never idle-timed-out. Effective value is
+    /// `min(this, peer's)`.
     ///
     /// Bounds detection of a crash/network-loss departure. Parsed FAIL-LOUD
     /// (non-numeric or `0` is rejected at load) — an invalid value must not
@@ -397,12 +360,12 @@ pub struct Config {
     /// Consumed by `init_otel` only when `otel_enabled` is `true`.
     pub otel_endpoint: String,
 
-    /// Trace sample rate in `[0.0, 1.0]` (R-55, env `OTEL_SAMPLE_RATE`, default
-    /// `1.0`). Parsed here; range validation is `init_otel`'s responsibility.
+    /// Trace sample rate in `[0.0, 1.0]` (R-55, env `OTEL_SAMPLE_RATE`,
+    /// REQUIRED). Parsed here; range validation is `init_otel`'s responsibility.
     pub otel_sample_rate: f64,
 
     /// Deployment environment resource attribute (R-55, env
-    /// `DEPLOYMENT_ENVIRONMENT`, default `"development"`).
+    /// `DEPLOYMENT_ENVIRONMENT`, REQUIRED).
     pub environment: String,
 
     // ========================================================================
@@ -708,30 +671,29 @@ impl Config {
             })?
             .clone();
 
+        // Topology: REQUIRED (meeting-end-safety P2). A code default here
+        // ran a pod that started, passed readiness and talked to nothing
+        // (`localhost` GC, a wrong region) when a key went missing.
         let webtransport_bind_address = vars
             .get("MC_WEBTRANSPORT_BIND_ADDRESS")
-            .cloned()
-            .unwrap_or_else(|| DEFAULT_WEBTRANSPORT_BIND_ADDRESS.to_string());
-
+            .ok_or_else(|| ConfigError::MissingEnvVar("MC_WEBTRANSPORT_BIND_ADDRESS".to_string()))?
+            .clone();
         let grpc_bind_address = vars
             .get("MC_GRPC_BIND_ADDRESS")
-            .cloned()
-            .unwrap_or_else(|| DEFAULT_GRPC_BIND_ADDRESS.to_string());
-
+            .ok_or_else(|| ConfigError::MissingEnvVar("MC_GRPC_BIND_ADDRESS".to_string()))?
+            .clone();
         let health_bind_address = vars
             .get("MC_HEALTH_BIND_ADDRESS")
-            .cloned()
-            .unwrap_or_else(|| DEFAULT_HEALTH_BIND_ADDRESS.to_string());
-
+            .ok_or_else(|| ConfigError::MissingEnvVar("MC_HEALTH_BIND_ADDRESS".to_string()))?
+            .clone();
         let region = vars
             .get("MC_REGION")
-            .cloned()
-            .unwrap_or_else(|| "us-east-1".to_string());
-
+            .ok_or_else(|| ConfigError::MissingEnvVar("MC_REGION".to_string()))?
+            .clone();
         let gc_grpc_url = vars
             .get("GC_GRPC_URL")
-            .cloned()
-            .unwrap_or_else(|| "http://localhost:50051".to_string());
+            .ok_or_else(|| ConfigError::MissingEnvVar("GC_GRPC_URL".to_string()))?
+            .clone();
 
         // Capacity limits (R-37): REQUIRED. A missing key, an unparseable value
         // or 0 refuses boot. Before story 4 MC-A both silently fell back to a
@@ -755,53 +717,54 @@ impl Config {
             u32::MAX,
         )?;
 
-        // ADR-0023 session-binding parameters: OPTIONAL (absent = default),
-        // but an unparseable value refuses boot — never a silent default.
-        // MC_CLOCK_SKEW_SECONDS is also bounded by the shared JWT ceiling
-        // (`common::jwt::MAX_CLOCK_SKEW`, as AC enforces), which is what makes
-        // `main.rs`'s "bounded to <= MAX_CLOCK_SKEW" cast justifications true.
+        // ADR-0023 session-binding parameters: REQUIRED (meeting-end-safety
+        // P2), bounded, fail-loud. MC_CLOCK_SKEW_SECONDS is also bounded by the
+        // shared JWT ceiling (`common::jwt::MAX_CLOCK_SKEW`, as AC enforces),
+        // which is what makes `main.rs`'s "bounded to <= MAX_CLOCK_SKEW" cast
+        // justifications true.
         //
         // `MC_BINDING_TOKEN_TTL_SECONDS` and `MC_NONCE_GRACE_WINDOW_SECONDS`
-        // were REMOVED (2026-11-12 join-window devloop, closing the docs/TODO.md
-        // "parsed but never consumed" entry): neither was enforced — the binding
-        // TTL is `actors::session::BINDING_TOKEN_TTL`, which also caps the
-        // disconnect grace — so a key an operator could set while a different
-        // value ran was a hazard. Both are now unread (see
+        // were REMOVED (2026-11-12 join-window devloop): neither was enforced —
+        // the binding TTL is `actors::session::BINDING_TOKEN_TTL`, which also
+        // caps the disconnect grace. Both are now unread (see
         // `test_retired_keys_are_not_read`).
-        let clock_skew_seconds = optional_seconds(
-            vars,
+        let clock_skew_seconds = bounded(
             "MC_CLOCK_SKEW_SECONDS",
+            vars.get("MC_CLOCK_SKEW_SECONDS")
+                .ok_or_else(|| ConfigError::MissingEnvVar("MC_CLOCK_SKEW_SECONDS".to_string()))?,
+            0,
             common::jwt::MAX_CLOCK_SKEW.as_secs(),
-            DEFAULT_CLOCK_SKEW_SECONDS,
         )?;
         // Ceiling = the binding-token TTL (security S-1): a longer grace cannot
         // serve any reconnect (the binding token has expired), it only keeps a
         // departed participant on the roster — deferring the leave KEK
-        // rotation and keeping the meeting alive. Configurable DOWNWARD only.
-        // Floor 0 fails closed (immediate removal).
-        let disconnect_grace_period_seconds = optional_seconds(
-            vars,
+        // rotation and keeping the meeting alive. Floor 0 fails closed
+        // (immediate removal). The grace covers network LOSS only: a deliberate
+        // leave (`LeaveRequest`) removes at once.
+        let disconnect_grace_period_seconds = bounded(
             "MC_DISCONNECT_GRACE_PERIOD_SECONDS",
+            vars.get("MC_DISCONNECT_GRACE_PERIOD_SECONDS")
+                .ok_or_else(|| {
+                    ConfigError::MissingEnvVar("MC_DISCONNECT_GRACE_PERIOD_SECONDS".to_string())
+                })?,
+            0,
             crate::actors::session::BINDING_TOKEN_TTL.as_secs(),
-            DEFAULT_DISCONNECT_GRACE_PERIOD_SECONDS,
         )?;
-        // The join window: OPTIONAL (unset = the derived default), bounded on
-        // BOTH sides. The floor (`LIFETIME_TICK`) is the observer tolerance the
-        // end is checked against (the window itself is an exact deadline) and
-        // refuses a degenerate 0 / sub-tick window; the ceiling (the derived default) keeps the never-joined
-        // leak from being configured back in. See `actors::meeting_timers`.
-        let meeting_join_window_seconds = vars
-            .get("MC_MEETING_JOIN_WINDOW_SECONDS")
-            .map(|raw| {
-                bounded(
-                    "MC_MEETING_JOIN_WINDOW_SECONDS",
-                    raw,
-                    MIN_JOIN_WINDOW.as_secs(),
-                    MAX_JOIN_WINDOW.as_secs(),
-                )
-            })
-            .transpose()?
-            .unwrap_or(MAX_JOIN_WINDOW.as_secs());
+        // The join window: REQUIRED, bounded on BOTH sides. The floor
+        // (`MIN_JOIN_WINDOW`, shared with GC as
+        // `common::meeting_lifecycle::MIN_MEETING_JOIN_WINDOW`) refuses a
+        // degenerate 0 / sub-tick window and is what GC's accept->commit budget
+        // sits under; the ceiling (`MAX_JOIN_WINDOW`, derived) keeps the
+        // never-joined leak from being configured back in. The derived value
+        // is a ceiling only, never a value MC runs. See `actors::meeting_timers`.
+        let meeting_join_window_seconds = bounded(
+            "MC_MEETING_JOIN_WINDOW_SECONDS",
+            vars.get("MC_MEETING_JOIN_WINDOW_SECONDS").ok_or_else(|| {
+                ConfigError::MissingEnvVar("MC_MEETING_JOIN_WINDOW_SECONDS".to_string())
+            })?,
+            MIN_JOIN_WINDOW.as_secs(),
+            MAX_JOIN_WINDOW.as_secs(),
+        )?;
 
         // QUIC max-idle-timeout: FAIL-LOUD parse (mirrors the OTEL_SAMPLE_RATE
         // pattern; every numeric MC key is fail-loud since story 4 MC-A). A
@@ -810,9 +773,12 @@ impl Config {
         // futures, and it re-introduces the unbounded crash-detection bug),
         // must crash the process at load rather than silently reverting to a
         // library default.
-        let quic_max_idle_timeout_seconds = if let Some(value_str) =
-            vars.get("MC_QUIC_MAX_IDLE_TIMEOUT_SECONDS")
-        {
+        let quic_max_idle_timeout_seconds = {
+            let value_str = vars
+                .get("MC_QUIC_MAX_IDLE_TIMEOUT_SECONDS")
+                .ok_or_else(|| {
+                    ConfigError::MissingEnvVar("MC_QUIC_MAX_IDLE_TIMEOUT_SECONDS".to_string())
+                })?;
             let parsed = value_str.trim().parse::<u64>().map_err(|e| {
                 ConfigError::InvalidValue(format!(
                     "MC_QUIC_MAX_IDLE_TIMEOUT_SECONDS must be a positive integer, got '{value_str}': {e}"
@@ -824,8 +790,6 @@ impl Config {
                 ));
             }
             parsed
-        } else {
-            DEFAULT_QUIC_MAX_IDLE_TIMEOUT_SECONDS
         };
 
         // Generate MC instance ID
@@ -862,21 +826,24 @@ impl Config {
         // `init_otel` — which re-validates at startup on the enabled path. We do
         // NOT duplicate the range check here (mirrors AC/GC/MH). Non-numeric
         // still fails fast at load rather than silently sampling at the default.
-        let otel_sample_rate = if let Some(value_str) = vars.get("OTEL_SAMPLE_RATE") {
+        // REQUIRED (meeting-end-safety P2, uniform across services): unset
+        // used to substitute 1.0 silently.
+        let otel_sample_rate = {
+            let value_str = vars
+                .get("OTEL_SAMPLE_RATE")
+                .ok_or_else(|| ConfigError::MissingEnvVar("OTEL_SAMPLE_RATE".to_string()))?;
             value_str.parse::<f64>().map_err(|e| {
                 ConfigError::InvalidOtelConfig(format!(
                     "OTEL_SAMPLE_RATE must be a number, got '{}': {}",
                     value_str, e
                 ))
             })?
-        } else {
-            DEFAULT_OTEL_SAMPLE_RATE
         };
 
         let environment = vars
             .get("DEPLOYMENT_ENVIRONMENT")
-            .cloned()
-            .unwrap_or_else(|| DEFAULT_ENVIRONMENT.to_string());
+            .ok_or_else(|| ConfigError::MissingEnvVar("DEPLOYMENT_ENVIRONMENT".to_string()))?
+            .clone();
 
         // Story 3 R-1/R-26: the per-kind receive-slot caps. Required,
         // fail-loud, bounded on both sides. Video's floor is 0 (the off lever).
@@ -1360,6 +1327,43 @@ mod tests {
             ),
             ("MC_TLS_CERT_PATH".to_string(), "/dev/null".to_string()),
             ("MC_TLS_KEY_PATH".to_string(), "/dev/null".to_string()),
+            // meeting-end-safety P2: REQUIRED topology/behaviour keys (no Rust
+            // default). Literals, the base config.env's values.
+            (
+                "MC_WEBTRANSPORT_BIND_ADDRESS".to_string(),
+                "0.0.0.0:4433".to_string(),
+            ),
+            (
+                "MC_GRPC_BIND_ADDRESS".to_string(),
+                "0.0.0.0:50052".to_string(),
+            ),
+            (
+                "MC_HEALTH_BIND_ADDRESS".to_string(),
+                "0.0.0.0:8081".to_string(),
+            ),
+            ("MC_REGION".to_string(), "us-east-1".to_string()),
+            (
+                "GC_GRPC_URL".to_string(),
+                "http://localhost:50051".to_string(),
+            ),
+            ("MC_CLOCK_SKEW_SECONDS".to_string(), "5".to_string()),
+            (
+                "MC_DISCONNECT_GRACE_PERIOD_SECONDS".to_string(),
+                "30".to_string(),
+            ),
+            (
+                "MC_MEETING_JOIN_WINDOW_SECONDS".to_string(),
+                "30".to_string(),
+            ),
+            (
+                "MC_QUIC_MAX_IDLE_TIMEOUT_SECONDS".to_string(),
+                "10".to_string(),
+            ),
+            ("OTEL_SAMPLE_RATE".to_string(), "1.0".to_string()),
+            (
+                "DEPLOYMENT_ENVIRONMENT".to_string(),
+                "development".to_string(),
+            ),
             // R-37: REQUIRED caps (today's deployed values).
             ("MC_MAX_MEETINGS".to_string(), "1000".to_string()),
             ("MC_MAX_PARTICIPANTS".to_string(), "10000".to_string()),
@@ -1853,31 +1857,23 @@ mod tests {
     }
 
     #[test]
-    fn test_from_vars_success_with_defaults() {
+    fn test_from_vars_success_with_the_base_values() {
         let vars = base_vars();
 
         let config = Config::from_vars(&vars).expect("Config should load successfully");
 
         assert_eq!(config.redis_url.expose_secret(), "redis://localhost:6379");
-        assert_eq!(
-            config.webtransport_bind_address,
-            DEFAULT_WEBTRANSPORT_BIND_ADDRESS
-        );
-        assert_eq!(config.grpc_bind_address, DEFAULT_GRPC_BIND_ADDRESS);
-        assert_eq!(config.health_bind_address, DEFAULT_HEALTH_BIND_ADDRESS);
+        assert_eq!(config.webtransport_bind_address, "0.0.0.0:4433");
+        assert_eq!(config.grpc_bind_address, "0.0.0.0:50052");
+        assert_eq!(config.health_bind_address, "0.0.0.0:8081");
         assert_eq!(config.region, "us-east-1");
         assert_eq!(config.gc_grpc_url, "http://localhost:50051");
         assert_eq!(config.max_meetings, 1000);
         assert_eq!(config.max_participants, 10000);
-        assert_eq!(config.clock_skew_seconds, DEFAULT_CLOCK_SKEW_SECONDS);
-        assert_eq!(
-            config.disconnect_grace_period_seconds,
-            DEFAULT_DISCONNECT_GRACE_PERIOD_SECONDS
-        );
-        assert_eq!(
-            config.quic_max_idle_timeout_seconds,
-            DEFAULT_QUIC_MAX_IDLE_TIMEOUT_SECONDS
-        );
+        assert_eq!(config.clock_skew_seconds, 5);
+        assert_eq!(config.disconnect_grace_period_seconds, 30);
+        assert_eq!(config.meeting_join_window_seconds, 30);
+        assert_eq!(config.quic_max_idle_timeout_seconds, 10);
         // MC ID should be auto-generated
         assert!(config.mc_id.starts_with("mc-"));
         assert_eq!(
@@ -1947,14 +1943,52 @@ mod tests {
         Config::from_vars(&vars)
     }
 
+    /// meeting-end-safety P2: every behaviour/topology key is REQUIRED. Unset
+    /// refuses boot with an error naming THE key — never a derived or code
+    /// default (the join window's derived value is a ceiling only).
     #[test]
-    fn join_window_unset_is_the_derived_default() {
-        let config = Config::from_vars(&base_vars()).expect("Config should load");
+    fn every_behaviour_and_topology_key_is_required() {
+        for key in [
+            "MC_MEETING_JOIN_WINDOW_SECONDS",
+            "MC_DISCONNECT_GRACE_PERIOD_SECONDS",
+            "MC_CLOCK_SKEW_SECONDS",
+            "MC_QUIC_MAX_IDLE_TIMEOUT_SECONDS",
+            "MC_WEBTRANSPORT_BIND_ADDRESS",
+            "MC_GRPC_BIND_ADDRESS",
+            "MC_HEALTH_BIND_ADDRESS",
+            "MC_REGION",
+            "GC_GRPC_URL",
+            "OTEL_SAMPLE_RATE",
+            "DEPLOYMENT_ENVIRONMENT",
+        ] {
+            let mut vars = base_vars();
+            vars.remove(key);
+            match Config::from_vars(&vars) {
+                Err(ConfigError::MissingEnvVar(k)) => assert_eq!(k, key),
+                other => panic!("{key} unset must refuse boot naming it, got {other:?}"),
+            }
+        }
+    }
+
+    /// The clock skew is bounded by the shared JWT ceiling, fail-loud.
+    #[test]
+    fn clock_skew_is_bounded_by_the_jwt_ceiling() {
+        let ceiling = common::jwt::MAX_CLOCK_SKEW.as_secs();
+        let with_skew = |raw: String| {
+            let mut vars = base_vars();
+            vars.insert("MC_CLOCK_SKEW_SECONDS".to_string(), raw);
+            Config::from_vars(&vars)
+        };
         assert_eq!(
-            config.meeting_join_window_seconds,
-            crate::actors::meeting_timers::MAX_JOIN_WINDOW.as_secs()
+            with_skew(ceiling.to_string()).unwrap().clock_skew_seconds,
+            ceiling
         );
-        assert_eq!(config.meeting_join_window_seconds, 975);
+        for bad in [(ceiling + 1).to_string(), "abc".to_string(), String::new()] {
+            assert!(
+                matches!(with_skew(bad.clone()), Err(ConfigError::InvalidValue(ref m)) if m.contains("MC_CLOCK_SKEW_SECONDS")),
+                "MC_CLOCK_SKEW_SECONDS={bad:?} must refuse boot"
+            );
+        }
     }
 
     #[test]
@@ -1997,7 +2031,6 @@ mod tests {
             with_grace((ceiling + 1).to_string()),
             Err(ConfigError::InvalidValue(_))
         ));
-        assert!(DEFAULT_DISCONNECT_GRACE_PERIOD_SECONDS <= ceiling);
     }
 
     /// Distinct values, so a swapped field or a dropped key is caught.
@@ -2020,15 +2053,6 @@ mod tests {
     // =========================================================================
     // QUIC max-idle-timeout config — FAIL-LOUD parse (task #64)
     // =========================================================================
-
-    #[test]
-    fn test_quic_max_idle_timeout_default() {
-        let config = Config::from_vars(&base_vars()).expect("Config should load");
-        assert_eq!(
-            config.quic_max_idle_timeout_seconds,
-            DEFAULT_QUIC_MAX_IDLE_TIMEOUT_SECONDS
-        );
-    }
 
     #[test]
     fn test_quic_max_idle_timeout_custom_value() {
@@ -2275,12 +2299,12 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_otel_defaults_disabled() {
+    fn test_otel_unset_enabled_is_off_and_rate_and_environment_are_taken_verbatim() {
         let config = Config::from_vars(&base_vars()).expect("Config should load");
         assert!(!config.otel_enabled);
         assert_eq!(config.otel_endpoint, "");
-        assert!((config.otel_sample_rate - DEFAULT_OTEL_SAMPLE_RATE).abs() < f64::EPSILON);
-        assert_eq!(config.environment, DEFAULT_ENVIRONMENT);
+        assert!((config.otel_sample_rate - 1.0).abs() < f64::EPSILON);
+        assert_eq!(config.environment, "development");
     }
 
     #[test]

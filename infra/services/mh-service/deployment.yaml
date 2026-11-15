@@ -111,6 +111,17 @@ spec:
             configMapKeyRef:
               name: mh-service-config
               key: MH_WEBTRANSPORT_BIND_ADDRESS
+        # REQUIRED telemetry attributes (meeting-end safety P2): no Rust default.
+        - name: OTEL_SAMPLE_RATE
+          valueFrom:
+            configMapKeyRef:
+              name: mh-service-config
+              key: OTEL_SAMPLE_RATE
+        - name: DEPLOYMENT_ENVIRONMENT
+          valueFrom:
+            configMapKeyRef:
+              name: mh-service-config
+              key: DEPLOYMENT_ENVIRONMENT
         # RETIRED — PENDING REMOVAL, and this reference is deliberately KEPT.
         # Since story 2 task 8's image, nothing reads MH_MAX_STREAMS.
         # The ref stays as a cheap ordering discipline: the read goes one
@@ -332,47 +343,24 @@ spec:
               containerName: mh-service
               resource: limits.memory
               divisor: "1"
-        # OPTIONAL AT THE MANIFEST LAYER TOO, deliberately — the only LIVE key
-        # in this file that is (the retired keys are the other case; see the
-        # end of this comment).
+        # THE RULE: a hard configMapKeyRef is correct when a missing key must
+        # be a LOUD STARTUP FAILURE rather than a silent fallback — and since
+        # meeting-end safety P2 (2026-11-15) every LIVE key MH reads is REQUIRED
+        # in code, so every live ref here is hard (`dt-guard env-config` check 7
+        # refuses an `optional: true` ref to a key config.rs requires).
         #
-        # THE RULE, and it is NOT "required by config.rs": a hard
-        # configMapKeyRef is correct when a missing key must be a LOUD STARTUP
-        # FAILURE rather than a silent fallback. That covers both the keys
-        # config.rs requires AND keys whose code default is wrong for a cluster
-        # — GC_GRPC_URL defaults to http://localhost:50051 and MH_REGION to
-        # us-east-1, so under `optional: true` a missing key would give you a
-        # pod that starts, passes readiness and talks to nothing. Several keys
-        # in this file are optional-with-default in code and hard-referenced
-        # anyway, deliberately and correctly. DO NOT flip them.
-        #
-        # `optional: true` is correct only when the code default IS the intended
-        # production behaviour AND decoupling the manifest rollback from the
-        # image rollback matters. Among LIVE keys that is this key alone:
-        # mh-service falls
-        # back to DEFAULT_MEDIA_LATENCY_SAMPLE_RATIO, which is the value we
-        # want, and a hard reference would make the kubelet refuse to start the
-        # container when the key is absent (CreateContainerConfigError), forcing
-        # the deployment and the ConfigMap to roll back together — the
-        # deploy-time coupling optional-with-default was chosen to avoid,
-        # reintroduced one layer down.
-        #
-        # THE RETIRED KEYS ARE ALSO `optional: true` (MH_MAX_STREAMS,
+        # THE RETIRED KEYS ARE `optional: true` (MH_MAX_STREAMS,
         # MH_STREAM_COST_*_BPS, MH_MAX_MUTED_SOURCES_PER_MEETING here, and
-        # MC_MAX_RECEIVE_SLOTS + MC_AUDIO_* in the MC Deployments), and that
-        # does NOT contradict "DO NOT flip them": the warning covers keys whose
-        # absence must be LOUD, and a key nothing reads (after its code task
-        # removes the read) cannot be loud. Every one of them is now unread
-        # (MH's code tasks and story 3 MC-A removed the reads), and each key
-        # stays present for one more deploy, so the flag loosens no bound: a
-        # rollback to an image that still reads one as REQUIRED finds it.
-        # It is step 1 of the two-deploy retirement in docs/TODO.md.
+        # MC_MAX_RECEIVE_SLOTS + MC_AUDIO_* in the MC Deployments): nothing
+        # reads them, so their absence is behaviourally identical to their
+        # presence. They are step 1 of the two-deploy retirement in
+        # docs/TODO.md ("Delete the story-3 retired config keys"), which is
+        # ready to execute.
         - name: MH_MEDIA_LATENCY_SAMPLE_RATIO
           valueFrom:
             configMapKeyRef:
               name: mh-service-config
               key: MH_MEDIA_LATENCY_SAMPLE_RATIO
-              optional: true
         # Drain window, DERIVED — do not hand-edit this value.
         #
         # The single source of truth is this deployment's own

@@ -3,7 +3,7 @@
 //! Provides TestAuthServer for spawning real AC server instances in tests.
 
 use crate::crypto_fixtures::test_master_key;
-use ac_service::config::{Config, DEFAULT_BCRYPT_COST};
+use ac_service::config::{Config, RECOMMENDED_MIN_BCRYPT_COST};
 use ac_service::crypto;
 use ac_service::handlers::auth_handler::AppState;
 use ac_service::repositories::{service_credentials, signing_keys};
@@ -73,16 +73,18 @@ impl TestAuthServer {
             hash_secret: SecretBox::new(Box::new(master_key.clone())), // Use same as master_key for tests
             otel_enabled: false,
             otel_endpoint: String::new(),
-            otel_sample_rate: ac_service::config::DEFAULT_OTEL_SAMPLE_RATE,
-            environment: ac_service::config::DEFAULT_DEPLOYMENT_ENVIRONMENT.to_string(),
-            jwt_clock_skew_seconds: ac_service::config::DEFAULT_JWT_CLOCK_SKEW.as_secs() as i64,
-            bcrypt_cost: DEFAULT_BCRYPT_COST,
-            rate_limit_window_minutes: ac_service::config::DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-            rate_limit_max_attempts: ac_service::config::DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+            otel_sample_rate: 1.0,
+            environment: "development".to_string(),
+            jwt_clock_skew_seconds: ac_service::config::RECOMMENDED_JWT_CLOCK_SKEW.as_secs() as i64,
+            bcrypt_cost: RECOMMENDED_MIN_BCRYPT_COST,
+            rate_limit_window_minutes: ac_service::config::RECOMMENDED_RATE_LIMIT_WINDOW_MINUTES,
+            rate_limit_max_attempts: ac_service::config::RECOMMENDED_RATE_LIMIT_MAX_ATTEMPTS,
             registration_rate_limit_window_minutes:
-                ac_service::config::DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
+                ac_service::config::RECOMMENDED_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
             registration_rate_limit_max_attempts:
-                ac_service::config::DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
+                ac_service::config::RECOMMENDED_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
+            cluster_name: "test-cluster".to_string(),
+            drain_seconds: 0,
         };
 
         // Create application state
@@ -174,7 +176,8 @@ impl TestAuthServer {
     ) -> Result<String, anyhow::Error> {
         // Use deterministic test secret for reproducibility
         let client_secret = "test-secret-12345";
-        let client_secret_hash = crypto::hash_client_secret(client_secret, DEFAULT_BCRYPT_COST)?;
+        let client_secret_hash =
+            crypto::hash_client_secret(client_secret, RECOMMENDED_MIN_BCRYPT_COST)?;
 
         // Convert scopes to Vec<String>
         let scopes_vec: Vec<String> = scopes.iter().map(|s| s.to_string()).collect();
@@ -391,7 +394,7 @@ impl TestAuthServer {
         display_name: &str,
     ) -> Result<uuid::Uuid, anyhow::Error> {
         // Hash password with bcrypt (use low cost for tests)
-        let password_hash = crypto::hash_client_secret(password, DEFAULT_BCRYPT_COST)
+        let password_hash = crypto::hash_client_secret(password, RECOMMENDED_MIN_BCRYPT_COST)
             .map_err(|e| anyhow::anyhow!("Failed to hash password: {:?}", e))?;
 
         let user: (uuid::Uuid,) = sqlx::query_as(
@@ -444,7 +447,7 @@ impl TestAuthServer {
         display_name: &str,
     ) -> Result<uuid::Uuid, anyhow::Error> {
         // Hash password with bcrypt (use low cost for tests)
-        let password_hash = crypto::hash_client_secret(password, DEFAULT_BCRYPT_COST)
+        let password_hash = crypto::hash_client_secret(password, RECOMMENDED_MIN_BCRYPT_COST)
             .map_err(|e| anyhow::anyhow!("Failed to hash password: {:?}", e))?;
 
         let user: (uuid::Uuid,) = sqlx::query_as(

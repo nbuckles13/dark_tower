@@ -1953,19 +1953,73 @@ pub fn record_teardown_fence_backstop() {
     .increment(1);
 }
 
-/// Record the result of one `NotifyMeetingEnded` call to GC.
+/// The outcome of one `NotifyMeetingEnded` ATTEMPT to GC.
+///
+/// The notify is fenced by `assignment_id` (a duplicate can only end its own
+/// incarnation), so MC retries it until GC answers. `Acked` = GC answered
+/// ENDED or NOT_CURRENT (MC's action is the same: stop); `Retried` = this
+/// attempt failed and the notification stays pending; `Rejected` = GC said the
+/// request is invalid, or answered UNSPECIFIED — a defect, final, never
+/// retried. Drops (queue full / shutdown) are NOT here: they keep their own
+/// counter, `mc_gc_meeting_ended_notifications_dropped_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotifyMeetingEndedOutcome {
+    Acked,
+    Retried,
+    Rejected,
+}
+
+impl NotifyMeetingEndedOutcome {
+    pub const ALL: [Self; 3] = [Self::Acked, Self::Retried, Self::Rejected];
+
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Acked => "acked",
+            Self::Retried => "retried",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
+/// Record one `NotifyMeetingEnded` attempt.
 ///
 /// Metric: `mc_gc_notify_meeting_ended_total`
-/// Labels: `status` (success, error)
-/// Cardinality: 2
+/// Labels: `outcome` (acked, retried, rejected)
+/// Cardinality: 3
 ///
 /// A GC-coordination metric, like its `mc_gc_heartbeats_total` sibling — not a
-/// media-path one — so it carries no `key_custody`. Coarse `status`, because a
-/// fire-and-forget notification's remedies do not differ by failure mode. A
-/// sustained `error` leaves GC holding a live assignment for an ended meeting,
-/// and joins to that id then get `MeetingNotFound` until MC restarts.
-pub fn record_gc_notify_meeting_ended(status: &'static str) {
-    counter!("mc_gc_notify_meeting_ended_total", "status" => status).increment(1);
+/// media-path one — so it carries no `key_custody`. `retried` measures GC RPC
+/// flakiness, NOT user impact (a retried notify that later acks harmed nobody);
+/// the user-visible symptom — a meeting id GC still routes to MC after MC
+/// ended it — is `mc_gc_notify_meeting_ended_oldest_pending_age_seconds`.
+/// `rejected` is a defect (GC refused the request as invalid, or answered with
+/// no outcome) and is alerted on at once.
+pub fn record_gc_notify_meeting_ended(outcome: NotifyMeetingEndedOutcome) {
+    counter!("mc_gc_notify_meeting_ended_total", "outcome" => outcome.label()).increment(1);
+}
+
+/// Publish the meeting-ended notifications not yet answered by GC, and the age
+/// of the OLDEST of them.
+///
+/// Metrics: `mc_gc_notify_meeting_ended_pending`,
+/// `mc_gc_notify_meeting_ended_oldest_pending_age_seconds`
+/// Labels: none
+/// Cardinality: 1 each
+///
+/// The age is the alerting signal (`MCNotifyMeetingEndedStuck`): a COUNT reads
+/// above zero under routine churn (a notify milliseconds into a successful
+/// send), while the oldest entry's age only grows when something is genuinely
+/// not getting through. Both read 0 when nothing is pending. While an entry is
+/// pending, GC still routes joins for that meeting id to this MC, which no
+/// longer holds it.
+pub fn set_gc_notify_meeting_ended_pending(count: usize, oldest_age: Duration) {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "bounded by MEETING_ENDED_QUEUE_CAPACITY, far below 2^52"
+    )]
+    gauge!("mc_gc_notify_meeting_ended_pending").set(count as f64);
+    gauge!("mc_gc_notify_meeting_ended_oldest_pending_age_seconds").set(oldest_age.as_secs_f64());
 }
 
 /// Record a meeting-ended notification DROPPED before it was attempted,
@@ -2850,9 +2904,10 @@ pub fn zero_initialize_counters() {
     counter!("mc_media_teardown_fence_backstop_total", KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR)
         .increment(0);
     // GC-coordination, no key_custody (see `record_gc_notify_meeting_ended`).
-    for status in STATUS_SUCCESS_ERROR {
-        counter!("mc_gc_notify_meeting_ended_total", "status" => *status).increment(0);
+    for o in NotifyMeetingEndedOutcome::ALL {
+        counter!("mc_gc_notify_meeting_ended_total", "outcome" => o.label()).increment(0);
     }
+    set_gc_notify_meeting_ended_pending(0, Duration::ZERO);
     counter!("mc_gc_meeting_ended_notifications_dropped_total").increment(0);
     for o in FloorAdoption::ALL {
         counter!("mc_media_policy_generation_adoptions_total", "outcome" => o.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
@@ -4104,16 +4159,18 @@ mod tests {
             .assert_delta(1);
     }
 
-    /// `mc_gc_notify_meeting_ended_total` — both statuses, no `key_custody`
-    /// (a GC-coordination metric, like its heartbeat sibling).
+    /// `mc_gc_notify_meeting_ended_total` — every outcome on its own cell, no
+    /// `key_custody` (a GC-coordination metric, like its heartbeat sibling).
     #[test]
-    fn record_gc_notify_meeting_ended_covers_both_statuses() {
-        for status in STATUS_SUCCESS_ERROR.iter().copied() {
+    fn record_gc_notify_meeting_ended_counts_each_outcome_on_its_own_cell() {
+        for outcome in NotifyMeetingEndedOutcome::ALL {
             let snap = MetricAssertion::snapshot();
-            record_gc_notify_meeting_ended(status);
-            snap.counter("mc_gc_notify_meeting_ended_total")
-                .with_labels(&[("status", status)])
-                .assert_delta(1);
+            record_gc_notify_meeting_ended(outcome);
+            for other in NotifyMeetingEndedOutcome::ALL {
+                snap.counter("mc_gc_notify_meeting_ended_total")
+                    .with_labels(&[("outcome", other.label())])
+                    .assert_delta(u64::from(other == outcome));
+            }
         }
     }
 

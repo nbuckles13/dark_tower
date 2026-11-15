@@ -28,7 +28,7 @@ import type {
 } from '../media/setup/seams.js';
 import type { VideoRenderState } from '../media/pipeline/renderDecision.js';
 import type { Vp8Profile } from '../media/setup/vp8.js';
-import type { WebTransportConnectFn } from '../signaling/SignalingClient.js';
+import type { LeaveOutcome, WebTransportConnectFn } from '../signaling/SignalingClient.js';
 import type { HandlerSetView, MediaHandlerView } from '../media/handlerSet.js';
 import type { TransportScheduler } from '../media/events.js';
 import type { SlotReconnectingChangedEvent } from './slotContinuity.js';
@@ -49,7 +49,10 @@ import type {
  * the codebase `SignalingErrorCode` idiom) so consumers branch on stable values and
  * observability/UI map them without coupling to internals.
  *
- * Order: `idle -> fetching-token -> connecting-mc -> joining -> joined`. ONE
+ * Order: `idle -> fetching-token -> connecting-mc -> joining -> joined`, then
+ * `disconnecting -> disconnected` on `disconnect()` (`disconnected` once the
+ * signalling transport has closed: after MC acknowledged the LeaveRequest, or
+ * at the leave bound). ONE
  * backward edge: when MC refuses the join because the meeting ended or is
  * ending (`NOT_FOUND` / `CONFLICT`, see `JOIN_RETRY`), `join()` re-enters
  * `fetching-token` to re-run its GC join, at most `JOIN_RETRY.maxAttempts - 1`
@@ -64,6 +67,8 @@ export const MeetingSessionState = {
   Joining: 'joining',
   Joined: 'joined',
   Disconnecting: 'disconnecting',
+  /** Terminal: `disconnect()` finished — the signalling transport is closed. */
+  Disconnected: 'disconnected',
 } as const;
 
 export type MeetingSessionState = (typeof MeetingSessionState)[keyof typeof MeetingSessionState];
@@ -163,6 +168,13 @@ export interface MeetingSessionEventMap {
   error: SdkError;
   /** Emitted on every state-machine transition (the new state). */
   stateChange: MeetingSessionState;
+  /**
+   * Emitted once at the end of `disconnect()`, just before the terminal
+   * `disconnected` state: how the deliberate leave ended (a bounded scalar —
+   * `acknowledged` | `timed_out` | `write_failed` | `not_sent`). Only
+   * `acknowledged` proves MC removed the participant at once.
+   */
+  left: LeaveOutcome;
 
   // --------------------------------------------------------------------------
   // THE FOUR ABSENCE-SIGNALS (ADR-0036 §5/§6/§10)

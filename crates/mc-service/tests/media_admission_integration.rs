@@ -78,6 +78,7 @@ impl Server {
             // already covers.
             .create_meeting_with_seams(
                 meeting_id.to_string(),
+                ::common::meeting_lifecycle::AssignmentId::new_v4(),
                 handlers,
                 mc_service::actors::MeetingSeams {
                     sender_id_cursor: Some(None),

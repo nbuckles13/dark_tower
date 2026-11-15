@@ -13,6 +13,7 @@
 use crate::errors::GcError;
 use crate::observability::metrics;
 use crate::observability::metrics::MC_METHOD_ASSIGN_MEETING_WITH_MH;
+use crate::repositories::AssignmentId;
 use crate::services::mh_selection::MhAssignmentInfo;
 use common::secret::ExposeSecret;
 use common::token_manager::TokenReceiver;
@@ -139,6 +140,7 @@ impl McClient {
     ///
     /// * `mc_endpoint` - gRPC endpoint of the MC
     /// * `meeting_id` - Meeting being assigned
+    /// * `assignment_id` - This attempt's incarnation id (fresh per MC attempt)
     /// * `mh_assignments` - List of MH assignments
     /// * `gc_id` - ID of this GC instance
     ///
@@ -156,6 +158,7 @@ impl McClient {
         &self,
         mc_endpoint: &str,
         meeting_id: &str,
+        assignment_id: AssignmentId,
         mh_assignments: &[MhAssignmentInfo],
         gc_id: &str,
     ) -> Result<McAssignmentResult, GcError> {
@@ -180,6 +183,7 @@ impl McClient {
             meeting_id: meeting_id.to_string(),
             mh_assignments: proto_assignments,
             requesting_gc_id: gc_id.to_string(),
+            assignment_id: assignment_id.to_string(),
         };
 
         // Add authorization header (token accessed via ExposeSecret from TokenReceiver)
@@ -244,11 +248,12 @@ impl McClient {
 /// Trait for MC client operations (enables mocking).
 #[async_trait::async_trait]
 pub trait McClientTrait: Send + Sync {
-    /// Assign a meeting to an MC.
+    /// Assign a meeting to an MC, as incarnation `assignment_id`.
     async fn assign_meeting(
         &self,
         mc_endpoint: &str,
         meeting_id: &str,
+        assignment_id: AssignmentId,
         mh_assignments: &[MhAssignmentInfo],
         gc_id: &str,
     ) -> Result<McAssignmentResult, GcError>;
@@ -260,11 +265,18 @@ impl McClientTrait for McClient {
         &self,
         mc_endpoint: &str,
         meeting_id: &str,
+        assignment_id: AssignmentId,
         mh_assignments: &[MhAssignmentInfo],
         gc_id: &str,
     ) -> Result<McAssignmentResult, GcError> {
-        self.assign_meeting(mc_endpoint, meeting_id, mh_assignments, gc_id)
-            .await
+        self.assign_meeting(
+            mc_endpoint,
+            meeting_id,
+            assignment_id,
+            mh_assignments,
+            gc_id,
+        )
+        .await
     }
 }
 
@@ -276,6 +288,7 @@ pub mod mock {
 
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     /// Mock MC client for unit testing.
     pub struct MockMcClient {
@@ -285,6 +298,11 @@ pub mod mock {
         call_count: AtomicUsize,
         /// Whether to return errors.
         return_error: bool,
+        /// How long each call takes before answering (models a slow MC, for
+        /// the accept->commit budget).
+        delay: Duration,
+        /// Every `assignment_id` received, in call order.
+        assignment_ids: Mutex<Vec<AssignmentId>>,
     }
 
     impl MockMcClient {
@@ -294,6 +312,8 @@ pub mod mock {
                 responses: vec![McAssignmentResult::Accepted],
                 call_count: AtomicUsize::new(0),
                 return_error: false,
+                delay: Duration::ZERO,
+                assignment_ids: Mutex::new(Vec::new()),
             }
         }
 
@@ -303,6 +323,8 @@ pub mod mock {
                 responses: vec![McAssignmentResult::Rejected(reason)],
                 call_count: AtomicUsize::new(0),
                 return_error: false,
+                delay: Duration::ZERO,
+                assignment_ids: Mutex::new(Vec::new()),
             }
         }
 
@@ -312,6 +334,8 @@ pub mod mock {
                 responses,
                 call_count: AtomicUsize::new(0),
                 return_error: false,
+                delay: Duration::ZERO,
+                assignment_ids: Mutex::new(Vec::new()),
             }
         }
 
@@ -321,12 +345,34 @@ pub mod mock {
                 responses: vec![],
                 call_count: AtomicUsize::new(0),
                 return_error: true,
+                delay: Duration::ZERO,
+                assignment_ids: Mutex::new(Vec::new()),
             }
+        }
+
+        /// Make every call take `delay` before answering.
+        #[must_use]
+        pub fn with_delay(mut self, delay: Duration) -> Self {
+            self.delay = delay;
+            self
         }
 
         /// Get the number of calls made.
         pub fn call_count(&self) -> usize {
             self.call_count.load(Ordering::SeqCst)
+        }
+
+        /// Every `assignment_id` received, in call order.
+        ///
+        /// # Panics
+        ///
+        /// If the internal lock is poisoned (a test thread panicked).
+        #[expect(
+            clippy::expect_used,
+            reason = "test mock: a poisoned lock is a test failure"
+        )]
+        pub fn received_assignment_ids(&self) -> Vec<AssignmentId> {
+            self.assignment_ids.lock().expect("lock").clone()
         }
     }
 
@@ -336,10 +382,17 @@ pub mod mock {
             &self,
             _mc_endpoint: &str,
             _meeting_id: &str,
+            assignment_id: AssignmentId,
             _mh_assignments: &[MhAssignmentInfo],
             _gc_id: &str,
         ) -> Result<McAssignmentResult, GcError> {
             let count = self.call_count.fetch_add(1, Ordering::SeqCst);
+            if let Ok(mut ids) = self.assignment_ids.lock() {
+                ids.push(assignment_id);
+            }
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
 
             if self.return_error {
                 return Err(GcError::ServiceUnavailable(
@@ -368,7 +421,13 @@ pub mod mock {
         async fn test_mock_accepting() {
             let mock = MockMcClient::accepting();
             let result = mock
-                .assign_meeting("http://mc:50051", "meeting-1", &[], "gc-1")
+                .assign_meeting(
+                    "http://mc:50051",
+                    "meeting-1",
+                    AssignmentId::new_v4(),
+                    &[],
+                    "gc-1",
+                )
                 .await
                 .unwrap();
 
@@ -380,7 +439,13 @@ pub mod mock {
         async fn test_mock_rejecting() {
             let mock = MockMcClient::rejecting(McRejectionReason::AtCapacity);
             let result = mock
-                .assign_meeting("http://mc:50051", "meeting-1", &[], "gc-1")
+                .assign_meeting(
+                    "http://mc:50051",
+                    "meeting-1",
+                    AssignmentId::new_v4(),
+                    &[],
+                    "gc-1",
+                )
                 .await
                 .unwrap();
 
@@ -394,7 +459,13 @@ pub mod mock {
         async fn test_mock_failing() {
             let mock = MockMcClient::failing();
             let result = mock
-                .assign_meeting("http://mc:50051", "meeting-1", &[], "gc-1")
+                .assign_meeting(
+                    "http://mc:50051",
+                    "meeting-1",
+                    AssignmentId::new_v4(),
+                    &[],
+                    "gc-1",
+                )
                 .await;
 
             assert!(result.is_err());
@@ -410,7 +481,13 @@ pub mod mock {
 
             // First call: AtCapacity
             let r1 = mock
-                .assign_meeting("http://mc:50051", "meeting-1", &[], "gc-1")
+                .assign_meeting(
+                    "http://mc:50051",
+                    "meeting-1",
+                    AssignmentId::new_v4(),
+                    &[],
+                    "gc-1",
+                )
                 .await
                 .unwrap();
             assert!(matches!(
@@ -420,7 +497,13 @@ pub mod mock {
 
             // Second call: Draining
             let r2 = mock
-                .assign_meeting("http://mc:50051", "meeting-1", &[], "gc-1")
+                .assign_meeting(
+                    "http://mc:50051",
+                    "meeting-1",
+                    AssignmentId::new_v4(),
+                    &[],
+                    "gc-1",
+                )
                 .await
                 .unwrap();
             assert!(matches!(
@@ -430,14 +513,26 @@ pub mod mock {
 
             // Third call: Accepted
             let r3 = mock
-                .assign_meeting("http://mc:50051", "meeting-1", &[], "gc-1")
+                .assign_meeting(
+                    "http://mc:50051",
+                    "meeting-1",
+                    AssignmentId::new_v4(),
+                    &[],
+                    "gc-1",
+                )
                 .await
                 .unwrap();
             assert!(matches!(r3, McAssignmentResult::Accepted));
 
             // Fourth call: cycles back to AtCapacity
             let r4 = mock
-                .assign_meeting("http://mc:50051", "meeting-1", &[], "gc-1")
+                .assign_meeting(
+                    "http://mc:50051",
+                    "meeting-1",
+                    AssignmentId::new_v4(),
+                    &[],
+                    "gc-1",
+                )
                 .await
                 .unwrap();
             assert!(matches!(

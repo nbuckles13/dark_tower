@@ -67,9 +67,13 @@ fn service_with_cap(
 
 async fn create(c: &Arc<MeetingControllerActorHandle>, meeting: &str, handlers: &[&str]) {
     let infos: Vec<_> = handlers.iter().map(|h| mh_handler(h)).collect();
-    c.create_meeting(meeting.to_string(), handler_set(&infos))
-        .await
-        .unwrap();
+    c.create_meeting(
+        meeting.to_string(),
+        ::common::meeting_lifecycle::AssignmentId::new_v4(),
+        handler_set(&infos),
+    )
+    .await
+    .unwrap();
 }
 
 async fn handle(c: &Arc<MeetingControllerActorHandle>, meeting: &str) -> MeetingActorHandle {

@@ -405,8 +405,58 @@ describe('MeetingSession.disconnect (R-22/R-23)', () => {
     session.disconnect(); // idempotent
 
     expect(session.state).toBe(MeetingSessionState.Disconnecting);
-    expect(mcClose).toHaveBeenCalledTimes(1);
+    // MH closes synchronously; the signalling transport waits for MC to close
+    // the session after the ONE LeaveRequest (its acknowledgement).
     expect(mhClose).toHaveBeenCalledTimes(1);
+    const mc = mocks.get(MC_ENDPOINT)!;
+    await vi.waitFor(() =>
+      expect(
+        decodeOutboundClientMessages(mc.getOutboundBidiWrites(0)).filter(
+          (m) => m.message.case === 'leaveRequest',
+        ),
+      ).toHaveLength(1),
+    );
+    expect(mcClose).not.toHaveBeenCalled();
+    expect(session.state).toBe(MeetingSessionState.Disconnecting);
+    mc.simulateClose(0);
+    await vi.waitFor(() => expect(mcClose).toHaveBeenCalledTimes(1));
+    // Terminal once the signalling transport closed (MC's acknowledgement).
+    await vi.waitFor(() => expect(session.state).toBe(MeetingSessionState.Disconnected));
+  });
+
+  it('reports the leave outcome, and a listener throwing on `left`/`disconnected` is no unhandled rejection', async () => {
+    const mocks = new Map<string, MockWebTransport>();
+    const session = makeSession(mocks);
+    const joinP = session.join({
+      orgSubdomain: 'demo',
+      meetingCode: MEETING_CODE,
+      credentials: LOGIN,
+    });
+    await driveJoin(mocks, 'all');
+    await joinP;
+
+    const outcomes: string[] = [];
+    session.on('left', (o) => {
+      outcomes.push(o);
+      throw new Error('embedder boom on left');
+    });
+    session.on('stateChange', (st) => {
+      if (st === MeetingSessionState.Disconnected) throw new Error('embedder boom');
+    });
+    const unhandled: unknown[] = [];
+    const onUnhandled = (r: unknown) => unhandled.push(r);
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      session.disconnect();
+      mocks.get(MC_ENDPOINT)!.simulateClose(0);
+      await vi.waitFor(() => expect(outcomes).toEqual(['acknowledged']));
+      // Terminal state reached even though the `left` listener threw.
+      await vi.waitFor(() => expect(session.state).toBe(MeetingSessionState.Disconnected));
+      await new Promise((r) => setTimeout(r, 20));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
   });
 
   it('still tears down transports even if a stateChange(Disconnecting) listener throws (@operations)', async () => {
@@ -429,9 +479,11 @@ describe('MeetingSession.disconnect (R-22/R-23)', () => {
     });
 
     expect(() => session.disconnect()).toThrow('listener boom');
-    // Resources were released despite the throwing listener.
-    expect(mcClose).toHaveBeenCalledTimes(1);
+    // Resources were released despite the throwing listener (the signalling
+    // transport once MC acknowledges the leave).
     expect(mhClose).toHaveBeenCalledTimes(1);
+    mocks.get(MC_ENDPOINT)!.simulateClose(0);
+    await vi.waitFor(() => expect(mcClose).toHaveBeenCalledTimes(1));
   });
 });
 
@@ -591,7 +643,7 @@ describe('MeetingSession.join — failure paths (R-22)', () => {
     expect(session.state).toBe(MeetingSessionState.Joined);
   });
 
-  it('auth failure → rejects, failure_stage signup, no signaling counter, lands disconnecting', async () => {
+  it('auth failure → rejects, failure_stage signup, no signaling counter, lands disconnected', async () => {
     const sink = new InMemoryMetricsSink();
     const mocks = new Map<string, MockWebTransport>();
     const session = makeSession(mocks, {
@@ -602,7 +654,8 @@ describe('MeetingSession.join — failure paths (R-22)', () => {
       session.join({ orgSubdomain: 'demo', meetingCode: MEETING_CODE, credentials: LOGIN }),
     ).rejects.toBeDefined();
 
-    expect(session.state).toBe(MeetingSessionState.Disconnecting);
+    // No signalling session was built, so disconnect() completes at once.
+    expect(session.state).toBe(MeetingSessionState.Disconnected);
     sink.assertCounter(
       'dt_client_join_attempts_total',
       { status: 'failure', failure_stage: 'signup' },
@@ -3845,7 +3898,8 @@ describe('MeetingSession.join — GC re-join on an ended meeting (join-window de
     await flushMicrotasks();
     // Nothing was built after the teardown: no second signalling client dialed MC.
     expect(rec.count(MC_ENDPOINT)).toBe(1);
-    expect(session.state).toBe(MeetingSessionState.Disconnecting);
+    // The rejected attempt's signalling client already tore down: terminal.
+    expect(session.state).toBe(MeetingSessionState.Disconnected);
   });
 
   it('disconnect() while the FIRST GC join is in flight: no MC dial at all', async () => {
