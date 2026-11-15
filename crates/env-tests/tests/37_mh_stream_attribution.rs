@@ -351,6 +351,8 @@ async fn test_per_stream_attribution_on_the_datagram_path() {
         .await
         .expect("PRECONDITION: cluster connection (ENV_TEST_* URLs)");
     let prom = PrometheusClient::new(&cluster.prometheus_base_url);
+    // Ends through the Loki-proved end path: fail at once without Loki.
+    env_tests::fixtures::loki::require_loki(&cluster).await;
     let window = participant::settle_window(&cluster).await;
     let auth = AuthClient::new(&cluster.ac_base_url);
     let gc = GcClient::new(&cluster.gc_base_url);
@@ -794,9 +796,9 @@ async fn test_per_stream_attribution_on_the_datagram_path() {
     .await;
     assert_a8_arm_fires("ATTR (f) A8 FIRE", &prom, A8Arm::Policy).await;
 
-    // CLEANUP before any session closes, with the release PROVED.
-    for injection in injections {
-        injection.release_and_prove(&cleanup).await;
-    }
+    // CLEANUP: release PROVED before any session closes, then every
+    // participant leaves and THIS meeting is proved ended on MC.
+    injection::release_and_end_meeting("ATTR CLEANUP", injections, &cleanup, &cluster, &prom, ps)
+        .await;
     drop(sessions);
 }

@@ -207,6 +207,20 @@ impl McSession {
     }
 }
 
+/// THE graceful leave: close an MC (or MH) WebTransport connection with
+/// application code 0 and reason `leave`. MC classifies the peer's
+/// `ApplicationClosed` as `ClientClosed` (`classify_connection_error`,
+/// `crates/mc-service/src/webtransport/connection.rs`) and removes the
+/// participant AT ONCE (no disconnect grace); the last removal ends the
+/// meeting. A plain `drop` is not a leave: dropped at runtime teardown, the
+/// CONNECTION_CLOSE never leaves and MC holds the participant for its idle
+/// timeout plus its grace. The close is queued here and sent by the
+/// connection driver, so the caller must keep the runtime running afterwards
+/// (every caller awaits something next).
+pub fn leave(conn: &wtransport::Connection) {
+    conn.close(wtransport::VarInt::from_u32(0), b"leave");
+}
+
 /// The frame header version this suite declares at join: DERIVED from the
 /// wire-format crate (`media_protocol::frame::PROTOCOL_VERSION`), never a
 /// literal, so a version bump moves every env-test join with it. MC refuses a

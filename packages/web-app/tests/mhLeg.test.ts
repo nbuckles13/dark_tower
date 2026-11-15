@@ -3,10 +3,9 @@
 // twinned constant is pinned against its ONE Rust home with a positive control
 // (the extraction must find something), so a drift on either side fails here.
 
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { describe, expect, test } from 'vitest';
+
+import { readRepo as read, strConst } from './_rustSource.js';
 
 import type { BusHandlerSet } from '../src/lib/e2eBus.js';
 import { instanceForPodIp } from '../e2e/instanceCounters.js';
@@ -19,16 +18,15 @@ import {
 } from '../e2e/configEnv.js';
 import { runLeakVerdict, servingSlotCount, type PoolSnapshot } from '../e2e/mhPool.js';
 import {
-  FOREIGN_MC_MEETINGS,
   GC_SETTLE_HEALTHY_SERIES,
   GC_SETTLE_RECOMPUTE_OPERATION,
   GC_SETTLE_RECOMPUTE_SERIES,
   GC_SETTLE_RECOMPUTE_SUCCESS,
   GC_SETTLE_STATES,
+  LOG_AGGREGATION_CEILING_MS,
   METRICS_SCRAPE_CEILING_MS,
   OWNED_MH_NOT_PLACED,
   PLACEMENT_MISS_CEILING,
-  SERVICE_JOB_SCRAPE_SETTLE_MS,
   SETTLE_RECOMPUTES,
   makeBeforeBreak,
   newRefs,
@@ -40,9 +38,6 @@ import {
   replicaSettled,
   resilienceCeilings,
 } from '../e2e/mhLegRules.js';
-
-const REPO = fileURLToPath(new URL('../../../', import.meta.url));
-const read = (rel: string) => readFileSync(join(REPO, rel), 'utf8');
 
 const set = (version: number, refs: number[]): BusHandlerSet => ({
   version: String(version),
@@ -277,10 +272,7 @@ describe('pool snapshot predicates (mhPool.ts)', () => {
 describe('drift pins (one Rust home each)', () => {
   const placement = read('crates/env-tests/src/fixtures/owned_placement.rs');
   const gcFleet = read('crates/env-tests/src/fixtures/gc_fleet.rs');
-  const metrics = read('crates/env-tests/src/fixtures/metrics.rs');
   const eventual = read('crates/env-tests/src/eventual.rs');
-  const strConst = (src: string, name: string) =>
-    new RegExp(`pub const ${name}: &str = "([^"]*)";`).exec(src)?.[1];
 
   test('owned_placement.rs: token and miss ceiling', () => {
     expect(strConst(placement, 'OWNED_MH_NOT_PLACED')).toBe(OWNED_MH_NOT_PLACED);
@@ -304,22 +296,17 @@ describe('drift pins (one Rust home each)', () => {
     expect(Number(recomputes)).toBe(SETTLE_RECOMPUTES);
   });
 
-  test('metrics.rs FOREIGN_MC_MEETINGS; eventual.rs MetricsScrape ceiling', () => {
-    expect(strConst(metrics, 'FOREIGN_MC_MEETINGS')).toBe(FOREIGN_MC_MEETINGS);
-    const secs = /ConsistencyCategory::MetricsScrape => Duration::from_secs\((\d+)\)/.exec(
-      eventual,
-    )?.[1];
-    expect(secs, 'positive control').toBeTruthy();
-    expect(METRICS_SCRAPE_CEILING_MS).toBe(Number(secs) * 1000);
-  });
-
-  test('metrics.rs SERVICE_JOB_SCRAPE_SETTLE = interval + margin', () => {
-    const n = (name: string) =>
-      Number(new RegExp(`pub const ${name}: u64 = (\\d+);`).exec(metrics)?.[1]);
-    expect(n('SERVICE_JOB_SCRAPE_INTERVAL_SECS'), 'positive control').toBeGreaterThan(0);
-    expect(SERVICE_JOB_SCRAPE_SETTLE_MS).toBe(
-      (n('SERVICE_JOB_SCRAPE_INTERVAL_SECS') + n('SCRAPE_SETTLE_MARGIN_SECS')) * 1000,
-    );
+  test('eventual.rs MetricsScrape and LogAggregation ceilings', () => {
+    const ceiling = (category: string) =>
+      new RegExp(`ConsistencyCategory::${category} => Duration::from_secs\\((\\d+)\\)`).exec(
+        eventual,
+      )?.[1];
+    const scrape = ceiling('MetricsScrape');
+    const logs = ceiling('LogAggregation');
+    expect(scrape, 'positive control').toBeTruthy();
+    expect(logs, 'positive control').toBeTruthy();
+    expect(METRICS_SCRAPE_CEILING_MS).toBe(Number(scrape) * 1000);
+    expect(LOG_AGGREGATION_CEILING_MS).toBe(Number(logs) * 1000);
   });
 
   test('GC health tick: the TS reader parses the source line the Rust twin reads', () => {

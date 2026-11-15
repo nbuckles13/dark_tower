@@ -108,7 +108,24 @@ pub const INJECTION_MARGIN: u64 = 16;
 /// generalise "EndMeeting is recovered by MC's next push" to production: until
 /// story 4's re-assert cadence exists, it is false for an unchanged snapshot.
 ///
+/// # Ending the meeting
+///
+/// The ONE public end path is [`release_and_end_meeting`]: release (and
+/// prove) the injection on every pod FIRST, then leave every participant
+/// gracefully and prove THAT meeting ended and was released on MC's side
+/// ([`crate::fixtures::meeting_end`]). A suite that only released the pods and
+/// returned would leave MC holding the meeting for its disconnect grace, with
+/// the pods it had released silent — MC would declare them Dead and ask GC for
+/// a replacement, possibly a later pool leg's run-owned MH (the orphan class).
+///
 /// # If cleanup is skipped
+///
+/// On a PANIC before [`release_and_end_meeting`], `ReleaseOnDrop` still
+/// releases on MH, but the sessions drop abruptly, so MC holds the meeting
+/// for its grace — the orphan class above. That is acceptable only because the
+/// run is already red at this suite, and a later pool leg fails LOUDLY on it
+/// (`MhPool::assert_baseline`'s foreign-mh-activity, and the zombie leg's
+/// re-assert before the freeze), never with corrupted evidence.
 ///
 /// `ReleaseOnDrop` releases on success and on a panic, but not on SIGKILL or a
 /// harness kill. Then this meeting id stays wedged at the injected generation
@@ -131,7 +148,7 @@ pub struct Injection<'a> {
     pub handler: &'a Handler,
     client: MediaHandlerServiceClient<tonic::transport::Channel>,
     token: &'a str,
-    meeting_id: String,
+    meeting_id: uuid::Uuid,
     mc_id: String,
     mc_grpc_endpoint: String,
     /// The generation the probe in [`Injection::open`] read back on this pod.
@@ -173,10 +190,10 @@ impl<'a> Injection<'a> {
                 .as_millis(),
         )
         .unwrap_or(u32::MAX);
-        let meeting_id = owner.gc.meeting_id.to_string();
+        let meeting_id = owner.gc.meeting_id;
         let mc_id = owner.gc.mc_assignment.mc_id.clone();
         let mc_grpc_endpoint = owner.gc.mc_assignment.grpc_endpoint.clone();
-        cleanup.record(handler, &meeting_id, &mc_id);
+        cleanup.record(handler, &meeting_id.to_string(), &mc_id);
         let mut injection = Injection {
             handler,
             client: mh_grpc::connect(handler).await,
@@ -221,7 +238,7 @@ impl<'a> Injection<'a> {
         sources: Vec<SourceStream>,
     ) -> RegisterMeetingResponse {
         let request = RegisterMeetingRequest {
-            meeting_id: self.meeting_id.clone(),
+            meeting_id: self.meeting_id.to_string(),
             mc_id: self.mc_id.clone(),
             mc_grpc_endpoint: self.mc_grpc_endpoint.clone(),
             egress_streams: streams,
@@ -257,7 +274,7 @@ impl<'a> Injection<'a> {
         sources: Vec<SourceStream>,
     ) -> tonic::Status {
         let request = RegisterMeetingRequest {
-            meeting_id: self.meeting_id.clone(),
+            meeting_id: self.meeting_id.to_string(),
             mc_id: self.mc_id.clone(),
             mc_grpc_endpoint: self.mc_grpc_endpoint.clone(),
             egress_streams: streams,
@@ -303,8 +320,9 @@ impl<'a> Injection<'a> {
     /// Release, then PROVE the injected generation is gone: a generation-1
     /// registration must now echo below it (1 if it installed, or MC's own
     /// fresh generation if MC re-programmed first). Our probe is released
-    /// again only if it is what installed.
-    pub async fn release_and_prove(mut self, cleanup: &ReleaseOnDrop) {
+    /// again only if it is what installed. Private: callers end through
+    /// [`release_and_end_meeting`], which cannot release without ending.
+    async fn release_and_prove(mut self, cleanup: &ReleaseOnDrop) {
         let injected = self.generation(0);
         self.end().await;
         let echoed = self.register(1, Vec::new(), Vec::new()).await;
@@ -318,7 +336,7 @@ impl<'a> Injection<'a> {
         if echoed == 1 {
             self.end().await;
         }
-        cleanup.forget(&self.meeting_id);
+        cleanup.forget(&self.meeting_id.to_string());
     }
 
     async fn end(&mut self) {
@@ -327,7 +345,7 @@ impl<'a> Injection<'a> {
             .end_meeting(mh_grpc::authed(
                 self.token,
                 EndMeetingRequest {
-                    meeting_id: self.meeting_id.clone(),
+                    meeting_id: self.meeting_id.to_string(),
                     mc_id: self.mc_id.clone(),
                     cause: ReleaseCause::MeetingEnded as i32,
                 },
@@ -344,6 +362,47 @@ impl<'a> Injection<'a> {
             .into_inner();
         assert!(done.acknowledged, "CLEANUP on {}", self.handler.name);
     }
+}
+
+/// THE end of an injection suite's meeting (the only public end path).
+///
+/// 1. Release every injection, PROVED, while every session is still open —
+///    the documented order ("EndMeeting on the pod BEFORE any session
+///    closes"), so MC cannot re-program a pod mid-cleanup.
+/// 2. Leave EVERY participant of the meeting gracefully and prove THAT
+///    meeting ended and was released on MC's side
+///    ([`crate::fixtures::meeting_end::leave_and_await_ended`]).
+///
+/// `ps` must be every MC participant of the injected meeting (the proof
+/// names any participant whose clean close never appears).
+///
+/// # Panics
+/// `ps` empty or of another meeting; a release or meeting-end failure.
+pub async fn release_and_end_meeting(
+    phase: &str,
+    injections: Vec<Injection<'_>>,
+    cleanup: &ReleaseOnDrop,
+    cluster: &crate::cluster::ClusterConnection,
+    prom: &PrometheusClient,
+    ps: Vec<Participant>,
+) {
+    assert!(
+        !ps.is_empty(),
+        "{phase}: release_and_end_meeting needs the meeting's participants"
+    );
+    for injection in &injections {
+        for p in &ps {
+            assert_eq!(
+                p.gc.meeting_id, injection.meeting_id,
+                "{phase}: participant {} is not in the injected meeting",
+                p.label
+            );
+        }
+    }
+    for injection in injections {
+        injection.release_and_prove(cleanup).await;
+    }
+    crate::fixtures::meeting_end::leave_and_await_ended(phase, cluster, prom, ps, Vec::new()).await;
 }
 
 /// PRECONDITION: MC has programmed the pod that carries this meeting's edges.

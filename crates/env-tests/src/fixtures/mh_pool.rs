@@ -1206,9 +1206,7 @@ impl MhPool {
     }
 
     /// Pool-mutating. THE leg scaffold (40's legs, 44): a run-owned pool with
-    /// [`MhPool::assert_baseline`] and no live MC meeting
-    /// ([`await_no_mc_meetings`](crate::fixtures::metrics::await_no_mc_meetings))
-    /// before, `body` in its own task (so its
+    /// [`MhPool::assert_baseline`] before, `body` in its own task (so its
     /// panic is caught), then on EVERY exit path the asserted owner teardown +
     /// GC settle ([`MhPool::teardown_and_settle`]), then the baseline again.
     /// `body` gets the pool and the Prometheus base url. The body's panic is
@@ -1261,17 +1259,12 @@ impl MhPool {
         pool.baseline_drain_leg = baseline_drain_leg;
         let pool = std::sync::Arc::new(pool);
         pool.assert_baseline(&prom).await;
-        // Foreign activity also covers MC: no meeting from an earlier suite may
-        // be alive, or MC can pull this leg's run-owned MH into it as a
-        // replacement (story 4 MC-C) and the leg would count its releases.
-        crate::fixtures::metrics::await_no_mc_meetings(
-            &prom,
-            // Two reads one SCRAPE apart (observability C3): reads closer than
-            // the service-job scrape interval compare one sample with itself.
-            crate::fixtures::metrics::service_job_scrape_settle(&prom).await,
-        )
-        .await
-        .unwrap_or_else(|e| panic!("{e}"));
+        // No fleet-wide MC check here (operator ruling: env-tests never couple
+        // through a shared counter). A suite whose meeting could be handed this
+        // leg's run-owned MH proves its OWN meeting ended before it returns
+        // (`fixtures::meeting_end`); a panicking one that did not is caught by
+        // the owned-MH exclusivity checks (`assert_baseline`, and the zombie
+        // leg's re-assert before the freeze) as foreign-mh-activity.
 
         let outcome = tokio::spawn(body(std::sync::Arc::clone(&pool), prom_url)).await;
 

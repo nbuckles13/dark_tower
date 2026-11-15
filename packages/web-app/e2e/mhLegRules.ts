@@ -21,17 +21,10 @@ export const PLACEMENT_MISS_CEILING = 1e-6;
 export const SETTLE_RECOMPUTES = 2;
 /** `eventual.rs` ConsistencyCategory::MetricsScrape: the scrape-visibility ceiling. */
 export const METRICS_SCRAPE_CEILING_MS = 30_000;
-/**
- * `metrics.rs` SERVICE_JOB_SCRAPE_SETTLE (service-job scrape interval + margin):
- * the spacing of two Prometheus reads that must be DIFFERENT samples — reads
- * closer than one scrape compare a sample with itself and observe nothing.
- */
-export const SERVICE_JOB_SCRAPE_SETTLE_MS = 6_000;
-/** `metrics.rs` FOREIGN_MC_MEETINGS. */
-export const FOREIGN_MC_MEETINGS = 'foreign-mc-meetings';
+/** `eventual.rs` ConsistencyCategory::LogAggregation: the log-ingest (Loki) ceiling. */
+export const LOG_AGGREGATION_CEILING_MS = 45_000;
 /** Reason tokens of this file's own waits (the Rust legs use the same words). */
 export const REMOVED_MH_STILL_SELECTABLE = 'removed-mh-still-selectable';
-export const MEETINGS_NOT_DRAINED = 'meetings-not-drained';
 
 // ---------------------------------------------------------------------------
 // PURE kernels (node-tested)

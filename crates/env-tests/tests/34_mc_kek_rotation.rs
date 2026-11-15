@@ -212,8 +212,7 @@ async fn a_departure_rotates_the_meeting_kek_for_the_remaining_member() {
 
     // B leaves with a clean close: MC removes it immediately (no grace), and
     // the removal schedules the debounced rotation.
-    b.connection()
-        .close(wtransport::VarInt::from_u32(0), b"leave");
+    env_tests::fixtures::mc_session::leave(b.connection());
 
     let deadline = Instant::now() + w + ROTATION_MARGIN;
     let update = await_kek_update(&mut a, deadline).await.unwrap_or_else(|| {
@@ -276,8 +275,7 @@ async fn a_departure_rotates_the_meeting_kek_for_the_remaining_member() {
     )
     .await;
 
-    a.connection()
-        .close(wtransport::VarInt::from_u32(0), b"leave");
+    env_tests::fixtures::mc_session::leave(a.connection());
 }
 
 /// Story 3 MC-A (R-14, R-33 "rotation on leave with video flowing"): a leave
@@ -438,9 +436,7 @@ async fn a_leave_with_video_flowing_rotates_the_kek_without_touching_video_direc
     // nothing.
     let c = ps.pop().unwrap();
     let c_id = c.sender_id();
-    c.session
-        .connection()
-        .close(wtransport::VarInt::from_u32(0), b"leave");
+    env_tests::fixtures::mc_session::leave(c.session.connection());
     let deadline = Instant::now() + w + ROTATION_MARGIN;
     let mut a_directives_since_leave = 0usize;
     let mut early_update = None;

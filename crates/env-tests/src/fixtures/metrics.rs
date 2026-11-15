@@ -1314,6 +1314,18 @@ pub async fn mc_replacement_retry_budget(prom: &PrometheusClient) -> Duration {
     mc_config_gauge_max(prom, "mc_media_handler_replacement_retry_budget_seconds").await
 }
 
+/// THE env-test read of MC's disconnect grace
+/// (`mc_meeting_disconnect_grace_seconds`, the config echo MC publishes from
+/// the same `MeetingTimers` its meeting actors enforce): how long MC holds an
+/// abruptly-lost participant. The failure ceiling of
+/// [`crate::fixtures::meeting_end`]'s meeting-end proof derives from it.
+///
+/// # Panics
+/// As [`mc_config_gauge_max`].
+pub async fn mc_disconnect_grace(prom: &PrometheusClient) -> Duration {
+    mc_config_gauge_max(prom, "mc_meeting_disconnect_grace_seconds").await
+}
+
 /// MH's owner-silence timeout gauge (story 4 MH-3,
 /// `MH_MEETING_OWNER_SILENCE_TIMEOUT_SECONDS`). ONE home for the name: env-test
 /// 40 pins it per pod, and [`mh_owner_silence_timeout`] reads the fleet value.
@@ -1385,52 +1397,6 @@ pub fn planned_cutover_ceiling(
         ));
     }
     Ok(grace - margin + view_margin)
-}
-
-/// MC's active meetings, summed over the fleet (`mc_meetings_active`, one
-/// series per MC instance). The ONE home of that read.
-pub async fn mc_meetings_active_total(prom: &PrometheusClient) -> f64 {
-    prom.instance_counter_map("sum by (instance) (mc_meetings_active)")
-        .await
-        .values()
-        .sum()
-}
-
-/// Reason token: an MC meeting is still alive when a pool-mutating leg starts.
-pub const FOREIGN_MC_MEETINGS: &str = "foreign-mc-meetings";
-
-/// LEG PRECONDITION (resilience legs): no MC meeting is alive, settled (two
-/// reads one `poll` apart both 0). A meeting left by an earlier suite lives
-/// for MC's disconnect grace, and if its handlers are lost meanwhile (e.g. an
-/// injection suite's `EndMeeting` straight to MH) MC asks GC for a
-/// replacement, and GC may grant the leg's fresh run-owned MH, so the leg's
-/// "only our meeting is on it" evidence would count a foreign meeting. The
-/// bound is FAILURE-ONLY: MC publishes no gauge for its disconnect grace, so
-/// it is the shared [`PINNED_METRIC_BOUND`] plus MC's published replacement
-/// retry budget (an orphan may hold a replacement that long).
-///
-/// # Errors
-/// [`FOREIGN_MC_MEETINGS`] at the bound, with the last count.
-pub async fn await_no_mc_meetings(prom: &PrometheusClient, poll: Duration) -> Result<(), String> {
-    let bound = PINNED_METRIC_BOUND + mc_replacement_retry_budget(prom).await;
-    let deadline = Instant::now() + bound;
-    let mut previous = mc_meetings_active_total(prom).await;
-    loop {
-        tokio::time::sleep(poll).await;
-        let now = mc_meetings_active_total(prom).await;
-        if now == 0.0 && previous == 0.0 {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "{FOREIGN_MC_MEETINGS}: MC still holds {now} active meeting(s) {bound:?} into the \
-                 leg's precondition; an earlier suite left a meeting alive (its participants \
-                 dropped without leaving, or its handlers released behind MC's back). A pool \
-                 leg must start with none, or GC can grant the leg's run-owned MH to it"
-            ));
-        }
-        previous = now;
-    }
 }
 
 /// MH's published drain window (story 4 MH-3/MC-F, no labels): the grace

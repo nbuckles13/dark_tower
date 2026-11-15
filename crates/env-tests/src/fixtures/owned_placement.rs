@@ -29,9 +29,10 @@
 //! One attempt is one `create_meeting` plus ONE MC join (the first joiner's
 //! `JoinResponse.media_handler_set` IS the meeting's set; later joins never
 //! change membership). The users are registered once per search, not per
-//! attempt. A missed meeting's participant is dropped at once, which closes
-//! its MC session. The meeting is on baseline MHs only and ends by MC's normal
-//! empty-meeting path.
+//! attempt. A missed meeting's participant LEAVES at once (graceful close, so
+//! MC ends the meeting immediately by its normal empty-meeting path); its
+//! `Departure` rides in [`OwnedMeeting::missed`] so the leg proves that end
+//! too. The meeting is on baseline MHs only.
 
 use crate::fixtures::auth_client::UserRegistrationRequest;
 use crate::fixtures::gc_client::{CreateMeetingRequest, JoinMeetingResponse};
@@ -107,6 +108,11 @@ pub struct OwnedMeeting<'a> {
     rest: Vec<(String, String)>,
     /// Attempts the search used (logged by the leg).
     pub attempts: u32,
+    /// The placement MISSES, each left gracefully when it missed. The leg
+    /// proves them ended in its one end wait
+    /// ([`crate::fixtures::meeting_end::leave_and_await_ended`]'s `also`), so
+    /// no miss meeting outlives the leg unproved.
+    pub missed: Vec<crate::fixtures::meeting_end::Departure>,
 }
 
 impl OwnedMeeting<'_> {
@@ -185,6 +191,7 @@ pub async fn place_on_owned<'a>(
         registered.push((r.access_token, display));
     }
     let mut observed: Vec<Vec<String>> = Vec::new();
+    let mut missed = Vec::new();
     for attempt in 1..=attempts {
         let created = gc
             .create_meeting(&registered[0].0, &CreateMeetingRequest::new(title))
@@ -216,13 +223,15 @@ pub async fn place_on_owned<'a>(
                     meeting_code: created.meeting_code,
                     rest,
                     attempts: attempt,
+                    missed,
                 },
             );
         }
         observed.push(urls);
-        // A miss: dropping the participant closes its MC session. The meeting
-        // is not on the owned MH, so the owned MH stays load-free.
-        drop(first);
+        // A miss: leave gracefully (MC ends the meeting at once); the leg
+        // proves it ended with its own meeting. Not on the owned MH, so the
+        // owned MH stays load-free.
+        missed.push(first.leave());
     }
     panic!(
         "{OWNED_MH_NOT_PLACED}: {attempts} meetings (derived for a miss probability <= \

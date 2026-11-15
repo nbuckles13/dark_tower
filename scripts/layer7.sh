@@ -1122,7 +1122,7 @@ __layer7_main() {
   fi
   if [[ -n "${ENV_TEST_LOKI_URL:-}" ]]; then
     __wait_http_ready "${ENV_TEST_LOKI_URL}/ready" "$obs_budget" \
-      || printf 'WARN LOKI_NOT_READY_AFTER=%ss — proceeding; test_all_services_have_logs_in_loki WILL fail and that failure is the observability stack, NOT your diff. See docs/TODO.md §Env-Test Resilience (is_loki_available retry/conditional-skip).\n' "$obs_budget" >&2
+      || printf 'WARN LOKI_NOT_READY_AFTER=%ss — proceeding; every Loki-dependent test WILL fail and that failure is the observability stack, NOT your diff: test_all_services_have_logs_in_loki, 47_mc_join_window, the injection suites (26 S4/churn, 37, 38, 39), every 40_resilience pool leg and the browser MH-replacement legs (tokens PRECONDITION-loki-unavailable / loki-query-failed). See docs/runbooks/devloop-validation.md §8.\n' "$obs_budget" >&2
   fi
   emit_step_duration observability-ready "$t_step"
 
@@ -1511,6 +1511,11 @@ __layer7_main() {
     # copy is drift nothing could catch.
     if [[ -n "${ENV_TEST_PROMETHEUS_URL:-}" ]]; then
       export E2E_PROMETHEUS_URL="$ENV_TEST_PROMETHEUS_URL"
+    fi
+    # The MH-replacement legs prove each meeting ended from per-meeting MC log
+    # lines (e2e/mcLoki.ts); unset, they fail loudly.
+    if [[ -n "${ENV_TEST_LOKI_URL:-}" ]]; then
+      export E2E_LOKI_URL="$ENV_TEST_LOKI_URL"
     fi
 
     local browser_rc

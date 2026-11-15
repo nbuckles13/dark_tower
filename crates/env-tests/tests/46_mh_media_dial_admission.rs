@@ -298,9 +298,7 @@ async fn a_left_participant_and_an_unheld_meeting_are_declined() {
     // no longer fills a slot with P.
     let p_id = p.join.participant_id.clone();
     drop(p_session);
-    p.session
-        .connection()
-        .close(wtransport::VarInt::from_u32(0), b"leave");
+    env_tests::fixtures::mc_session::leave(p.session.connection());
     drop(p);
     r.await_left("LEFT", bound, &p_id).await;
     r.converge("LEFT", bound, |v, _| {
