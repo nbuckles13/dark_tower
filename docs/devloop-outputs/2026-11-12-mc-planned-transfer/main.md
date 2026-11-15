@@ -415,6 +415,7 @@ Lead ruling change during review: "every deadline cutover is timed_out" supersed
 - (none surfaced in this devloop)
 
 - `docs/TODO.md` §Env-Test Resilience & Runbook Validation — injection suites orphan a live MC meeting (MC-C replacement)
+  - **SUPERSEDED 2026-11-14** by `docs/devloop-outputs/2026-11-14-injection-orphan-meeting-fix/` (commit a1c475ba), per operator ruling (no global-counter coupling between env-tests; no slower suites). The compensating `MhPool::run_leg*` gate (`metrics::await_no_mc_meetings`, token `foreign-mc-meetings`) and its browser twin were removed. The injection suites now end their own meeting via `injection::release_and_end_meeting`, proved from per-meeting MC log lines (`fixtures/meeting_end.rs`). The TODO entry is deleted. References to the gate elsewhere in this file describe the state at the time.
 
 ---
 
