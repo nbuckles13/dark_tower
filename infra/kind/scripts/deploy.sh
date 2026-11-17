@@ -1389,13 +1389,13 @@ converge_mh_pool() {
 
 # --- A removed MH must stop being selectable before deploy returns ---------------
 #
-# Until story 4 MH-3, an MH sends GC no DRAINING report on SIGTERM, so GC keeps a
-# removed MH's row `healthy` (and selectable for new meetings) until its heartbeat
-# ages past the staleness bound B. A converge that removed an MH (upgrade's old-MH
-# delete, or a baseline-shrink drain) would otherwise hand on a cluster where the
-# next meeting may be placed on a dead handler. After MH-3 a DRAINING report
-# excludes the row at once and this wait shrinks to about two health-checker ticks
-# (the recompute control below).
+# An MH reports DRAINING to GC on SIGTERM (story 4 MH-3), which excludes its row
+# at once, so this wait is normally about two health-checker ticks (the recompute
+# control below). It still bounds the case where that report never lands (an MH
+# killed before it could send it): GC then keeps the removed MH's row selectable
+# until its heartbeat ages past the staleness bound B. A converge that removed an
+# MH (upgrade's old-MH delete, or a baseline-shrink drain) must not hand on a
+# cluster where the next meeting may be placed on a dead handler.
 #
 # ANCHOR (DRY): the bash twin of
 # crates/env-tests/src/fixtures/gc_fleet.rs::wait_removed_mh_unselectable (Rust
@@ -1419,7 +1419,7 @@ converge_mh_pool() {
 #       be counted, or a dead row could hide behind it). `healthy` alone is NOT
 #       enough: a just-registered replacement is `pending` until its first load
 #       report, so a dead `healthy` row would hide behind it. `draining` is never
-#       selectable (and after MH-3 a removed MH reports it); a row past B counts
+#       selectable (a removed MH reports it on SIGTERM); a row past B counts
 #       `unhealthy`.
 #   (b) positive control: the gauge was RECOMPUTED after the removal. The pod's
 #       gc_db_queries_total{operation="count_available_mh",status="success"} must
@@ -1584,7 +1584,7 @@ wait_removed_mh_unselectable() {
         (( $(date +%s) < deadline )) || break
         sleep "${MH_SETTLE_POLL_SECONDS}"
     done
-    log_error "After B (${bound}s, rounded up) + ${margin}s, GC pod(s) still count more fresh ${MH_SETTLE_STATES} MH rows than the ${live} registered live one(s), or have not recomputed the count since the removal: ${last% }. Either a removed MH is still selectable (until story 4 MH-3 a removed MH sends no DRAINING report), so the next meeting may be placed on a dead handler, or the count is FROZEN: check gc_db_queries_total{operation=\"count_available_mh\",status=\"error\"} (the error= figure above) and the GC health-checker's 'MH registry tick step failed' lines (kubectl logs -n ${ns} deploy/gc-service); ./infra/kind/scripts/mh.sh list."
+    log_error "After B (${bound}s, rounded up) + ${margin}s, GC pod(s) still count more fresh ${MH_SETTLE_STATES} MH rows than the ${live} registered live one(s), or have not recomputed the count since the removal: ${last% }. Either a removed MH is still selectable (its DRAINING report never reached GC), so the next meeting may be placed on a dead handler, or the count is FROZEN: check gc_db_queries_total{operation=\"count_available_mh\",status=\"error\"} (the error= figure above) and the GC health-checker's 'MH registry tick step failed' lines (kubectl logs -n ${ns} deploy/gc-service); ./infra/kind/scripts/mh.sh list."
     mh_settle_failed
     return 1
 }
