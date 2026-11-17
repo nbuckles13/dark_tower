@@ -54,6 +54,11 @@ meeting at `http://demo.localhost:5173`. Windows stay uncovered (covered windows
 4. **Planned transfer.** `$M drain <k> --owner manual` on a slot carrying the meeting. Expected: no
    gap — the replacement is added before the draining handler is dropped.
 5. **Clean up.** Everyone leaves; `$M up --owner baseline` twice; `$M drain --all --owner manual`.
+6. **Crash the last handler** (optional, after step 4 leaves one MH). `$M signal <k> KILL --owner
+   manual`. Expected: media stops, then returns once MC's next replacement attempt gets the
+   restarted process (the gap includes any retry backoff already running).
+7. **Drain the last handler** (optional). `$M drain <k> --owner manual`. Expected: refused —
+   `mh.sh` drains a last serving MH only after `mh.sh up` adds another.
 
 ## Run record — 2026-11-16, Nathan Buckles, WSL2 + Windows Chrome, story branch at `7e1edb9e`
 
@@ -63,7 +68,20 @@ meeting at `http://demo.localhost:5173`. Windows stay uncovered (covered windows
 | 2 | PASS | Killed slot 2: no impact on audio or video (it was not forwarding). Slot 2 restarted in place. |
 | 3 | PASS | Killed slot 3: audio and video stopped for about 6–7 s, then recovered cleanly with no rejoin. Afterwards the meeting was on slots 3 (new incarnation) and 4 (the former spare). |
 | 4 | PASS | Drained slot 4, then slot 2: absolutely no impact on audio or video for either drain. The meeting ended on slot 3 alone. |
-| 5 | — | Restore baseline after the run. |
+| 6 | PASS (slow) | Killed slot 3 while it was the meeting's only handler and the meeting was already retrying for a missing second one (`no_capacity`, only one MH in the pool): media returned after about 30 s with no rejoin. The restarted process re-registered with GC within a second, but MC's replacement attempt waited for its already-backed-off retry timer (capped at `MC_MH_REPLACEMENT_BACKOFF_MAX_MS`, 30 s). Filed in `docs/TODO.md` ("A handler loss joins an already-backed-off replacement timer"). |
+| 7 | PASS | Drain of slot 3, the last serving MH, refused by `mh.sh` (a last MH is drained only after `mh.sh up` adds another) — expected. |
+| — | — | Cluster torn down after the run (step 5 not needed). |
+
+## Why the crash gap is 6-7 s (from MC logs of step 3)
+
+Detection dominates. MC asks each MH to heartbeat every N/3 = 2 s and declares it dead after
+N = `MC_MH_HEARTBEAT_TIMEOUT_MS` (6000) of silence, so detection lands 4-6 s after the kill
+(observed 4.0 s and 5.4 s). MC's own handling is about 8 ms (declaration → GC grant →
+registration → handler-set push). The remaining ~1 s is the client dialling the replacement,
+republishing and waiting for a keyframe (`MC_VIDEO_MIN_KEYFRAME_INTERVAL_MS`, 500). The browser's
+own loss detection, `MH_MAX_IDLE_TIMEOUT_MS` (6000, deliberately equal to N), usually loses to
+MC's push. Shortening the gap means lowering N, which raises heartbeat load and false-positive
+risk; N, the MH idle timeout and the client's replacement caps move together.
 
 ## Not run
 
