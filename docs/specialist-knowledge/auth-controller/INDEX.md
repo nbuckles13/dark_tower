@@ -10,24 +10,20 @@
 - Observability framework -> ADR-0011
 - Approved crypto + jsonwebtoken backend (`aws_lc_rs` only; rustls on ring) -> ADR-0027; enforced by `crates/dt-guard/src/resolved_features/policy.rs` (policy content co-owned with security)
 - Metric testability (AC backfill is Cat C test-only; no accept-loop-style work) -> ADR-0032
+- MC-minted `media_dial` dial credential (not AC-issued, never in JWKS) -> ADR-0039 §5; ADR-0003
 
 ## Code Locations
-- Config loading & validation -> `crates/ac-service/src/config.rs:Config::from_vars()`
+- Config loading & validation (behaviour/topology keys REQUIRED: `AC_HASH_SECRET`, `AC_CLUSTER_NAME`, `AC_DRAIN_SECONDS`) -> `crates/ac-service/src/config.rs:Config::from_vars()`; `required_vars()` test fixture in same file
+- Drain on shutdown -> `crates/ac-service/src/main.rs:shutdown_signal()`
 - Rate limit config parsing -> `crates/ac-service/src/config.rs:Config::parse_rate_limit_i64()`
 - JWT sign/verify (service+user), key encrypt/decrypt, bcrypt hash/verify -> `crates/ac-service/src/crypto/mod.rs` (`sign_jwt` / `sign_user_jwt` / `verify_jwt` / `verify_user_jwt` / `encrypt_private_key` / `hash_client_secret`)
-- Service token issuance -> `crates/ac-service/src/services/token_service.rs:issue_service_token()`
-- User token issuance -> `crates/ac-service/src/services/token_service.rs:issue_user_token()`
+- Service / user token issuance -> `crates/ac-service/src/services/token_service.rs:issue_service_token()` / `issue_user_token()`
 - Service registration -> `crates/ac-service/src/services/registration_service.rs:register_service()`
 - User registration -> `crates/ac-service/src/services/user_service.rs:register_user()`
-- Key rotation -> `crates/ac-service/src/services/key_management_service.rs:rotate_signing_key()`
-- Key init at startup -> `crates/ac-service/src/services/key_management_service.rs:initialize_signing_key()`
-- JWKS generation -> `crates/ac-service/src/services/key_management_service.rs:get_jwks()`
+- Key rotation / startup init / JWKS -> `crates/ac-service/src/services/key_management_service.rs` (`rotate_signing_key` / `initialize_signing_key` / `get_jwks`)
 - Route definitions -> `crates/ac-service/src/routes/mod.rs:build_routes()`
 - JWT primitives (common) -> `crates/common/src/jwt.rs` (`JwksClient` / `JwtValidator::validate` / `HasIat` / `JwtError` / `verify_token` / `ServiceClaims` / `UserClaims` / `MeetingTokenClaims` / `GuestTokenClaims` / `ParticipantType` / `MeetingRole` — 2-variant lowercase variants)
-- Meeting token request (shared GC->AC) -> `crates/common/src/meeting_token.rs:MeetingTokenRequest`
-- Guest token request (shared GC->AC) -> `crates/common/src/meeting_token.rs:GuestTokenRequest`
-- Participant type enum (shared, 3-variant) -> `crates/common/src/meeting_token.rs:ParticipantType`
-- Meeting role enum (shared, 3-variant) -> `crates/common/src/meeting_token.rs:MeetingRole`
+- Shared GC->AC request types + 3-variant enums -> `crates/common/src/meeting_token.rs` (`MeetingTokenRequest` / `GuestTokenRequest` / `ParticipantType` / `MeetingRole`)
 - AC re-exports shared types -> `crates/ac-service/src/models/mod.rs` (`pub use common::meeting_token::...`)
 - Internal token response (AC-local) -> `crates/ac-service/src/models/mod.rs:InternalTokenResponse`
 - Error types -> `crates/ac-service/src/errors.rs:AcError`
@@ -42,13 +38,20 @@
 - Meeting-token display-name resolution (fail-closed, single-cluster) -> `crates/ac-service/src/handlers/internal_tokens.rs:resolve_meeting_display_name()`
 - `MeetingTokenClaims.display_name` claim (PII, Debug-redacted, `#[serde(default)]`) -> `crates/common/src/jwt.rs:MeetingTokenClaims`
 - Fail-closed federation revisit -> `docs/TODO.md` §Roster Display Names
-- Request types (`MeetingTokenRequest`, `GuestTokenRequest`) shared via `common::meeting_token`; AC re-exports from `crate::models`
+- Meeting/guest token TTL cap (shared SSoT, MC join window derives from it) -> `crates/common/src/meeting_token.rs:MEETING_TOKEN_MAX_TTL_SECONDS`
+- JWT `exp` leeway (shared by all JWKS verifiers) -> `crates/common/src/jwt.rs:JWT_EXP_LEEWAY_SECONDS`
 - Note: `common::meeting_token::{ParticipantType, MeetingRole}` (3-variant, snake_case) vs `common::jwt::{ParticipantType, MeetingRole}` (2-variant, lowercase) — wire-compatible, separate Rust types; unification pending.
+
+## Media Dial Credential (ADR-0039 §5, outside AC/JWKS)
+- Claims + type discriminator -> `crates/common/src/jwt.rs:MediaDialClaims` / `MEDIA_DIAL_TOKEN_TYPE`
+- MC per-meeting signing -> `crates/mc-service/src/media_dial/key.rs:sign_media_dial()`
+- MH verification (key by `meeting_id`, not `kid`) -> `crates/mh-service/src/auth/mod.rs:verify_media_dial()`
+- MC JWKS path refuses `media_dial` tokens -> `crates/mc-service/src/auth/mod.rs` (tests `join_rejects_a_kidless_media_dial_*`)
 
 ## Scope Data (ADR-0003)
 - Default scopes per service type -> `crates/ac-service/src/models/mod.rs:ServiceType::default_scopes()`
 - DB seed scopes -> `infra/kind/scripts/deploy.sh:seed_test_data()`
-- Token issuance (scopes from DB, service_type claim) -> `crates/ac-service/src/services/token_service.rs:111-148`
+- Token issuance (scopes from DB, service_type claim) -> `crates/ac-service/src/services/token_service.rs:issue_service_token()`
 - ServiceClaims (scope + service_type) -> `crates/common/src/jwt.rs:ServiceClaims`
 
 ## Integration Seams
