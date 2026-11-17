@@ -3011,7 +3011,7 @@ tasks:
   tier: light
   tier_reason: 'Browser e2e spec only: no production code, wire contract, auth or GSA change'
 - id: 31
-  status: pending
+  status: completed
   specialist: test
   deps:
   - 22
