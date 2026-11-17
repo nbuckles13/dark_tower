@@ -1,12 +1,11 @@
 # Protocol Navigation
 
 ## Architecture & Design
-- API versioning → ADR-0004; user auth meeting access → ADR-0020
+- API versioning → ADR-0004; user auth meeting access → ADR-0020; client architecture (frame codec, SFrame layering, trace context fields) → ADR-0028
 - Media flow: frame format, sender auth, KEK model, send/receive contract → ADR-0036
 - MH replacement/migration (heartbeat + fence, AcquireMediaHandler, MediaHandlerSet/handler_ref, media_dial, ReleaseCause, MhCloseCode, RegisterMH endpoint rule; supersedes ADR-0036 §8 re-assert and §9 frozen set) → `docs/decisions/adr-0039-mh-replacement-and-migration.md`
 - Proto conventions (buf STANDARD, `vN`, bare RPC names, distinct response types, reserve-the-vacated-tag-and-name §5, intentional-wire-break protocol) → `docs/protocol/CONVENTIONS.md`
 - API contracts → `docs/API_CONTRACTS.md`; WebTransport flow/framing → `docs/WEBTRANSPORT_FLOW.md`
-- Client architecture (frame codec, SFrame layering, trace context fields) → ADR-0028
 
 ## Proto Definitions
 - Signaling (client↔MC) → `proto/dark_tower/signaling/v1/signaling.proto`; internal (service↔service) → `proto/dark_tower/internal/v1/internal.proto`
@@ -24,8 +23,8 @@
 ## gRPC Services (all in `proto/dark_tower/internal/v1/internal.proto`)
 - MediaHandlerService (MC→MH): RegisterMeeting + EndMeeting — forwarding policy gains fields, not sibling RPCs (ADR-0036 §8); teardown is its own RPC (story 2 R-20; mc_id-mismatch → FAILED_PRECONDITION, not an authz control). `Register`, `RouteMedia`, `StreamTelemetry` retired 2026-09-01; tombstone block in the proto
 - MediaCoordinationService (MH→MC): NotifyParticipantConnected/Disconnected (`connection_id` REQUIRED, empty refused → `NotifyParticipantConnectedRequest.connection_id`), MeetingHeartbeat — `NotifyParticipantConnectedResponse` carries the participant→`sender_id` binding (load-bearing gate on MH media accept, R-15); MC builder → `crates/mc-service/src/media_admission/binding_response.rs`; MH validates via `crates/mh-service/src/routing/mod.rs`→`SenderId::from_wire()`, bound single-sourced at `media_protocol::frame::KEY_ID_SENDER_ID_BITS` (no `common` helper)
-- MeetingControllerService (GC→MC): AssignMeetingWithMh
-- GlobalControllerService (MC→GC): RegisterMC, FastHeartbeat, ComprehensiveHeartbeat, AcquireMediaHandler (ADR-0039 §3 replacement grant; exclusion/cap/status rules once → `AcquireMediaHandlerRequest` header; fail-closed empty grant → `AcquireMediaHandlerResponse`; GC-owned cap → `RegisterMCResponse.max_exclude_handler_ids`; GC server → `crates/gc-service/src/grpc/mc_service.rs:acquire_media_handler()`, logic `services/mh_replacement.rs`); MediaHandlerRegistryService (MH→GC): RegisterMH, SendLoadReport
+- MeetingControllerService (GC→MC): AssignMeetingWithMh (per-attempt fence → `AssignMeetingWithMhRequest.assignment_id`)
+- GlobalControllerService (MC→GC): RegisterMC, FastHeartbeat, ComprehensiveHeartbeat, AcquireMediaHandler (ADR-0039 §3 replacement grant; exclusion/cap/status rules once → `AcquireMediaHandlerRequest` header; fail-closed empty grant → `AcquireMediaHandlerResponse`; GC-owned cap → `RegisterMCResponse.max_exclude_handler_ids`; GC server → `crates/gc-service/src/grpc/mc_service.rs:acquire_media_handler()`, logic `services/mh_replacement.rs`); NotifyMeetingEnded (incarnation fence + outcome rules → `NotifyMeetingEndedRequest` header, `NotifyMeetingEndedOutcome`; GC server `mc_service.rs:notify_meeting_ended()`, MC client `crates/mc-service/src/grpc/gc_client.rs:notify_meeting_ended()`); MediaHandlerRegistryService (MH→GC): RegisterMH (endpoint rule → `RegisterMHRequest`; GC server `crates/gc-service/src/grpc/mh_service.rs:register_mh()`, atomic supersede/reject `repositories/media_handlers.rs:register_mh()`), SendLoadReport
 - DisconnectReason enum (bounded for metrics). ADR-0039 release vocabulary + per-carrier validity + `trigger` projection → `ReleaseCause`; heartbeat (rules once incl. size/validation + forgery residuals; rpc `MeetingHeartbeat` on MediaCoordinationService, MC server `crates/mc-service/src/grpc/media_coordination.rs:meeting_heartbeat()`, interval derivation `media_routing/liveness.rs`) → `MeetingHeartbeatRequest`/`MeetingHeartbeatResponse`, `ServingState`, `HeartbeatVerdict`, `ApplyRefusal`; record-reject vs apply-refusal split (policy reject = INVALID_ARGUMENT yet record upserted) → `RegisterMeetingRequest` header; MH heartbeat sender + verdicts → `crates/mh-service/src/grpc/heartbeat_sender.rs`, beat build/schedule → `session/mod.rs`, `session/heartbeat.rs`; cause projection (EndMeeting + RELEASED, unknown = NoCause) → `session/release.rs:ReleaseKind::of()`; apply_refusal projection → `routing/mod.rs:apply_refusal_of()`; dial key + its allow-list entry → `RegisterMeetingRequest.media_dial_public_key`, `crates/dt-guard/src/internal_proto_no_key_material.rs:ALLOWED_BYTES_FIELDS`; teardown cause single source → `crates/mc-service/src/media_routing/teardown.rs:end_meeting_plan()`; runtime pins → `docs/TODO.md` §Media Path Obligations ("Story-4 internal-contract RUNTIME rules")
 
 ## ADR-0036 MC→MH Control Plane (internal.proto)
@@ -57,6 +56,7 @@ All message/enum shapes → `proto/dark_tower/signaling/v1/signaling.proto`
 - MH bidi stream: `RecoveryRequest` (client→MH), `MhServerMessage.KeyframeRequest` (MH→client), rules in the section above `RecoveryRequest`; MH per-publisher dedupe → `crates/mh-service/src/media/keyframe.rs:PublisherKeyframes`; SDK → `packages/sdk-core/src/media/lifecycle/recoveryRequestQueue.ts`, `keyframePolicy.ts`
 - Redacting `Debug` → `crates/proto-gen/build.rs`, `src/lib.rs`; wire-shape tests (incl. vacated-tag-decodes-as-unknown helper `assert_vacated_tag_is_unknown`) → `crates/proto-gen/tests/signaling_roundtrip.rs`; codegen oracle (presence + absence, both protos; story-4 P3 retired-surface list is the one home) → `packages/proto-gen/scripts/verify-codegen.sh`; SDK codec vocabulary → `packages/sdk-core/src/signaling/codecMap.ts`; 256-byte client-string bound (single home) → `MhConnectionStatus.failure_reason`; old-client vacated-tag-1 connect encoders → `crates/env-tests/src/fixtures/mc_session.rs:mh_connect_frame_with_vacated_tag_1()`, `crates/mh-service/tests/common/wt_client.rs:write_mh_connect_with_vacated_tag_1()`
 - ADR-0039 client signalling (story 4): handler-set rules (snapshot, membership epoch, ref membership, send-placement non-authority) → `MediaHandlerSet`; per-incarnation ref + dial-token credential rule (single home) → `MediaServerInfo.handler_ref`, `.media_dial_token`; close codes + security conditions → `MhCloseCode`; loss-report echo + permitted uses → `MhConnectionStatus`, `MediaConnectionUpdate`; redaction tests → `signaling_roundtrip.rs:assert_redacts_tokens()`; runtime pins → `docs/TODO.md` §Media Path Obligations ("Story-4 signalling-contract RUNTIME rules")
+- Deliberate leave (ordering + post-leave rules) → `LeaveRequest`; MC intake → `crates/mc-service/src/webtransport/connection.rs`; SDK sender + leave outcome → `packages/sdk-core/src/signaling/SignalingClient.ts`
 
 ## Signaling Producers/Consumers (MC + SDK)
 - MediaConnectionUpdate (R-60) + ServerMuteRequest (`handle_server_mute_request()`) → `crates/mc-service/src/webtransport/connection.rs`
@@ -64,12 +64,11 @@ All message/enum shapes → `proto/dark_tower/signaling/v1/signaling.proto`
 - `MeetingKekUpdate` coalescing over W → `crates/mc-service/src/media_admission/rotation.rs`; KEK minting → `media_admission/kek.rs`
 - MC served-kind admission (SCREEN refused) + publish set → `crates/mc-service/src/media_kind.rs:served_kind()`, `PublishSet`
 - SDK KEK intake → `packages/sdk-core/src/signaling/kekIntake.ts:takeMeetingKek()`; retention `min(W/2, ceiling)` → `packages/sdk-core/src/media/setup/kekSource.ts:RetentionGuard`
+- ADR-0039 handler set: MC producer (versioned, ref-addressed) → `crates/mc-service/src/media_routing/placement.rs:MeetingHandlers`, replacement/transfer → `media_routing/replacement.rs`, `planned_transfer.rs`; SDK intake → `packages/sdk-core/src/signaling/handlerSetIntake.ts:takeHandlerSet()`
+- `media_dial` token: MC minting + key → `crates/mc-service/src/media_dial/`; MH admission → `crates/mh-service/src/session/admission.rs`; `MhCloseCode` MH emit → `crates/mh-service/src/webtransport/close.rs`, SDK decode → `packages/sdk-core/src/media/closeCode.ts`
 
 ## Integration Seams
 - GC HTTP error taxonomy (status + `error.code` + `error_type`) → `crates/gc-service/src/errors.rs`; meeting-creation refusals → `crates/gc-service/src/repositories/meetings.rs`
 - MH gRPC metrics (method cardinality) → `crates/mh-service/src/observability/metrics.rs:record_grpc_request()`
-
-## Story Manifest Schema (dt-story)
-- Contract → ADR-0035; schema + `v1` marker → `crates/dt-story/src/manifest.rs`; block discovery → `crates/dt-story/src/markdown.rs:find_manifest_block()`; CLI → `crates/dt-story/src/main.rs`
-- Guards → `scripts/guards/simple/validate-story-manifest.sh`, `validate-slug-class-sync.sh`
+- Story manifest schema (ADR-0035) → `crates/dt-story/src/manifest.rs`, `markdown.rs:find_manifest_block()`, CLI `main.rs`; guards → `scripts/guards/simple/validate-story-manifest.sh`, `validate-slug-class-sync.sh`
 
