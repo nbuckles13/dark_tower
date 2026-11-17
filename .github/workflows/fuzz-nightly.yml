@@ -87,7 +87,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "=== Generating seed corpus: ${SEED_CMD} ==="
-          # Split the static matrix string into argv; no eval, no ${{ }} in the script.
+          # Split the static matrix string into argv; no eval, and no Actions expression in the script body.
           read -ra cmd <<<"${SEED_CMD}"
           "${cmd[@]}"
 
