@@ -393,15 +393,14 @@ pub async fn gc_config_gauge_agreed(
 ///
 /// # Why this wait exists
 ///
-/// A removed MH does not tell GC it is gone. Today MH sends no DRAINING load
-/// report on SIGTERM; that is story 4 MH-3. So GC's row stays `healthy` with a
-/// fresh heartbeat, and `get_candidate_mhs` still selects it, until the
-/// heartbeat ages past `B = k × I`. With no MC replacement yet (MC-B/C), a
-/// meeting created inside that window keeps a dead handler. The window is the
+/// An MH reports DRAINING to GC on SIGTERM (story 4 MH-3), which excludes its
+/// row from selection at once, so this wait is normally about one
+/// health-checker tick plus a scrape. It still bounds the case where that
+/// report never lands (an MH killed before it could send it): GC's row then
+/// stays `healthy` with a fresh heartbeat, and `get_candidate_mhs` still
+/// selects it, until the heartbeat ages past `B = k × I`. The window is the
 /// ADR-0039 design, not a bug, but a test that removes an MH must not leak it
-/// to the next suite. Once MH-3 lands, a DRAINING report excludes the row from
-/// selection at once, and this wait shrinks to about one health-checker tick
-/// plus a scrape. The code stays correct either way.
+/// to the next suite.
 ///
 /// # Evidence (GC's own view, never a re-derivation of its selection rule)
 ///
