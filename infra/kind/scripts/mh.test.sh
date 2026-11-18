@@ -1241,10 +1241,13 @@ fail_case "image pull fails fast" debug-container-timeout '{"after":-1,"waiting"
 assert_status "$CASE_LABEL: names the waiting reason" "waiting=ImagePullBackOff" "$DETAIL"
 
 # --- the ONE in-container script, run for real against a local process ---
-# A uniquely named copy of sleep stands in for mh-service (the comm is the script's $2).
+# A bash loop that renames ITSELF to a unique comm stands in for mh-service (the comm is the
+# script's $2). It writes /proc/self/comm rather than running a renamed copy of a binary: a
+# multicall coreutils (Ubuntu 26.04's) picks its utility from its own file name, so a renamed
+# copy of sleep exits at once. Its `sleep` children keep comm `sleep` and never match.
 COMM="dtinj$$x"; COMM="${COMM:0:15}"
 new_case "in-container script: STOP / CONT / KILL on a real process"
-cp "$(command -v sleep)" "$CASE/$COMM"
+STANDIN='printf %s "$1" > /proc/self/comm; while :; do sleep 1; done'
 SCRIPT="$("$BASH_BIN" -c 'source "$1"; printf %s "$MH_INJECT_SCRIPT"' _ "$MH")"
 pstate() { sed -n 's/^[0-9]* (.*) \([A-Za-z]\) .*/\1/p' "/proc/$1/stat" 2>/dev/null; }
 # wait_comm <pid>: bounded poll (5 s, 0.05 s steps) until the process IS $COMM; loud at the bound.
@@ -1261,7 +1264,7 @@ wait_comm() {
 # also ends a STOPped one, so nothing is left behind.
 TPIDS=()
 reap_standins() { local p; for p in "${TPIDS[@]}"; do kill -KILL "$p" 2>/dev/null; wait "$p" 2>/dev/null; done; TPIDS=(); }
-"$CASE/$COMM" 300 & tpid=$!; TPIDS+=("$tpid")
+"$BASH_BIN" -c "$STANDIN" _ "$COMM" & tpid=$!; TPIDS+=("$tpid")
 wait_comm "$tpid"
 o="$(sh -c "$SCRIPT" dt-inject STOP "$COMM")"; r=$?
 assert_rc "$CASE_LABEL: STOP rc" 0 "$r"; assert_rc "$CASE_LABEL: STOP line" "DT_INJECT pid=${tpid} state=T" "$o"
@@ -1271,7 +1274,7 @@ assert_rc "$CASE_LABEL: CONT rc" 0 "$r"; assert_rc "$CASE_LABEL: really running"
 o="$(sh -c "$SCRIPT" dt-inject HUP "$COMM")"; r=$?
 assert_rc "$CASE_LABEL: closed set re-checked in-container" "10 DT_INJECT error=bad-signal" "$r $o"
 assert_rc "$CASE_LABEL: HUP never sent" S "$(pstate "$tpid")"
-"$CASE/$COMM" 300 & tpid2=$!; TPIDS+=("$tpid2")
+"$BASH_BIN" -c "$STANDIN" _ "$COMM" & tpid2=$!; TPIDS+=("$tpid2")
 wait_comm "$tpid2"
 o="$(sh -c "$SCRIPT" dt-inject KILL "$COMM")"; r=$?
 assert_rc "$CASE_LABEL: two matches refused" "11 DT_INJECT error=pid-count count=2" "$r $o"
