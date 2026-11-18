@@ -42,12 +42,9 @@ run_and_emit "service-dep-exclusion" "${DT_GUARD:-$DT_GUARD_BIN}" service-dep-ex
 # crates/dt-guard/src/resolved_features/mod.rs. INVOKES CARGO (`cargo metadata
 # --offline --locked`: resolution only), so it runs here for the same reason as
 # service-dep-exclusion above.
-# `cargo metadata` without `--filter-platform` needs EVERY platform's package sources;
-# the host-only workspace build above does not download them, so on a cold registry
-# (fresh CI cache, new devloop volume, rust-cache key miss on any Cargo.lock change)
-# `--offline` would fail. Fetch all platforms first, as its own labelled lane: a
-# network failure reds HERE, and the guard stays offline and deterministic.
-run_and_emit "cargo-fetch-all-platforms" cargo fetch "${CARGO_LOCKED[@]}"
+# `--offline` needs every platform's package sources, which the host-only build above
+# does not download: fetch them first (why, and the other lane that needs it: _common.sh).
+run_cargo_fetch_all_platforms
 run_and_emit "resolved-features" "${DT_GUARD:-$DT_GUARD_BIN}" resolved-features --root "$__repo_root"
 
 # ADR-0036 §11 release-build feature gate — asserts mh-service's `per-frame-trace`

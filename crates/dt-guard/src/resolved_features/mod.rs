@@ -51,7 +51,10 @@
 //! package sources (no `--filter-platform`), which the host-only workspace
 //! build does NOT download; `compile.sh` therefore runs an all-platform
 //! `cargo fetch --locked` as its own labelled step first, so a cold registry is
-//! a network failure in THAT lane, not a false red here.
+//! a network failure in THAT lane, not a false red here. The e2e tests
+//! (`tests/resolved_features_e2e.rs`) run this guard on the real workspace in
+//! Layer 4, so `lang/rust/test.sh` runs the same fetch (one helper:
+//! `run_cargo_fetch_all_platforms` in `scripts/lang/_common.sh`).
 //!
 //! ## Vacuity
 //!

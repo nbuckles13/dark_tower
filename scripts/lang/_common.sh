@@ -216,6 +216,20 @@ run_and_emit() {
   fi
 }
 
+# Download EVERY platform's package sources, as its own labelled lane (needs CARGO_LOCKED,
+# above). `cargo metadata` without `--filter-platform` needs them all, and a host-only
+# build does not fetch them, so on a cold registry (fresh CI cache, new devloop volume,
+# rust-cache key miss on any Cargo.lock change) an `--offline` resolution fails. Two lanes
+# resolve that way and each must fetch for itself — they can run in separate CI jobs:
+#   - Layer 1 (lang/rust/compile.sh): `dt-guard resolved-features`;
+#   - Layer 4 (lang/rust/test.sh): dt-guard's resolved_features e2e tests, which run the
+#     real guard against the real workspace.
+# A network failure reds HERE, so the guard stays offline and deterministic.
+# Returns: run_and_emit's (0 OK, 1 FAIL)
+run_cargo_fetch_all_platforms() {
+  run_and_emit "cargo-fetch-all-platforms" cargo fetch "${CARGO_LOCKED[@]}"
+}
+
 # Concurrent run_and_emit for independent scripts (Layer 3's self-tests).
 #
 #   parallel_queue_add <reason-prefix> <script>   # register, in the order output should read
