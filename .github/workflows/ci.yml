@@ -843,6 +843,11 @@ jobs:
           # the step dies. `cargo test` under the sourced env emits the same
           # instrumented profraws the report step below consumes.
           cargo build -p dt-guard --locked
+          # dt-guard's resolved_features e2e tests run `cargo metadata --offline` on the
+          # real workspace, which needs EVERY platform's sources; this job's cache is cold
+          # whenever Cargo.lock or the toolchain changes. Same helper as Layers 1 and 4
+          # (scripts/lang/_common.sh); a subshell keeps its shell options out of this step.
+          ( source scripts/lang/_common.sh && run_cargo_fetch_all_platforms )
           cargo test --workspace --locked
 
           # Point DT_GUARD at the INSTRUMENTED binary, derived from the target dir
