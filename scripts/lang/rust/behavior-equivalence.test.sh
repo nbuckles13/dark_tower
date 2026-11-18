@@ -5,8 +5,8 @@
 # Verifies: `./scripts/test.sh <args>` (NEW dispatcher path) and
 #           `./scripts/lang/rust/test.sh <args>` (OLD path, body migrated)
 # produce IDENTICAL cargo argv on the same args, and that the argv is exactly the
-# two lanes test.sh runs: nextest with every arg, then doctests with the
-# package-selection subset.
+# three lanes test.sh runs: the all-platform fetch (no args), nextest with every arg,
+# then doctests with the package-selection subset.
 #
 # Hermetic via PATH-shim (test §3): no real cargo, no DB bring-up, sub-second.
 # Tests three arg shapes (from existing CI / muscle memory, plus `=`/`--` forms):
@@ -61,10 +61,13 @@ exec "\$(dirname "\$0")/cargo-record" "\$@"
 EOF
 chmod +x "${shim_dir}/cargo"
 
-# The two lane commands, read from test.sh itself (not retyped here): the argv each
+# The lane commands, read from their sources (not retyped here): the argv each
 # run_and_emit lane passes before the caller's args. CARGO_LOCKED is empty here (no
-# GITHUB_ACTIONS / DEVLOOP_FMT_CHECK_ONLY under `env -i`).
+# GITHUB_ACTIONS / DEVLOOP_FMT_CHECK_ONLY under `env -i`). The fetch lane lives in
+# _common.sh (shared with compile.sh); test.sh must call it.
 TEST_SH_SRC="$(cat "${SCRIPTS_ROOT}/lang/rust/test.sh")"
+FETCH_CMD="$(sed -n 's/.*run_and_emit "cargo-fetch-all-platforms" \(cargo fetch[^"$]*\)"\${CARGO_LOCKED.*/\1/p' "${SCRIPTS_ROOT}/lang/_common.sh")"
+grep -qE '^\s*run_cargo_fetch_all_platforms\b' <<< "$TEST_SH_SRC" || FETCH_CMD=""  # not called: every shape fails below
 NEXTEST_CMD="$(sed -n 's/.*run_and_emit "cargo-nextest" \(cargo nextest run [^"$]*\)"\${CARGO_LOCKED.*/\1/p' <<< "$TEST_SH_SRC")"
 DOCTEST_CMD="$(sed -n 's/.*run_and_emit "cargo-doctest" \(cargo test --doc [^"$]*\)"\${CARGO_LOCKED.*/\1/p' <<< "$TEST_SH_SRC")"
 
@@ -160,17 +163,18 @@ run_equivalence() {
   fi
 
   # Non-vacuity + exact lanes: two EMPTY logs (both paths aborted before cargo) would
-  # "match", so each log must be EXACTLY the two lane calls: nextest with every arg,
-  # then doctests with only the package-selection args (never all args, never none).
+  # "match", so each log must be EXACTLY the three lane calls: the all-platform fetch
+  # (never the caller's args), nextest with every arg, then doctests with only the
+  # package-selection args (never all args, never none).
   local log want joined
   joined="$(IFS=' '; printf '%s' "${test_args[*]}")"
-  want="$(printf '%s %s\n%s %s' "${NEXTEST_CMD% }" "$joined" "${DOCTEST_CMD% }" "$want_doc" | sed 's/ *$//')"
+  want="$(printf '%s\n%s %s\n%s %s' "${FETCH_CMD% }" "${NEXTEST_CMD% }" "$joined" "${DOCTEST_CMD% }" "$want_doc" | sed 's/ *$//')"
   for log in "$old_log" "$new_log"; do
-    if [[ -n "$NEXTEST_CMD" && -n "$DOCTEST_CMD" && "$(cat "$log")" == "$want" ]]; then
+    if [[ -n "$FETCH_CMD" && -n "$NEXTEST_CMD" && -n "$DOCTEST_CMD" && "$(cat "$log")" == "$want" ]]; then
       PASS=$((PASS + 1))
     else
       FAIL=$((FAIL + 1))
-      FAILURES+=("[${label}] ${log##*/} is not exactly the two lanes.
+      FAILURES+=("[${label}] ${log##*/} is not exactly the three lanes.
   want: $(tr '\n' '|' <<< "$want")
   got:  $(tr '\n' '|' < "$log")")
     fi

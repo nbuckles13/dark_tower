@@ -245,6 +245,12 @@ main() {
   # No fail-fast in either: every test binary runs even when one fails, so one red run
   # reports every failure (all test runners, every layer — scripts/layer7.test.sh pins it).
   # nextest's is `fail-fast = false` in the layer4 profile; the doctest lane's is the flag.
+  # dt-guard's resolved_features e2e tests run `cargo metadata --offline` on the real
+  # workspace: fetch every platform's sources first (_common.sh has why). Layer 1 fetches
+  # too, but Layer 4 can run in its own CI job with a cold registry. A failed fetch ends
+  # the run here, red, rather than surfacing later as two unexplained test failures.
+  run_cargo_fetch_all_platforms || exit 1
+
   local -a failed=()
   log_info "Running: cargo nextest run --profile layer4 $(IFS=' '; printf '%s' "$*")"
   run_and_emit "cargo-nextest" cargo nextest run --profile layer4 --show-progress none "${CARGO_LOCKED[@]}" "$@" || failed+=(nextest)
