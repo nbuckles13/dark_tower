@@ -223,7 +223,8 @@ run_and_emit() {
 # resolve that way and each must fetch for itself — they can run in separate CI jobs:
 #   - Layer 1 (lang/rust/compile.sh): `dt-guard resolved-features`;
 #   - Layer 4 (lang/rust/test.sh): dt-guard's resolved_features e2e tests, which run the
-#     real guard against the real workspace.
+#     real guard against the real workspace;
+#   - the CI Code Coverage job (.github/workflows/ci.yml), which runs those tests too.
 # A network failure reds HERE, so the guard stays offline and deterministic.
 # Returns: run_and_emit's (0 OK, 1 FAIL)
 run_cargo_fetch_all_platforms() {
