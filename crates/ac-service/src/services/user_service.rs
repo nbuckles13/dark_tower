@@ -220,7 +220,9 @@ async fn validate_registration(
     if !is_valid_email(&request.email) {
         return Ok(Err(RegistrationRejection::InvalidEmail));
     }
-    if request.password.len() < MIN_PASSWORD_LENGTH {
+    // The minimum is about strength, so it counts characters (Unicode scalar
+    // values), as its message says; the maximum below counts bytes, bcrypt's unit.
+    if request.password.chars().count() < MIN_PASSWORD_LENGTH {
         return Ok(Err(RegistrationRejection::WeakPassword));
     }
     if request.password.len() > MAX_PASSWORD_BYTES {
