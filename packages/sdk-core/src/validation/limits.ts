@@ -19,6 +19,17 @@ export const MAX_EMAIL_LENGTH = 254;
 /** Max password length (R-31). */
 export const MAX_PASSWORD_LENGTH = 128;
 /**
+ * Max size of a NEW password, in UTF-8 bytes, checked at registration only. AC
+ * hashes passwords with bcrypt, which ignores every byte past 72, so AC refuses a
+ * longer one at registration with a 400; checking here keeps it from spending a
+ * request and a rate-limit attempt. Login keeps {@link MAX_PASSWORD_LENGTH}, so an
+ * account registered before AC's cap can still sign in.
+ *
+ * ANCHOR (DRY): mirrors `MAX_PASSWORD_BYTES` in
+ * `crates/ac-service/src/services/user_service.rs`.
+ */
+export const MAX_NEW_PASSWORD_BYTES = 72;
+/**
  * Max user-token length. Sized for a real JWT (header.payload.signature, base64url,
  * with claims) — NOT derived from `MAX_PASSWORD_LENGTH`. A bound copied from the
  * password limit would reject every legitimate token, and because the credential
@@ -177,6 +188,22 @@ export function validatePassword(password: string): void {
     throw new ValidationError(
       'password',
       `Password must be at most ${MAX_PASSWORD_LENGTH} characters`,
+    );
+  }
+}
+
+/**
+ * Validate a NEW password (registration): {@link validatePassword}, then at most
+ * {@link MAX_NEW_PASSWORD_BYTES} UTF-8 bytes, counted as bytes, not `.length`
+ * (UTF-16 units). The VALUE is never logged or placed on an error.
+ * @throws {ValidationError} if invalid.
+ */
+export function validateNewPassword(password: string): void {
+  validatePassword(password);
+  if (new TextEncoder().encode(password).length > MAX_NEW_PASSWORD_BYTES) {
+    throw new ValidationError(
+      'password',
+      `Password must be at most ${MAX_NEW_PASSWORD_BYTES} bytes`,
     );
   }
 }
