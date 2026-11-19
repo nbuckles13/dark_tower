@@ -359,6 +359,26 @@ async fn test_register_password_too_short(pool: PgPool) -> Result<(), anyhow::Er
     .await?;
     assert_eq!(failure_rows(server.pool(), "weak_password").await?, 1);
 
+    // The minimum counts characters, not bytes: 7 two-byte characters (14 bytes)
+    // are still too short.
+    let response = server
+        .client()
+        .post(format!("{}/api/v1/auth/register", server.url()))
+        .header("Host", server.host_header("short"))
+        .json(&json!({
+            "email": "short2@example.com",
+            "password": "ééééééé",
+            "displayName": "Short Pass"
+        }))
+        .send()
+        .await?;
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "7 multibyte characters should still be too short"
+    );
+    assert_eq!(failure_rows(server.pool(), "weak_password").await?, 2);
+
     Ok(())
 }
 
