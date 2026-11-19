@@ -5,7 +5,8 @@
 // the `{error:{code,message}}` envelope (`crates/ac-service/src/errors.rs`).
 //
 // LIVE STATUSES: AC emits 400 `INVALID_REQUEST` (registration format validation —
-// bad email, short password, empty display name — and admin validation) and 409
+// bad email, short or over-72-byte password, empty display name — and admin
+// validation) and 409
 // `CONFLICT` (registering an email that already exists in the org), alongside
 // 401/403/404/429/500. Both land on their typed subtypes (`AuthBadRequestError` /
 // `AuthConflictError`) and carry AC's fixed body message verbatim. (404 surfaces as

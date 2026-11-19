@@ -10,8 +10,11 @@ import {
   capMhUrl,
   capUtf8Bytes,
   MAX_MH_URL_BYTES,
+  MAX_NEW_PASSWORD_BYTES,
   MAX_PASSWORD_LENGTH,
   MAX_USER_TOKEN_LENGTH,
+  validateNewPassword,
+  validatePassword,
   validateUserToken,
 } from '../limits.js';
 import { ValidationError } from '../../errors/ValidationError.js';
@@ -96,5 +99,28 @@ describe('validateUserToken', () => {
     // workaround — it would present as an inexplicable join failure (@security).
     expect(MAX_USER_TOKEN_LENGTH).toBeGreaterThan(MAX_PASSWORD_LENGTH * 8);
     expect(() => validateUserToken('a'.repeat(2048))).not.toThrow();
+  });
+});
+
+describe('validateNewPassword (registration: AC refuses passwords over 72 bytes)', () => {
+  it('accepts exactly MAX_NEW_PASSWORD_BYTES ASCII bytes and rejects one more', () => {
+    expect(MAX_NEW_PASSWORD_BYTES).toBe(72);
+    expect(() => validateNewPassword('a'.repeat(72))).not.toThrow();
+    expect(() => validateNewPassword('a'.repeat(73))).toThrow('Password must be at most 72 bytes');
+  });
+
+  it('counts UTF-8 bytes, not UTF-16 length', () => {
+    // 'é' is 1 UTF-16 unit but 2 UTF-8 bytes: 36 of them fill the cap, 37 overflow it.
+    expect(() => validateNewPassword('é'.repeat(36))).not.toThrow();
+    expect(() => validateNewPassword('é'.repeat(37))).toThrow('at most 72 bytes');
+  });
+
+  it('still applies the general password rules', () => {
+    expect(() => validateNewPassword('')).toThrow('Password is required');
+  });
+
+  it('login validation keeps the wider bound, so pre-cap accounts can still sign in', () => {
+    expect(() => validatePassword('a'.repeat(100))).not.toThrow();
+    expect(() => validatePassword('a'.repeat(MAX_PASSWORD_LENGTH + 1))).toThrow();
   });
 });

@@ -10,7 +10,12 @@
 // logs them, stores them, or places them on an error.
 
 import { AuthError } from '../errors/AuthError.js';
-import { validateDisplayName, validateEmail, validatePassword } from '../validation/limits.js';
+import {
+  validateDisplayName,
+  validateEmail,
+  validateNewPassword,
+  validatePassword,
+} from '../validation/limits.js';
 import { resolveAcOrigin } from './origin.js';
 import { handleResponse, safeFetch } from './parse.js';
 import type {
@@ -60,7 +65,7 @@ export class AuthApiClient {
    */
   async register(input: RegisterInput): Promise<RegisterResponse> {
     validateEmail(input.email);
-    validatePassword(input.password);
+    validateNewPassword(input.password);
     validateDisplayName(input.displayName);
     const origin = resolveAcOrigin(this.#acOriginTemplate, input.subdomain);
 
