@@ -1512,14 +1512,13 @@ impl SessionManagerActor {
             .state
             .active_connections
             .get(meeting_id)
-            .map(|participants| {
+            .map_or_default(|participants| {
                 participants
                     .values()
                     .flatten()
                     .map(|c| c.connection_id.clone())
                     .collect()
-            })
-            .unwrap_or_default();
+            });
         // DRAINING carries the time left, derived from the ONE deadline at
         // build time (relative: no clock skew; MH's grace is the only copy).
         let (serving_state, drain_remaining_ms) = match *hb.drain.borrow() {

@@ -1972,11 +1972,9 @@ mod tests {
         fn leave(&mut self, person: u8, controls: &mut Controls) {
             self.members.retain(|m| m.person != person);
             for m in &mut self.members {
-                for kind in 0..2 {
-                    for slot in &mut m.slots[kind] {
-                        if *slot == Some(person) {
-                            *slot = None;
-                        }
+                for slot in m.slots.iter_mut().flatten() {
+                    if *slot == Some(person) {
+                        *slot = None;
                     }
                 }
             }
@@ -2025,7 +2023,12 @@ mod tests {
                         out.push((SlotState::Unavailable, None));
                         continue;
                     }
-                    let Some(o) = me.slots[kind][i] else {
+                    // `declare` keeps min(declared, cap) slots, so every
+                    // i below the cap has one; a missing slot is an oracle bug.
+                    let Some(o) = *me.slots[kind]
+                        .get(i)
+                        .expect("oracle keeps min(declared, cap) slots")
+                    else {
                         out.push((SlotState::FewerSourcesThanSlots, None));
                         continue;
                     };
