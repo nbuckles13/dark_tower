@@ -1263,8 +1263,7 @@ impl RoutingSnapshot {
     pub fn applied_source_streams_for(&self, meeting: &MeetingKey) -> Vec<SourceStreamEcho> {
         self.meetings
             .get(meeting)
-            .map(|r| r.applied_source_streams())
-            .unwrap_or_default()
+            .map_or_default(|r| r.applied_source_streams())
     }
 
     /// Egress edges across **all** meetings on this handler.

@@ -803,14 +803,12 @@ pub fn reconcile(
     status: impl Fn(CandidateRef) -> SourceStatus,
     context: &EdgeContext,
 ) -> Reconciled {
-    let mut carried: HashMap<u32, Arc<EdgeRuntime>> = previous
-        .map(|(_, cells)| {
-            cells
-                .iter()
-                .map(|cell| (cell.egress_stream_id, Arc::clone(cell)))
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut carried: HashMap<u32, Arc<EdgeRuntime>> = previous.map_or_default(|(_, cells)| {
+        cells
+            .iter()
+            .map(|cell| (cell.egress_stream_id, Arc::clone(cell)))
+            .collect()
+    });
     let subscribers = context.subscribers.load();
     let now = Instant::now();
 
