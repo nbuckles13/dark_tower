@@ -362,6 +362,52 @@ async fn test_register_password_too_short(pool: PgPool) -> Result<(), anyhow::Er
     Ok(())
 }
 
+/// A password over 72 bytes is refused: bcrypt ignores every byte past 72, so
+/// accepting it would silently weaken it. Exactly 72 bytes still registers.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_register_password_too_long(pool: PgPool) -> Result<(), anyhow::Error> {
+    // Arrange
+    let server = TestAuthServer::spawn(pool).await?;
+    let _org_id = server.create_test_org("longpw", "Long Corp").await?;
+    let register = |email: &'static str, password: String| {
+        server
+            .client()
+            .post(format!("{}/api/v1/auth/register", server.url()))
+            .header("Host", server.host_header("longpw"))
+            .json(&json!({
+                "email": email,
+                "password": password,
+                "displayName": "Long Pass"
+            }))
+            .send()
+    };
+
+    // Act + Assert - 73 bytes: refused
+    let response = register("long@example.com", "a".repeat(73)).await?;
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "73-byte password should return 400"
+    );
+    assert_error_body(
+        response,
+        "INVALID_REQUEST",
+        "Password must be at most 72 bytes",
+    )
+    .await?;
+    assert_eq!(failure_rows(server.pool(), "password_too_long").await?, 1);
+
+    // Act + Assert - exactly 72 bytes: the boundary is inclusive
+    let response = register("edge@example.com", "a".repeat(72)).await?;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "72-byte password should register"
+    );
+
+    Ok(())
+}
+
 /// Test that registration with empty display_name returns 400.
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_register_empty_display_name(pool: PgPool) -> Result<(), anyhow::Error> {

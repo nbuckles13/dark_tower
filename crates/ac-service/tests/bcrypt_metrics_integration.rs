@@ -45,18 +45,11 @@ fn bcrypt_hash_emits_operation_hash() {
 #[test]
 fn bcrypt_verify_emits_operation_verify() {
     let snap = MetricAssertion::snapshot();
-    // Pre-compute a valid hash OUTSIDE the snapshot window... actually no,
-    // we want only the verify path to emit. So use a known-good fixture
-    // hash to avoid emitting `operation=hash` in this test. The fixture
-    // is a bcrypt cost-10 hash of "test-secret-12345" generated offline.
-    // Using cost-10 avoids the snapshot capturing a hash emission while
-    // still exercising the verify code path under cost-10 (verify cost
-    // is determined by the hash, not the hasher).
-    //
-    // To avoid an external fixture file, we call hash() OUTSIDE the
-    // snapshot, then drop the snapshot and take a fresh one for the
-    // verify-only assertion. See histogram-first / fresh-snapshot
-    // discipline in testing.rs §"Histograms DRAIN".
+    // Only the verify path may emit inside the asserted window, so the hash
+    // is computed under a first snapshot that is then dropped, and a fresh
+    // snapshot covers the verify alone. See histogram-first / fresh-snapshot
+    // discipline in testing.rs §"Histograms DRAIN". (Fixed-hash verification,
+    // across bcrypt versions, is tested in `crypto::tests`.)
     let hash =
         crypto::hash_client_secret("test-secret-12345", RECOMMENDED_MIN_BCRYPT_COST).unwrap();
     drop(snap);

@@ -109,7 +109,14 @@ quinn = "0.11"
 # session-close patch) by the `[patch.crates-io]` entry at the end of this file.
 # Bumping this requirement past 0.7.2 silently unpatches it; follow the drop
 # procedure in vendor/patches/wtransport/PATCH.md instead.
-wtransport = { version = "0.7", features = ["quinn"] }
+#
+# `default-features = false`: the upstream default `self-signed` links rcgen into
+# the MC/MH images, which only ever load certificates from disk
+# (`Identity::load_pemfiles`). `ring` is the provider ADR-0027 allows, named
+# explicitly because it was a default. The one test using in-memory
+# `Identity::self_signed` enables `self-signed` as a dev-dependency feature
+# (mh-service), which reaches test builds only.
+wtransport = { version = "0.7", default-features = false, features = ["quinn", "ring"] }
 
 # Lock-free snapshot publication. Readers take an `Arc` with no guard lifetime
 # (`ArcSwap::load_full`), which `tokio::sync::watch` cannot offer: its

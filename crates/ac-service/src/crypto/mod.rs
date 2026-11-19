@@ -1696,6 +1696,30 @@ mod tests {
         );
     }
 
+    /// Hashes already stored in Postgres were written by an OLDER bcrypt than the
+    /// one now linked. Every other verify test hashes at runtime with the current
+    /// crate, so a bump that stopped verifying old hashes would pass them all. These
+    /// fixtures are fixed strings made by an independent implementation (Python
+    /// `bcrypt` 3.2.2, cost 10), in both prefixes we may have stored.
+    #[test]
+    fn test_verify_accepts_fixed_hashes_from_another_implementation() {
+        const SECRET: &str = "stored-before-upgrade-0151";
+        const FIXTURES: [&str; 2] = [
+            "$2a$10$JhkrSGviKG3r1N7cKicupOHEjshIX8mM5Mp2B1eiIr1nogSDCtVpO",
+            "$2b$10$qeaDiYN5n7wBBR2J8gjIc.vhiXtyoAh.kSaAo6PJ1ARmDqzvPiNFK",
+        ];
+        for hash in FIXTURES {
+            assert!(
+                verify_client_secret(SECRET, hash).unwrap(),
+                "fixed hash must verify: {hash}"
+            );
+            assert!(
+                !verify_client_secret("wrong-secret", hash).unwrap(),
+                "fixed hash must reject a wrong secret: {hash}"
+            );
+        }
+    }
+
     /// Test RECOMMENDED_MIN_BCRYPT_COST constant is used correctly
     #[test]
     fn test_default_bcrypt_cost_constant() {
