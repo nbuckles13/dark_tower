@@ -18,6 +18,15 @@ const MIN_PASSWORD_LENGTH: usize = 8;
 /// (pinned by `tests::weak_password_message_names_min_length`).
 const WEAK_PASSWORD_MESSAGE: &str = "Password must be at least 8 characters";
 
+/// bcrypt hashes only the first 72 bytes of its input and ignores the rest, so a
+/// longer password would be accepted while every byte past 72 did nothing.
+/// Refuse it at registration instead.
+const MAX_PASSWORD_BYTES: usize = 72;
+
+/// Body message for a too-long password. Must name `MAX_PASSWORD_BYTES`
+/// (pinned by `tests::long_password_message_names_max_bytes`).
+const LONG_PASSWORD_MESSAGE: &str = "Password must be at most 72 bytes";
+
 /// Registration request data.
 #[derive(Debug, Clone)]
 pub struct RegistrationRequest {
@@ -44,6 +53,7 @@ pub struct RegistrationResponse {
 enum RegistrationRejection {
     InvalidEmail,
     WeakPassword,
+    PasswordTooLong,
     EmptyDisplayName,
     EmailExists,
 }
@@ -53,6 +63,7 @@ impl RegistrationRejection {
         match self {
             RegistrationRejection::InvalidEmail => "invalid_email",
             RegistrationRejection::WeakPassword => "weak_password",
+            RegistrationRejection::PasswordTooLong => "password_too_long",
             RegistrationRejection::EmptyDisplayName => "empty_display_name",
             RegistrationRejection::EmailExists => "email_exists",
         }
@@ -62,6 +73,7 @@ impl RegistrationRejection {
         match self {
             RegistrationRejection::InvalidEmail => AcError::BadRequest("Invalid email format"),
             RegistrationRejection::WeakPassword => AcError::BadRequest(WEAK_PASSWORD_MESSAGE),
+            RegistrationRejection::PasswordTooLong => AcError::BadRequest(LONG_PASSWORD_MESSAGE),
             RegistrationRejection::EmptyDisplayName => {
                 AcError::BadRequest("Display name cannot be empty")
             }
@@ -211,6 +223,9 @@ async fn validate_registration(
     if request.password.len() < MIN_PASSWORD_LENGTH {
         return Ok(Err(RegistrationRejection::WeakPassword));
     }
+    if request.password.len() > MAX_PASSWORD_BYTES {
+        return Ok(Err(RegistrationRejection::PasswordTooLong));
+    }
     if request.display_name.trim().is_empty() {
         return Ok(Err(RegistrationRejection::EmptyDisplayName));
     }
@@ -344,6 +359,12 @@ mod tests {
     #[test]
     fn weak_password_message_names_min_length() {
         assert!(WEAK_PASSWORD_MESSAGE.contains(&MIN_PASSWORD_LENGTH.to_string()));
+    }
+
+    /// Same for the too-long message and `MAX_PASSWORD_BYTES`.
+    #[test]
+    fn long_password_message_names_max_bytes() {
+        assert!(LONG_PASSWORD_MESSAGE.contains(&MAX_PASSWORD_BYTES.to_string()));
     }
 
     #[test]

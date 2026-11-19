@@ -113,7 +113,9 @@ base64 = { workspace = true }
 serde_json = { workspace = true }
 # WebTransport client for integration tests: enables with_no_cert_validation
 # for self-signed server certs (test-only; production uses real TLS certs).
-wtransport = { workspace = true, features = ["dangerous-configuration"] }
+# `self-signed`: `Identity::self_signed` in tests/transport_real_impl.rs (the
+# workspace entry turns it off for production builds).
+wtransport = { workspace = true, features = ["dangerous-configuration", "self-signed"] }
 # Self-signed TLS cert generation for the accept-loop component test — the
 # rig writes PEMs to a tempdir and passes them through production
 # `Identity::load_pemfiles` (same code path as runtime). `wtransport`'s
