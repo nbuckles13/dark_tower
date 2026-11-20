@@ -312,9 +312,11 @@ impl GcClient {
             handler_id: self.config.handler_id.clone(),
             current_streams: self.current_streams(),
             health: health as i32,
-            cpu_usage_percent: 0.0,
-            memory_usage_percent: 0.0,
-            bandwidth_usage_percent: 0.0,
+            // MH measures none of these yet: sent unset ("not measured"),
+            // never a placeholder 0 (internal.proto SendLoadReportRequest).
+            cpu_usage_percent: None,
+            memory_usage_percent: None,
+            bandwidth_usage_percent: None,
         };
 
         let start = Instant::now();

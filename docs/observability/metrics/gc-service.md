@@ -676,6 +676,22 @@ logs (`gc.grpc.mh_service` "Load report for unknown handler" carries `handler_id
   sum by(outcome) (increase(gc_mh_load_reports_total[5m]))
   ```
 
+### `gc_usage_readings_discarded_total`
+- **Type**: Counter
+- **Description**: Present usage readings GC discarded because they were not a finite percent in `[0, 100]`, from MC `ComprehensiveHeartbeat` and MH `SendLoadReport`. The ONE rule is `grpc/mod.rs::sanitize_usage_percent`. Field-level: the discarded reading is stored (MH) / logged (MC) as no reading — never clamped — and the rest of the request, liveness included, still applies (these readings are advisory; whole-request rejection would let telemetry age a healthy MH out of selection).
+- **Labels**:
+  - `source`: `mc` | `mh`
+  - `field`: `cpu` | `memory` | `bandwidth` (`bandwidth` is MH only)
+  - `reason`: `non_finite` (NaN / ±inf) | `out_of_range` (finite, outside `[0, 100]`)
+- **Cardinality**: 10 reachable series, zero-initialized: (mc x {cpu, memory}) + (mh x {cpu, memory, bandwidth}), each x 2 reasons. `source="mc", field="bandwidth"` cannot occur (MC's heartbeat has no bandwidth field) and is never registered. No sender-id or raw-value label: both are in the `gc.grpc.usage_readings` warn log (`controller_id` for `source="mc"`, `handler_id` for `source="mh"`, plus `raw_value`).
+- **No alert, by design**: the readings are advisory. A non-zero rate means a peer bug (the proto obliges senders never to send such a value); find the peer from the warn log's `controller_id` / `handler_id`.
+- **MC-side counterpart**: `mc_system_readings_unavailable_total` — MC classifies invalid values as unavailable before sending, so `source="mc"` stays at 0 unless MC has a bug.
+- **Example**:
+  ```promql
+  sum by (source, field, reason) (increase(gc_usage_readings_discarded_total[5m]))
+  ```
+- **Dashboard**: GC Overview - Usage Readings Discarded
+
 ### `gc_mh_registrations_total`
 - **Type**: Counter
 - **Description**: RegisterMH outcomes under the GC registration rule (ADR-0039 §7; the rule is stated once above

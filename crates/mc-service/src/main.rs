@@ -55,7 +55,7 @@ use mc_service::grpc::{
 };
 use mc_service::observability::{health_router, HealthState};
 use mc_service::redis::FencedRedisClient;
-use mc_service::system_info::gather_system_info;
+use mc_service::system_info::SystemSampler;
 use mc_service::webtransport::WebTransportServer;
 use proto_gen::dark_tower::internal::v1::media_coordination_service_server::MediaCoordinationServiceServer;
 use proto_gen::dark_tower::internal::v1::meeting_controller_service_server::MeetingControllerServiceServer;
@@ -743,6 +743,10 @@ async fn run_gc_task(
     let mut fast_ticker = tokio::time::interval(fast_interval);
     fast_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // One long-lived sampler: CPU usage is a delta between refreshes, so a
+    // per-tick System would read ~0 forever (see `system_info`).
+    let mut system_sampler = SystemSampler::new();
+
     let mut comprehensive_ticker = tokio::time::interval(comprehensive_interval);
     comprehensive_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -770,13 +774,10 @@ async fn run_gc_task(
             }
             _ = comprehensive_ticker.tick() => {
                 let snapshot = metrics.snapshot();
-                let sys_info = gather_system_info();
-
-                // CPU and memory are 0-100, no precision loss in f32 range
-                #[allow(clippy::cast_precision_loss)]
-                let cpu = sys_info.cpu_percent as f32;
-                #[allow(clippy::cast_precision_loss)]
-                let memory = sys_info.memory_percent as f32;
+                let readings = system_sampler.sample();
+                readings.record_unavailable();
+                // An unavailable reading is sent unset, never as 0.
+                let (cpu, memory) = readings.to_wire();
 
                 if let Err(e) = gc_client
                     .comprehensive_heartbeat(

@@ -12,6 +12,10 @@ pub use mh_service::MhService;
 
 use tonic::Status;
 
+use crate::observability::metrics::{
+    record_usage_reading_discarded, UsageDiscardReason, UsageField, UsageSource,
+};
+
 /// Maximum allowed registration endpoint length (MC and MH registration;
 /// the `VARCHAR(255)` endpoint columns).
 pub(crate) const MAX_ENDPOINT_LENGTH: usize = 255;
@@ -96,9 +100,60 @@ pub fn server_layers(
     )
 }
 
+/// The ONE usage-reading rule (MC comprehensive heartbeat, MH load report):
+/// a present value must be a finite percent in `[0, 100]`.
+///
+/// Field-level, never whole-request: these readings are advisory (nothing in
+/// selection, assignment or health reads them), so one bad reading must not
+/// block the liveness/capacity update the rest of the request carries. An
+/// invalid value becomes `None` (stored / logged as no reading) — never
+/// clamped or saturated — and is loud: a `warn!` naming the sender (as
+/// `controller_id` / `handler_id`, matching every other GC log line) and the
+/// raw value, plus `gc_usage_readings_discarded_total`. `None` passes through.
+/// `peer_id` is the request's already-validated controller / handler id.
+pub(crate) fn sanitize_usage_percent(
+    source: UsageSource,
+    field: UsageField,
+    peer_id: &str,
+    value: Option<f32>,
+) -> Option<f32> {
+    let v = value?;
+    let reason = if !v.is_finite() {
+        UsageDiscardReason::NonFinite
+    } else if !(0.0..=100.0).contains(&v) {
+        UsageDiscardReason::OutOfRange
+    } else {
+        return Some(v);
+    };
+    let raw_value = f64::from(v);
+    match source {
+        UsageSource::Mc => tracing::warn!(
+            target: "gc.grpc.usage_readings",
+            controller_id = %peer_id,
+            source = source.label(),
+            field = field.label(),
+            reason = reason.label(),
+            raw_value,
+            "Discarded invalid usage reading; logged as no reading"
+        ),
+        UsageSource::Mh => tracing::warn!(
+            target: "gc.grpc.usage_readings",
+            handler_id = %peer_id,
+            source = source.label(),
+            field = field.label(),
+            reason = reason.label(),
+            raw_value,
+            "Discarded invalid usage reading; stored as no reading"
+        ),
+    }
+    record_usage_reading_discarded(source, field, reason);
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use common::observability::testing::MetricAssertion;
 
     /// Non-ASCII letters and digits (homoglyphs) are rejected by every id rule.
     #[test]
@@ -197,5 +252,36 @@ mod tests {
             validate_region("r").is_ok(),
             "Region with 1 char should pass"
         );
+    }
+
+    // ---- sanitize_usage_percent ----
+
+    fn sanitize_mh_cpu(v: Option<f32>) -> Option<f32> {
+        sanitize_usage_percent(UsageSource::Mh, UsageField::Cpu, "mh-test", v)
+    }
+
+    #[test]
+    fn absent_and_in_range_values_pass_through() {
+        assert_eq!(sanitize_mh_cpu(None), None);
+        assert_eq!(sanitize_mh_cpu(Some(0.0)), Some(0.0));
+        assert_eq!(sanitize_mh_cpu(Some(42.5)), Some(42.5));
+        assert_eq!(sanitize_mh_cpu(Some(100.0)), Some(100.0));
+    }
+
+    #[test]
+    fn invalid_values_are_discarded_never_clamped_and_counted() {
+        for (v, reason) in [
+            (f32::NAN, "non_finite"),
+            (f32::INFINITY, "non_finite"),
+            (f32::NEG_INFINITY, "non_finite"),
+            (-1.0, "out_of_range"),
+            (100.5, "out_of_range"),
+        ] {
+            let snap = MetricAssertion::snapshot();
+            assert_eq!(sanitize_mh_cpu(Some(v)), None, "{v} must be discarded");
+            snap.counter("gc_usage_readings_discarded_total")
+                .with_labels(&[("source", "mh"), ("field", "cpu"), ("reason", reason)])
+                .assert_delta(1);
+        }
     }
 }

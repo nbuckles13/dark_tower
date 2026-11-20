@@ -604,16 +604,18 @@ impl GcClient {
     /// * `current_meetings` - Current number of active meetings
     /// * `current_participants` - Current total participants
     /// * `health` - Current health status
-    /// * `cpu_usage_percent` - CPU usage (0-100)
-    /// * `memory_usage_percent` - Memory usage (0-100)
+    /// * `cpu_usage_percent` - CPU usage (0-100), `None` when no reading is
+    ///   available this interval (sent unset: never a placeholder 0)
+    /// * `memory_usage_percent` - Memory usage (0-100), `None` when no reading
+    ///   is available
     #[instrument(skip_all, fields(mc_id = %self.config.mc_id))]
     pub async fn comprehensive_heartbeat(
         &self,
         current_meetings: u32,
         current_participants: u32,
         health: HealthStatus,
-        cpu_usage_percent: f32,
-        memory_usage_percent: f32,
+        cpu_usage_percent: Option<f32>,
+        memory_usage_percent: Option<f32>,
     ) -> Result<(), McError> {
         if !self.is_registered.load(Ordering::SeqCst) {
             debug!(target: "mc.grpc.gc_client", "Skipping heartbeat - not registered");
@@ -656,8 +658,8 @@ impl GcClient {
                     debug!(
                         target: "mc.grpc.gc_client",
                         timestamp = inner.timestamp,
-                        cpu = cpu_usage_percent,
-                        memory = memory_usage_percent,
+                        cpu = ?cpu_usage_percent,
+                        memory = ?memory_usage_percent,
                         "Comprehensive heartbeat acknowledged"
                     );
                 }

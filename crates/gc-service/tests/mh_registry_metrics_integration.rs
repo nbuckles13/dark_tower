@@ -38,9 +38,9 @@ fn load_report(id: &str) -> Request<SendLoadReportRequest> {
         handler_id: id.to_string(),
         current_streams: 3,
         health: 1,
-        cpu_usage_percent: 0.0,
-        memory_usage_percent: 0.0,
-        bandwidth_usage_percent: 0.0,
+        cpu_usage_percent: None,
+        memory_usage_percent: None,
+        bandwidth_usage_percent: None,
     })
 }
 

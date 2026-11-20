@@ -518,12 +518,22 @@ message FastHeartbeatRequest {
 }
 
 // Comprehensive heartbeat (30s) - full metrics
+//
+// Resource readings (fields 4-5) are percents in [0, 100] with explicit
+// presence. Unset = no reading this interval; set = a measurement (0 is a real
+// reading, never a placeholder). Senders MUST NOT set a non-finite value or
+// one outside [0, 100]; a receiver discards such a value and treats it as no
+// reading (the rest of the request still applies).
 message ComprehensiveHeartbeatRequest {
   string controller_id = 1;
   ControllerCapacity capacity = 2;
   HealthStatus health = 3;
-  float cpu_usage_percent = 4;
-  float memory_usage_percent = 5;
+  // Host CPU usage over the interval since the previous comprehensive
+  // heartbeat. Unset when no reading is available.
+  optional float cpu_usage_percent = 4;
+  // Host memory in use as a percent of host total. Unset when no reading is
+  // available.
+  optional float memory_usage_percent = 5;
 }
 
 // ============================================================================
@@ -1391,13 +1401,22 @@ message RegisterMHResponse {
 }
 
 // Load report from MH to GC (heartbeat with capacity info)
+//
+// Resource readings (fields 4-6) are percents in [0, 100] with explicit
+// presence. Unset = not measured; set = a measurement (0 is a real reading,
+// never a placeholder). Senders MUST NOT set a non-finite value or one outside
+// [0, 100]; a receiver discards such a value and treats it as no reading (the
+// rest of the report still applies).
 message SendLoadReportRequest {
   string handler_id = 1; // Handler sending the report
   uint32 current_streams = 2; // Current number of active streams
   HealthStatus health = 3; // Current health status
-  float cpu_usage_percent = 4; // CPU usage (0-100)
-  float memory_usage_percent = 5; // Memory usage (0-100)
-  float bandwidth_usage_percent = 6; // Bandwidth usage (0-100)
+  // CPU usage. Unset when not measured.
+  optional float cpu_usage_percent = 4;
+  // Memory usage. Unset when not measured.
+  optional float memory_usage_percent = 5;
+  // Bandwidth usage. Unset when not measured.
+  optional float bandwidth_usage_percent = 6;
 }
 
 // Response to load report
