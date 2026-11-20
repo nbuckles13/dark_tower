@@ -27,6 +27,7 @@ use crate::media_signaling::{
     MuteRejection, MuteSurface, RefusalReplySurface, ServerMuteAction, ServerMuteOutcome,
     SlotViewEmission, UnmuteRequestOutcome, WithdrawalReason,
 };
+use crate::system_info::{Reading, ReadingUnavailable};
 use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use std::time::Duration;
@@ -301,6 +302,21 @@ pub fn record_message_dropped(actor_type: &str) {
 /// Cardinality: 4 (2 statuses x 2 types)
 pub fn record_gc_heartbeat(status: &str, heartbeat_type: &str) {
     counter!("mc_gc_heartbeats_total", "status" => status.to_string(), "heartbeat_type" => heartbeat_type.to_string())
+        .increment(1);
+}
+
+/// Record a host reading that is unavailable for a comprehensive heartbeat
+/// (and so sent unset).
+///
+/// Metric: `mc_system_readings_unavailable_total`
+/// Labels: `reading` (cpu, memory), `reason` (init_failed, no_cpus,
+/// no_memory_total, invalid_value). `no_cpus` is CPU-only and
+/// `no_memory_total` memory-only; `cpu_baseline_pending` is never counted
+/// (see [`ReadingUnavailable::is_counted`]).
+///
+/// Cardinality: 6 reachable series.
+pub fn record_system_reading_unavailable(reading: Reading, reason: ReadingUnavailable) {
+    counter!("mc_system_readings_unavailable_total", "reading" => reading.label(), "reason" => reason.label())
         .increment(1);
 }
 
@@ -2897,6 +2913,12 @@ pub fn zero_initialize_counters() {
     }
     for o in EndMeetingOutcome::ALL {
         counter!("mc_media_end_meeting_total", "outcome" => o.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+    }
+    // Reachable (reading, reason) pairs only.
+    for reading in Reading::ALL {
+        for reason in ReadingUnavailable::counted_for(reading) {
+            counter!("mc_system_readings_unavailable_total", "reading" => reading.label(), "reason" => reason.label()).increment(0);
+        }
     }
     for o in QuiesceOutcome::ALL {
         counter!("mc_media_push_quiesce_total", "outcome" => o.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);

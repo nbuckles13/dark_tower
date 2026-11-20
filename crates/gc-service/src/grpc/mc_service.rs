@@ -11,7 +11,7 @@
 //! - Generic error messages returned to prevent information leakage
 
 use crate::auth::Claims;
-use crate::observability::metrics::{self, GcView, ReplacementTrigger};
+use crate::observability::metrics::{self, GcView, ReplacementTrigger, UsageField, UsageSource};
 use crate::repositories::{
     AssignmentId, EndAssignmentOutcome, HealthStatus, MeetingControllersRepository,
 };
@@ -394,12 +394,28 @@ impl GlobalControllerService for McService {
         // Convert health status from proto enum
         let health_status = HealthStatus::from_proto(req.health);
 
+        // Usage readings are advisory: an invalid one is discarded field by
+        // field (warned, counted) and the heartbeat still applies. Unset = no
+        // reading this interval.
+        let cpu_usage = super::sanitize_usage_percent(
+            UsageSource::Mc,
+            UsageField::Cpu,
+            &req.controller_id,
+            req.cpu_usage_percent,
+        );
+        let memory_usage = super::sanitize_usage_percent(
+            UsageSource::Mc,
+            UsageField::Memory,
+            &req.controller_id,
+            req.memory_usage_percent,
+        );
+
         // Log metrics (could be stored in a time-series database in the future)
         tracing::debug!(
             target: "gc.grpc.comprehensive_heartbeat",
             controller_id = %req.controller_id,
-            cpu_usage = req.cpu_usage_percent,
-            memory_usage = req.memory_usage_percent,
+            cpu_usage = ?cpu_usage,
+            memory_usage = ?memory_usage,
             current_meetings = current_meetings,
             current_participants = current_participants,
             health = ?health_status,

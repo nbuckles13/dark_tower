@@ -800,8 +800,8 @@ async fn test_gc_client_comprehensive_heartbeat() {
             10,
             100,
             proto_gen::dark_tower::internal::v1::HealthStatus::Healthy,
-            45.5,
-            60.0,
+            Some(45.5),
+            Some(60.0),
         )
         .await
         .unwrap();
@@ -811,8 +811,43 @@ async fn test_gc_client_comprehensive_heartbeat() {
     let capacity = request.capacity.unwrap();
     assert_eq!(capacity.current_meetings, 10);
     assert_eq!(capacity.current_participants, 100);
-    assert!((request.cpu_usage_percent - 45.5).abs() < 0.1);
-    assert!((request.memory_usage_percent - 60.0).abs() < 0.1);
+    assert_eq!(request.cpu_usage_percent, Some(45.5));
+    assert_eq!(request.memory_usage_percent, Some(60.0));
+
+    cancel_token.cancel();
+}
+
+/// An unavailable reading reaches GC unset, never as a placeholder 0.
+#[tokio::test]
+async fn test_gc_client_comprehensive_heartbeat_sends_unavailable_readings_unset() {
+    let (heartbeat_tx, mut heartbeat_rx) = mpsc::channel(1);
+    let mock_gc = MockGcServer::accepting().with_comprehensive_heartbeat_channel(heartbeat_tx);
+    let (addr, cancel_token) = start_mock_gc_server(mock_gc).await;
+
+    let gc_url = format!("http://{}", addr);
+    let config = test_config(&gc_url);
+    let token_rx = test_token_receiver();
+
+    let gc_client = GcClient::new(gc_url, token_rx, config.clone())
+        .await
+        .unwrap();
+
+    gc_client.register().await.unwrap();
+
+    gc_client
+        .comprehensive_heartbeat(
+            10,
+            100,
+            proto_gen::dark_tower::internal::v1::HealthStatus::Healthy,
+            None,
+            Some(60.0),
+        )
+        .await
+        .unwrap();
+
+    let request = heartbeat_rx.recv().await.unwrap();
+    assert_eq!(request.cpu_usage_percent, None);
+    assert_eq!(request.memory_usage_percent, Some(60.0));
 
     cancel_token.cancel();
 }
@@ -846,8 +881,8 @@ async fn test_gc_client_heartbeat_skipped_when_not_registered() {
             10,
             100,
             proto_gen::dark_tower::internal::v1::HealthStatus::Healthy,
-            45.5,
-            60.0,
+            Some(45.5),
+            Some(60.0),
         )
         .await
         .unwrap();
@@ -984,7 +1019,7 @@ async fn test_comprehensive_heartbeat_not_found_detection() {
 
     // Comprehensive heartbeat should detect NOT_FOUND
     let result = gc_client
-        .comprehensive_heartbeat(5, 10, HealthStatus::Healthy, 50.0, 75.0)
+        .comprehensive_heartbeat(5, 10, HealthStatus::Healthy, Some(50.0), Some(75.0))
         .await;
 
     assert!(result.is_err());
@@ -1129,7 +1164,7 @@ async fn gc_comprehensive_heartbeat_success_records_status_success_type_comprehe
 
     let snap = MetricAssertion::snapshot();
     gc_client
-        .comprehensive_heartbeat(1, 1, HealthStatus::Healthy, 10.0, 20.0)
+        .comprehensive_heartbeat(1, 1, HealthStatus::Healthy, Some(10.0), Some(20.0))
         .await
         .unwrap();
 
@@ -1198,7 +1233,7 @@ async fn gc_comprehensive_heartbeat_error_records_status_error_type_comprehensiv
 
     let snap = MetricAssertion::snapshot();
     let result = gc_client
-        .comprehensive_heartbeat(1, 1, HealthStatus::Healthy, 10.0, 20.0)
+        .comprehensive_heartbeat(1, 1, HealthStatus::Healthy, Some(10.0), Some(20.0))
         .await;
     assert!(result.is_err(), "expected Err after server cancel");
 

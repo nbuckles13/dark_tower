@@ -48,7 +48,7 @@
 - MH client (`register_meeting`, `end_meeting`, MhRegistrationClient trait) → `crates/mc-service/src/grpc/mh_client.rs`
 - MH→MC notifications → `crates/mc-service/src/grpc/media_coordination.rs:resolve_and_record()` (empty `connection_id` refused at the boundary); heartbeat intake (owner check first, P-1 list screening, routing + drop counting) → `media_coordination.rs:meeting_heartbeat()`/`route_heartbeat()`, `HeartbeatIntake`; auth layer (R-22) → `grpc/auth_interceptor.rs`
 - Redis fenced client, `MhAssignmentData` (GC's hand-off record: written by the assign RPC, never read back by MC) → `crates/mc-service/src/redis/client.rs`; Lua → `redis/lua_scripts.rs`
-- Health, system info → `crates/mc-service/src/observability/health.rs`, `crates/mc-service/src/system_info.rs`
+- Health → `crates/mc-service/src/observability/health.rs`; host readings for the comprehensive heartbeat (long-lived `SystemSampler`, pure `classify`, unset-not-zero `SystemReadings::to_wire`, `record_unavailable`) → `crates/mc-service/src/system_info.rs`; GC-side field-level discard `sanitize_usage_percent` → `crates/gc-service/src/grpc/mod.rs`
 - Metric wrappers + Cat B matrix (`KEY_CUSTODY_LABEL` on media emissions; per-kind recorders take `KindLabels`) → `crates/mc-service/src/observability/metrics.rs`; catalog → `docs/observability/metrics/mc-service.md`; alert inventory → `docs/observability/alerts.md`
 - Kind-label SSoT (`media_kind` + `content_kind` rows, projection table) → `docs/observability/label-taxonomy.md`; key constants → `crates/common/src/observability/labels.rs`; cross-language drift guard → `crates/dt-guard/src/common/kind_labels.rs`, `crates/dt-guard/src/metric_labels.rs`
 

@@ -109,6 +109,20 @@ All MC service metrics follow ADR-0011 naming conventions with the `mc_` prefix.
 - **Cardinality**: Low (2 statuses x 2 types = 4 series)
 - **Usage**: Monitor GC registration health, detect connectivity issues
 
+### `mc_system_readings_unavailable_total`
+- **Type**: Counter
+- **Description**: Comprehensive-heartbeat host readings (CPU, memory) that were unavailable and therefore sent **unset** to GC (never as a placeholder 0; `ComprehensiveHeartbeatRequest` fields are `optional float`). One increment per unavailable reading per comprehensive tick (every 30s by default).
+- **Labels**:
+  - `reading`: `cpu` | `memory`
+  - `reason`: `init_failed` (sysinfo `System` construction failed; retried every tick, the sysinfo error and its kind `unsupported|io|other` are in the `mc.system_info` warn log) | `no_cpus` (CPU stats unreadable; `reading=cpu` only) | `no_memory_total` (memory stats unreadable; `reading=memory` only) | `invalid_value` (non-finite or outside `[0, 100]`, e.g. sysinfo reporting used > total; never clamped; the raw value is in the `mc.system_info` warn log)
+- **Cardinality**: 6 reachable series, zero-initialised: cpu x {`init_failed`, `no_cpus`, `invalid_value`}, memory x {`init_failed`, `no_memory_total`, `invalid_value`}. `no_cpus` never appears with `memory` and `no_memory_total` never with `cpu`.
+- **One init failure increments BOTH series** (`cpu` and `memory`, `reason=init_failed`): one cause, two readings.
+- **Not counted**: `cpu_baseline_pending` — no prior CPU refresh at least `sysinfo::MINIMUM_CPU_UPDATE_INTERVAL` old. Expected once per process start (the comprehensive ticker fires immediately) and once after an init retry succeeds; the CPU reading is still sent unset, logged at debug only, so a rollout does not move this series.
+- **No alert, by design**: the readings are advisory (GC only logs them; nothing in placement reads them), so a gap has no actionable operator response. The counter plus the `mc.system_info` warn log are the loud signal. Heartbeat health is NOT degraded by a reading gap.
+- **GC-side counterpart**: `gc_usage_readings_discarded_total{source="mc"}` (stays 0 unless MC sends an invalid value, which this filter prevents).
+- **Recorded in**: `system_info.rs::SystemReadings::record_unavailable` via `observability/metrics.rs::record_system_reading_unavailable`
+- **Dashboard**: MC Overview - Host Readings Unavailable
+
 ### `mc_gc_notify_meeting_ended_total`
 - **Type**: Counter
 - **Description**: `NotifyMeetingEnded` ATTEMPTS to GC — MC telling GC that the incarnation it held (the `assignment_id` GC sent with the assignment) ENDED (emptied — last participant left OR nobody joined within the join window — or closed) after its handlers were released (ADR-0010 §3). A never-joined meeting never registered on any MH, so its "release" is empty and the notify follows its teardown at once.

@@ -534,6 +534,109 @@ pub fn record_mh_load_report(outcome: &'static str) {
     counter!("gc_mh_load_reports_total", "outcome" => outcome).increment(1);
 }
 
+// ============================================================================
+// Usage-reading discards (MC comprehensive heartbeat, MH load report)
+// ============================================================================
+
+/// Which peer sent a usage reading (`source` label).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageSource {
+    /// MC `ComprehensiveHeartbeatRequest`.
+    Mc,
+    /// MH `SendLoadReportRequest`.
+    Mh,
+}
+
+impl UsageSource {
+    /// Every source.
+    pub const ALL: [Self; 2] = [Self::Mc, Self::Mh];
+
+    /// The `source` label value.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Mc => "mc",
+            Self::Mh => "mh",
+        }
+    }
+
+    /// The usage fields this source's message carries (MC has no bandwidth).
+    #[must_use]
+    pub const fn fields(self) -> &'static [UsageField] {
+        match self {
+            Self::Mc => &[UsageField::Cpu, UsageField::Memory],
+            Self::Mh => &[UsageField::Cpu, UsageField::Memory, UsageField::Bandwidth],
+        }
+    }
+}
+
+/// Which usage reading (`field` label).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageField {
+    /// `cpu_usage_percent`.
+    Cpu,
+    /// `memory_usage_percent`.
+    Memory,
+    /// `bandwidth_usage_percent` (MH only).
+    Bandwidth,
+}
+
+impl UsageField {
+    /// The `field` label value.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Memory => "memory",
+            Self::Bandwidth => "bandwidth",
+        }
+    }
+}
+
+/// Why a present usage reading was discarded (`reason` label).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageDiscardReason {
+    /// NaN or infinite.
+    NonFinite,
+    /// Finite but outside `[0, 100]`.
+    OutOfRange,
+}
+
+impl UsageDiscardReason {
+    /// Every reason.
+    pub const ALL: [Self; 2] = [Self::NonFinite, Self::OutOfRange];
+
+    /// The `reason` label value.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::NonFinite => "non_finite",
+            Self::OutOfRange => "out_of_range",
+        }
+    }
+}
+
+/// Record one discarded usage reading (stored / logged as no reading).
+///
+/// Metric: `gc_usage_readings_discarded_total`
+/// Labels: `source` (`mc` | `mh`), `field` (`cpu` | `memory` | `bandwidth`,
+/// MH only for `bandwidth`), `reason` (`non_finite` | `out_of_range`). No
+/// sender id and no raw value label: both go in the warn log.
+///
+/// Cardinality: 10 reachable series.
+pub fn record_usage_reading_discarded(
+    source: UsageSource,
+    field: UsageField,
+    reason: UsageDiscardReason,
+) {
+    counter!("gc_usage_readings_discarded_total",
+        "source" => source.label(),
+        "field" => field.label(),
+        "reason" => reason.label()
+    )
+    .increment(1);
+}
+
 /// Record what GC did with one `NotifyMeetingEnded` (ADR-0010 §3).
 ///
 /// Metric: `gc_meeting_end_notifications_total`
@@ -1526,6 +1629,15 @@ pub fn zero_initialize_counters() {
     for o in MH_LOAD_REPORT_OUTCOMES {
         counter!("gc_mh_load_reports_total", "outcome" => *o).increment(0);
     }
+    // gc_usage_readings_discarded_total{source, field, reason}: the 10
+    // reachable series only (MC has no bandwidth field).
+    for src in UsageSource::ALL {
+        for f in src.fields() {
+            for r in UsageDiscardReason::ALL {
+                counter!("gc_usage_readings_discarded_total", "source" => src.label(), "field" => f.label(), "reason" => r.label()).increment(0);
+            }
+        }
+    }
     // gc_grpc_mc_calls_total{method, status} (un-exempted — closed at emit sites)
     for m in GRPC_MC_METHODS {
         for s in GRPC_MC_STATUSES {
@@ -1594,6 +1706,12 @@ mod tests {
         present_at_zero(r#"gc_meeting_end_notifications_total{outcome="fenced"}"#);
         present_at_zero(r#"gc_mh_load_reports_total{outcome="accepted"}"#);
         present_at_zero(r#"gc_mh_load_reports_total{outcome="unknown_handler"}"#);
+        present_at_zero(
+            r#"gc_usage_readings_discarded_total{source="mh",field="bandwidth",reason="non_finite"}"#,
+        );
+        present_at_zero(
+            r#"gc_usage_readings_discarded_total{source="mc",field="cpu",reason="out_of_range"}"#,
+        );
         // gc_mh_registrations_total: exactly the 6 series, `match` only on
         // superseded.
         present_at_zero(r#"gc_mh_registrations_total{outcome="ok"}"#);

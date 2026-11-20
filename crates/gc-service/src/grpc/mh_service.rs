@@ -11,7 +11,7 @@
 
 use crate::config::MhRegistryConfig;
 use crate::mh_endpoint_policy::{EndpointField, MhEndpointAllowlist, RejectedComponent};
-use crate::observability::metrics::{self, MhRegistrationOutcome};
+use crate::observability::metrics::{self, MhRegistrationOutcome, UsageField, UsageSource};
 use crate::repositories::{
     HealthStatus, MediaHandlersRepository, MhRegistrationDecision, NewMhRegistration,
 };
@@ -260,27 +260,22 @@ impl MediaHandlerRegistryService for MhService {
             _ => HealthStatus::Pending,
         };
 
+        // Usage readings are advisory: an invalid one is discarded field by
+        // field (stored NULL, warned, counted) and the rest of the report —
+        // liveness included — still applies. Unset = not measured = NULL.
+        let usage = |field, value| {
+            super::sanitize_usage_percent(UsageSource::Mh, field, &req.handler_id, value)
+        };
+
         // Update the load report
         let updated = MediaHandlersRepository::update_load_report(
             &self.pool,
             &req.handler_id,
             current_streams,
             health_status,
-            if req.cpu_usage_percent > 0.0 {
-                Some(req.cpu_usage_percent)
-            } else {
-                None
-            },
-            if req.memory_usage_percent > 0.0 {
-                Some(req.memory_usage_percent)
-            } else {
-                None
-            },
-            if req.bandwidth_usage_percent > 0.0 {
-                Some(req.bandwidth_usage_percent)
-            } else {
-                None
-            },
+            usage(UsageField::Cpu, req.cpu_usage_percent),
+            usage(UsageField::Memory, req.memory_usage_percent),
+            usage(UsageField::Bandwidth, req.bandwidth_usage_percent),
         )
         .await
         .map_err(|e| {
@@ -475,9 +470,9 @@ mod integration_tests {
             handler_id: "overflow-mh".to_string(),
             current_streams: u32::try_from(i32::MAX).unwrap() + 1,
             health: 1,
-            cpu_usage_percent: 0.0,
-            memory_usage_percent: 0.0,
-            bandwidth_usage_percent: 0.0,
+            cpu_usage_percent: None,
+            memory_usage_percent: None,
+            bandwidth_usage_percent: None,
         });
         let result = service.send_load_report(request).await;
         assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
@@ -495,9 +490,9 @@ mod integration_tests {
             handler_id: "load-report-mh".to_string(),
             current_streams: 50,
             health: 1, // Healthy
-            cpu_usage_percent: 25.0,
-            memory_usage_percent: 40.0,
-            bandwidth_usage_percent: 30.0,
+            cpu_usage_percent: Some(25.0),
+            memory_usage_percent: Some(40.0),
+            bandwidth_usage_percent: Some(30.0),
         });
 
         let response = service.send_load_report(request).await.unwrap();
@@ -524,9 +519,9 @@ mod integration_tests {
             handler_id: "unknown-handler".to_string(),
             current_streams: 50,
             health: 1,
-            cpu_usage_percent: 25.0,
-            memory_usage_percent: 40.0,
-            bandwidth_usage_percent: 30.0,
+            cpu_usage_percent: Some(25.0),
+            memory_usage_percent: Some(40.0),
+            bandwidth_usage_percent: Some(30.0),
         });
 
         let result = service.send_load_report(request).await;
@@ -542,13 +537,149 @@ mod integration_tests {
             handler_id: "".to_string(),
             current_streams: 50,
             health: 1,
-            cpu_usage_percent: 25.0,
-            memory_usage_percent: 40.0,
-            bandwidth_usage_percent: 30.0,
+            cpu_usage_percent: Some(25.0),
+            memory_usage_percent: Some(40.0),
+            bandwidth_usage_percent: Some(30.0),
         });
 
         let result = service.send_load_report(request).await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
+    }
+
+    fn load_report(
+        handler_id: &str,
+        current_streams: u32,
+        cpu: Option<f32>,
+        memory: Option<f32>,
+        bandwidth: Option<f32>,
+    ) -> Request<SendLoadReportRequest> {
+        Request::new(SendLoadReportRequest {
+            handler_id: handler_id.to_string(),
+            current_streams,
+            health: 1,
+            cpu_usage_percent: cpu,
+            memory_usage_percent: memory,
+            bandwidth_usage_percent: bandwidth,
+        })
+    }
+
+    /// A real 0 is a reading (stored 0), 100 is in range, and unset after a
+    /// prior value stores NULL (no stale carry-over). Regression for the
+    /// dropped `> 0.0` heuristic, which discarded a genuine 0.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_send_load_report_stores_presence_as_sent(pool: PgPool) {
+        let service = service(pool.clone());
+        seed(&pool, "presence-mh").await;
+
+        service
+            .send_load_report(load_report(
+                "presence-mh",
+                1,
+                Some(0.0),
+                Some(100.0),
+                Some(30.0),
+            ))
+            .await
+            .unwrap();
+        let h = MediaHandlersRepository::get_handler(&pool, "presence-mh")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(h.cpu_usage_percent, Some(0.0));
+        assert_eq!(h.memory_usage_percent, Some(100.0));
+        assert_eq!(h.bandwidth_usage_percent, Some(30.0));
+
+        service
+            .send_load_report(load_report("presence-mh", 1, Some(5.0), Some(5.0), None))
+            .await
+            .unwrap();
+        let h = MediaHandlersRepository::get_handler(&pool, "presence-mh")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            h.bandwidth_usage_percent, None,
+            "unset after Some must store NULL"
+        );
+    }
+
+    /// An invalid present reading is discarded for that field only: the
+    /// report is accepted, the field is NULL (even after a prior valid value),
+    /// the other readings, `current_streams` and liveness all apply, and the
+    /// discard is counted.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_send_load_report_discards_invalid_reading_and_applies_the_rest(pool: PgPool) {
+        use common::observability::testing::MetricAssertion;
+
+        let service = service(pool.clone());
+        seed(&pool, "discard-mh").await;
+
+        for (i, (bad, reason)) in [
+            (f32::NAN, "non_finite"),
+            (f32::INFINITY, "non_finite"),
+            (f32::NEG_INFINITY, "non_finite"),
+            (-1.0, "out_of_range"),
+            (100.5, "out_of_range"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            // Prior valid reading for the field about to go bad.
+            service
+                .send_load_report(load_report(
+                    "discard-mh",
+                    1,
+                    Some(10.0),
+                    Some(20.0),
+                    Some(30.0),
+                ))
+                .await
+                .unwrap();
+            let before = MediaHandlersRepository::get_handler(&pool, "discard-mh")
+                .await
+                .unwrap()
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+
+            let streams = 100 + u32::try_from(i).unwrap();
+            let snap = MetricAssertion::snapshot();
+            let response = service
+                .send_load_report(load_report(
+                    "discard-mh",
+                    streams,
+                    Some(bad),
+                    Some(55.0),
+                    Some(30.0),
+                ))
+                .await
+                .unwrap();
+            assert!(response.into_inner().acknowledged, "{bad}: report accepted");
+
+            let after = MediaHandlersRepository::get_handler(&pool, "discard-mh")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                after.cpu_usage_percent, None,
+                "{bad}: invalid field stored NULL"
+            );
+            assert_eq!(
+                after.memory_usage_percent,
+                Some(55.0),
+                "{bad}: other field applied"
+            );
+            assert_eq!(after.bandwidth_usage_percent, Some(30.0));
+            assert_eq!(after.current_streams, i32::try_from(streams).unwrap());
+            assert!(
+                after.last_heartbeat_at > before.last_heartbeat_at,
+                "{bad}: liveness still refreshed"
+            );
+            snap.counter("gc_usage_readings_discarded_total")
+                .with_labels(&[("source", "mh"), ("field", "cpu"), ("reason", reason)])
+                .assert_delta(1);
+            snap.counter("gc_usage_readings_discarded_total")
+                .assert_delta(1);
+        }
     }
 }

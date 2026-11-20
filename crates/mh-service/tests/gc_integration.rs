@@ -436,6 +436,10 @@ async fn test_gc_client_load_report_success() {
     let request = load_report_rx.recv().await.unwrap();
     assert_eq!(request.handler_id, config.handler_id);
     assert_eq!(request.health, 1); // HEALTHY
+                                   // Unmeasured readings go out unset, never as a placeholder 0.
+    assert_eq!(request.cpu_usage_percent, None);
+    assert_eq!(request.memory_usage_percent, None);
+    assert_eq!(request.bandwidth_usage_percent, None);
 
     cancel_token.cancel();
 }
