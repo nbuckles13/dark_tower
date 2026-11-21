@@ -45,6 +45,19 @@ command_not_found_handle() {
   return 127
 }
 
+# stage_common_lib <dest-dir> — copy _common.sh AND every file it sources into <dest-dir>,
+# for a fixture that runs a COPY of the lang/ tree. The ONE list of _common.sh's sourced
+# siblings for test fixtures: when _common.sh starts sourcing another file, add it here only.
+# Args: $1=destination directory (created if absent)  Returns: non-zero if a copy fails
+__TH_LANG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+stage_common_lib() {
+  local f
+  mkdir -p "$1" || return 1
+  for f in _common.sh _layers.sh; do
+    cp "${__TH_LANG_DIR}/${f}" "$1/${f}" || return 1
+  done
+}
+
 # Increment PASS/FAIL; record failure context.
 # Args: $1=label  $2=expected-exit-code  $3=actual-exit-code
 # Returns: 0 always

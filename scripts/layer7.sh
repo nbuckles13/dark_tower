@@ -291,7 +291,9 @@ precondition_fail() {
   printf 'PRECONDITION_FAILURE: %s\n  Fix: %s\n' "$cause" "$fix" >&2
   emit_status PRECONDITION_FAILURE "$token" | tee_collect_statuses
   # The layer_lifecycle_begin EXIT trap recomputes the exit code from the aggregated
-  # enum (PRECONDITION_FAILURE → 2); the literal arg here is irrelevant.
+  # enum (PRECONDITION_FAILURE → 2); the literal arg here is irrelevant. A deliberate
+  # end: mark it, or the lifecycle renders UNKNOWN layer-incomplete.
+  layer_lifecycle_done
   exit 0
 }
 
@@ -592,6 +594,7 @@ readonly CLUSTER_ENV_REASONS=(runtime-unreachable runtime-incapable apiserver-un
 implementer_fail() {
   printf 'FAIL: %s\n  Fix: %s\n' "$2" "$3" >&2
   emit_status FAIL "$1" | tee_collect_statuses
+  layer_lifecycle_done
   exit 0
 }
 
@@ -1032,6 +1035,7 @@ __layer7_main() {
     # CI, no cluster, not provisionable this round → the ONLY clean skip.
     printf 'Layer7: GITHUB_ACTIONS set + no devloop cluster (provisioning out of scope); skipping env-tests cleanly.\n' >&2
     emit_status SKIPPED-NO-CLUSTER no-cluster-ci | tee_collect_statuses
+    layer_lifecycle_done
     exit 0  # lifecycle maps SKIPPED-NO-CLUSTER → exit 0
   else
     # Local, no helper socket → a cluster was expected but the helper isn't running. LOUD
@@ -1555,4 +1559,7 @@ __layer7_main() {
 # helpers directly).
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   __layer7_main "$@"
+  # Normal end (lifecycle): without this mark a killed/aborted Layer 7 renders STATUS=UNKNOWN
+  # layer-incomplete instead of the worst status of the suites that finished.
+  layer_lifecycle_done
 fi

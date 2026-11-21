@@ -82,6 +82,17 @@ mk_main_md() {
 EOF
 }
 
+# Helper (runs inside the temp repo): snapshot the worktree NOW and render a verdict from it
+# — the producer path layer-all.sh drives (emit_gate2_verdict takes a MANDATORY snapshot and
+# decides nothing: <verdict> is what layer-all's derive_gate2 would have set).
+# emit_v <PASS|FAIL|anything> <status-array> <duration-array> [reason]
+emit_v() {
+  local snap; snap="$(mktemp -d "${DEVLOOP_TMP}/snap.XXXXXX")"
+  gate2_snapshot_worktree "$snap" || { bad "emit_v: snapshot failed"; return 1; }
+  local reason="${4:-none}"; [[ "$1" == "PASS" ]] || reason="${4:-layer-failed}"
+  emit_gate2_verdict "$snap" "$1" "$reason" "$([[ "$1" == PASS ]] && echo 0 || echo 1)" none "" "$2" "$3"
+}
+
 # Helper: an initial commit so HEAD exists and diffs are meaningful.
 seed_commit() {
   echo "seed" > .seedfile
@@ -99,7 +110,7 @@ case_a() {
   git add -A
   # Producer emits over the worktree (== staged after add -A).
   declare -A ls=( [1]=OK [4]=OK ) ld=( [1]=1 [4]=2 )
-  emit_gate2_verdict 0 ls ld
+  emit_v PASS ls ld
   if gate2_validate_commit; then ok "(a) clean run + matching verdict → allow"; else bad "(a) clean run should ALLOW"; fi
 }
 
@@ -113,7 +124,7 @@ case_b() {
   echo "original" > src.rs
   git add -A
   declare -A ls=( [4]=OK ) ld=( [4]=2 )
-  emit_gate2_verdict 0 ls ld
+  emit_v PASS ls ld
   # Now drift: change src.rs and re-stage it (staged blob != recorded blob).
   echo "TAMPERED" > src.rs
   git add src.rs
@@ -136,7 +147,7 @@ case_c() {
   echo "fn main() {}" > src.rs
   git add -A
   declare -A ls=( [4]=OK ) ld=( [4]=2 )
-  emit_gate2_verdict 0 ls ld
+  emit_v PASS ls ld
   # Edit ONLY the main.md (an excluded path) and re-stage it.
   printf '\n<!-- post-run human edit -->\n' >> "docs/devloop-outputs/story-c/main.md"
   git add "docs/devloop-outputs/story-c/main.md"
@@ -153,7 +164,7 @@ case_d() {
   git add -A
   # Simulate a failing pipeline: emit with a nonzero exit code.
   declare -A ls=( [4]=FAIL ) ld=( [4]=2 )
-  emit_gate2_verdict 1 ls ld
+  emit_v FAIL ls ld
   local out rc
   out="$(gate2_validate_commit 2>&1)" && rc=0 || rc=$?
   if [[ "$rc" -ne 0 ]] && grep -q "not PASS" <<<"$out"; then
@@ -245,7 +256,7 @@ case_f2b() {
   echo "fn main() {}" > src.rs
   git add -A
   declare -A ls=( [4]=OK ) ld=( [4]=2 )
-  emit_gate2_verdict 0 ls ld
+  emit_v PASS ls ld
   if [[ "$(gate2_verdict_get GATE2 "$GATE2_VERDICT_FILE")" != "PASS" ]]; then bad "(f2b) setup: no PASS verdict"; return; fi
   run_validate
   expect_phase_refusal "(f2b) ci-speed shape with a PASS verdict present" "docs/devloop-outputs/story-f2b/main.md"
@@ -330,7 +341,7 @@ case_s5() {
   echo "fn main() {}" > src.rs
   git add -A
   declare -A ls=( [4]=OK ) ld=( [4]=2 )
-  emit_gate2_verdict 0 ls ld
+  emit_v PASS ls ld
   run_validate
   expect_phase_refusal "(s5) complete+verdict + another setup record + code" "docs/devloop-outputs/story-s5b/main.md"
   if grep -qF 'story-s5a/main.md:' <<<"$out"; then bad "(s5) the COMPLETE record must not be listed as incomplete: $out"; fi
@@ -400,7 +411,7 @@ case_s10() {
   echo "fn main() {}" > src.rs
   git add -A
   declare -A ls=( [4]=OK ) ld=( [4]=2 )
-  emit_gate2_verdict 0 ls ld
+  emit_v PASS ls ld
   git mv crates/a.rs docs/devloop-outputs/story-s10/a.rs
   run_validate
   if [[ "$rc" -ne 0 ]] && grep -q 'signature mismatch' <<<"$out" && grep -q 'staged but not in verdict: crates/a.rs' <<<"$out"; then
@@ -461,7 +472,7 @@ case_s12c() {
   mkdir -p crates2; git mv crates/a.rs crates2/a.rs
   git add -A
   declare -A ls=( [4]=OK ) ld=( [4]=2 )
-  emit_gate2_verdict 0 ls ld
+  emit_v PASS ls ld
   run_validate
   if [[ "$rc" -eq 0 ]] && grep -q '^FILE crates/a.rs	DELETED$' "$GATE2_VERDICT_FILE"; then
     ok "(s12c) rename → emit → validate → allow; verdict binds the source deletion"
@@ -497,7 +508,7 @@ case_s13() {
       bad "(s13-${v}) complete form must reach the verdict path (rc=$rc); output: $out"
     else
       declare -A ls=( [4]=OK ) ld=( [4]=2 )
-      emit_gate2_verdict 0 ls ld
+      emit_v PASS ls ld
       run_validate
       expect_no_phase_refusal "(s13-${v}) accepted as complete, matching verdict"
     fi
@@ -515,7 +526,7 @@ case_g() {
   echo "fn main() {}" > src.rs
   git add -A
   declare -A ls=( [4]=OK ) ld=( [4]=2 )
-  emit_gate2_verdict 0 ls ld
+  emit_v PASS ls ld
   # Rewrite SLUG in the verdict to a different devloop, keeping the signature
   # valid (simulates a leftover verdict from another devloop in the same session).
   sed -i 's/^SLUG=.*/SLUG=some-other-devloop/' "$GATE2_VERDICT_FILE"
@@ -538,7 +549,7 @@ case_h() {
   echo "fn main() {}" > src.rs
   git add -A
   declare -A ls=( [4]=OK ) ld=( [4]=2 )
-  emit_gate2_verdict 0 ls ld
+  emit_v PASS ls ld
   # Stage an extra validated file the verdict didn't bind.
   echo "extra" > extra.rs
   git add extra.rs
@@ -565,7 +576,7 @@ case_i() {
   echo "fn main() {}" > src.rs
   git add -A
   declare -A ls=( [4]=OK ) ld=( [4]=2 )
-  emit_gate2_verdict 0 ls ld
+  emit_v PASS ls ld
   local recorded_slug
   recorded_slug="$(gate2_verdict_get SLUG "$GATE2_VERDICT_FILE")"
   if [[ "$recorded_slug" == "story-i" ]] && gate2_validate_commit; then
@@ -634,7 +645,7 @@ case_k() {
   # A verdict exists and is otherwise valid for the staged tree — proving the
   # block is due to AMBIGUITY, not a missing/failing verdict.
   declare -A ls=( [4]=OK ) ld=( [4]=2 )
-  emit_gate2_verdict 0 ls ld
+  emit_v PASS ls ld
   local out rc
   out="$(gate2_validate_commit 2>&1)" && rc=0 || rc=$?
   if [[ "$rc" -ne 0 ]] && grep -q "more than one staged devloop main.md" <<<"$out"; then
@@ -689,7 +700,7 @@ case_m() {
   echo "original">keep.rs
   git add -A
   declare -A ls=( [4]=OK ) ld=( [4]=2 )
-  emit_gate2_verdict 0 ls ld
+  emit_v PASS ls ld
   # Exploit attempt: delete gone.rs AND tamper keep.rs, both staged, after emit.
   git rm -q gone.rs
   echo "TAMPERED">keep.rs
@@ -755,7 +766,7 @@ case_o() {
   echo "original">zzz_keep.rs              # a present, validated file (sorts AFTER aaa_del.rs)
   git add -A
   declare -A ls=( [4]=OK ) ld=( [4]=2 )
-  emit_gate2_verdict 0 ls ld
+  emit_v PASS ls ld
   # Exploit attempt: delete aaa_del.rs (sorts FIRST) AND tamper zzz_keep.rs, both
   # staged after emit. The deleted-sorts-first order is the load-bearing detail —
   # it is what truncated the pre-fix record stream head, emptying the tail.
@@ -805,7 +816,7 @@ case_p() {
   echo "original" > src.rs
   git add -A
   declare -A ls=( [4]=OK ) ld=( [4]=2 )
-  emit_gate2_verdict 0 ls ld
+  emit_v PASS ls ld
   echo "TAMPERED" > src.rs
   git add src.rs
   local out rc
@@ -1344,7 +1355,7 @@ case_r20() {
   echo "fn main() {}" > src.rs
   git add -A
   declare -A ls=( [4]=OK ) ld=( [4]=2 )
-  emit_gate2_verdict 0 ls ld
+  emit_v PASS ls ld
   local shim="$DEVLOOP_TMP/shim"
   with_git_shim ':src.rs' rev-parse     # also installs the shim for the direct call below
   if [[ "$rc" -eq 0 ]] || ! grep -q 'error recomputing the staged-tree signature' <<<"$out" \
@@ -1502,7 +1513,7 @@ case_r17() {
 # vb — run the check against HEAD; sets out/rc in the caller's scope.
 vb() { out="$(gate2_verdict_binds_commit "$GATE2_VERDICT_FILE" HEAD)" && rc=0 || rc=$?; }
 # shellcheck disable=SC2034  # ls/ld are read by emit_gate2_verdict through namerefs
-v_emit() { declare -A ls=( [1]=OK [7]=OK ) ld=( [1]=1 [7]=2 ); emit_gate2_verdict "${1:-0}" ls ld; }
+v_emit() { local v=PASS; [[ "${1:-0}" == 0 ]] || v=FAIL; declare -A ls=( [1]=OK [7]=OK ) ld=( [1]=1 [7]=2 ); emit_v "$v" ls ld; }
 # A devloop-shaped change: a modified, an untracked-new, and a deleted bound file, plus
 # an excluded main.md — then the commit.
 v_task_commit() {
@@ -1590,13 +1601,87 @@ case_v11() {
   if [[ "$rc" -eq 1 ]] && [[ "$out" == verdict-signature-mismatch:* ]]; then ok "(v11) validated-but-uncommitted file → verdict-signature-mismatch"; else bad "(v11) should mismatch (rc=$rc): $out"; fi
 }
 
-printf 'gate2 isolation self-test (matrix a–f + Phase≠complete refusal f2/f2b/s1–s13 + slug/extra-file/exclusion/ambiguity/deletion/adversarial-ordering/remediation-ordering/source-safety guards + replay skip q1–q9/r1–r24 + committed binding v1–v11):\n'
+# ---------------------------------------------------------------------------
+# (k1–k6) KILLED-RUN contract (devloop 2026-11-21-killed-run-gate2-pass): the emitter
+# decides nothing and renders fail-closed; the verdict binds the START snapshot; a v1
+# verdict (whose PASS meant only "the trap saw $?==0") no longer binds anywhere.
+# ---------------------------------------------------------------------------
+# (k1) GATE2=PASS only for the literal PASS — FAIL, empty and lower-case `pass` all → FAIL.
+case_k1() {
+  seed_commit; echo x > x.rs
+  local v got snap; snap="$(mktemp -d "${DEVLOOP_TMP}/snap.XXXXXX")"; gate2_snapshot_worktree "$snap"
+  declare -A ls=( [1]=OK ) ld=( [1]=1 )
+  for v in FAIL "" pass; do
+    emit_gate2_verdict "$snap" "$v" none 0 none "" ls ld
+    got="$(gate2_verdict_get GATE2 "$GATE2_VERDICT_FILE")"
+    if [[ "$got" == "FAIL" ]]; then ok "(k1) verdict '${v}' renders GATE2=FAIL"; else bad "(k1) verdict '${v}' rendered GATE2=${got}"; fi
+  done
+}
+# (k2) the snapshot is MANDATORY: no snapshot dir → no verdict written (no exit-time fallback).
+case_k2() {
+  seed_commit; echo x > x.rs; rm -f "$GATE2_VERDICT_FILE"
+  declare -A ls=( [1]=OK ) ld=( [1]=1 )
+  if ! emit_gate2_verdict "" PASS none 0 none "" ls ld 2>/dev/null && [[ ! -e "$GATE2_VERDICT_FILE" ]]; then
+    ok "(k2) emit without a snapshot writes nothing"; else bad "(k2) emit without a snapshot wrote a verdict"; fi
+}
+# (k3) the verdict binds the START snapshot: a file edited after the snapshot (i.e. while
+#      layers ran) is "modified after validation" at commit — the edit is never attested.
+case_k3() {
+  seed_commit; mk_main_md "story-k3" "complete"; echo original > src.rs
+  local snap; snap="$(mktemp -d "${DEVLOOP_TMP}/snap.XXXXXX")"; gate2_snapshot_worktree "$snap"
+  echo EDITED-MID-RUN > src.rs
+  declare -A ls=( [1]=OK ) ld=( [1]=1 )
+  emit_gate2_verdict "$snap" PASS none 0 none "" ls ld
+  git add -A
+  local out rc; out="$(gate2_validate_commit 2>&1)" && rc=0 || rc=$?
+  if [[ "$rc" -ne 0 ]] && grep -q "modified after validation: src.rs" <<<"$out"; then
+    ok "(k3) edit after the start snapshot → block, names src.rs"; else bad "(k3) should block on src.rs (rc=$rc): $out"; fi
+}
+# (k4) control for k3: snapshot, NO edit, emit → the hook allows (the snapshot path did not
+#      break the normal case).
+case_k4() {
+  seed_commit; mk_main_md "story-k4" "complete"; echo original > src.rs
+  local snap; snap="$(mktemp -d "${DEVLOOP_TMP}/snap.XXXXXX")"; gate2_snapshot_worktree "$snap"
+  declare -A ls=( [1]=OK ) ld=( [1]=1 )
+  emit_gate2_verdict "$snap" PASS none 0 none "" ls ld
+  git add -A
+  if gate2_validate_commit 2>/dev/null; then ok "(k4) snapshot, no edit → allow"; else bad "(k4) unedited snapshot verdict should ALLOW"; fi
+}
+# (k5) a v1-schema GATE2=PASS over the matching tree is REJECTED by the hook and by the
+#      runner's committed check.
+case_k5() {
+  seed_commit; mk_main_md "story-k5" "complete"; echo x > src.rs
+  declare -A ls=( [1]=OK ) ld=( [1]=1 ); emit_v PASS ls ld
+  sed -i 's#^SCHEMA=.*#SCHEMA=gate2-verdict/v1#' "$GATE2_VERDICT_FILE"
+  git add -A
+  local out rc; out="$(gate2_validate_commit 2>&1)" && rc=0 || rc=$?
+  if [[ "$rc" -ne 0 ]] && grep -q "SCHEMA=gate2-verdict/v1" <<<"$out"; then
+    ok "(k5) v1 PASS verdict → hook blocks on SCHEMA"; else bad "(k5) hook should refuse a v1 verdict (rc=$rc): $out"; fi
+  git commit -qm task
+  out="$(gate2_verdict_binds_commit "$GATE2_VERDICT_FILE" HEAD)" && rc=0 || rc=$?
+  if [[ "$rc" -eq 1 && "$out" == verdict-schema:* ]]; then ok "(k5) v1 PASS verdict → binds_commit verdict-schema"; else bad "(k5) binds_commit should refuse v1 (rc=$rc): $out"; fi
+}
+# (k6) a non-PASS verdict's consumer line names REASON / SIGNAL / MISSING (in-progress shape).
+case_k6() {
+  seed_commit; echo x > x.rs
+  local snap out rc; snap="$(mktemp -d "${DEVLOOP_TMP}/snap.XXXXXX")"; gate2_snapshot_worktree "$snap"
+  declare -A ls=() ld=()
+  emit_gate2_verdict "$snap" FAIL pipeline-incomplete 143 TERM "6,7" ls ld
+  git add -A; git commit -qm c
+  out="$(gate2_verdict_binds_commit "$GATE2_VERDICT_FILE" HEAD)" && rc=0 || rc=$?
+  if [[ "$out" == "verdict-not-pass: GATE2=FAIL REASON=pipeline-incomplete SIGNAL=TERM MISSING=6,7 LAYER_ALL_EXIT=143" ]]; then
+    ok "(k6) verdict-not-pass names REASON/SIGNAL/MISSING"; else bad "(k6) unexpected consumer line: $out"; fi
+  if grep -qx 'LAYER 7 MISSING 0' "$GATE2_VERDICT_FILE"; then ok "(k6) unrecorded layer renders LAYER 7 MISSING 0"; else bad "(k6) no 'LAYER 7 MISSING 0' line"; fi
+}
+
+printf 'gate2 isolation self-test (matrix a–f + Phase≠complete refusal f2/f2b/s1–s13 + slug/extra-file/exclusion/ambiguity/deletion/adversarial-ordering/remediation-ordering/source-safety guards + replay skip q1–q9/r1–r24 + committed binding v1–v11 + killed-run k1–k6):\n'
 for c in case_a case_b case_c case_d case_e case_f case_f2b case_s1 case_s2 case_s3a case_s3b case_s4 case_s5 \
          case_s6 case_s7 case_s8 case_s9 case_s10 case_s11 case_s12 case_s12b case_s12c case_s13 case_g case_h case_i case_j case_k case_l case_m case_n case_o case_p \
          case_q1 case_q2 case_q3 case_q4 case_q5 case_q7 case_q8 case_q9 \
          case_r1 case_r2 case_r5 case_r6 case_r6b case_r6c case_r7 case_r8 case_r9 \
          case_r10 case_r10b case_r11 case_r12 case_r12c case_r13 case_r19 case_r20 case_r21 case_r22 case_r15 case_r16 case_r17 case_r23 case_r24 \
-         case_v1 case_v2 case_v3 case_v4 case_v5 case_v6 case_v7 case_v8 case_v9 case_v10 case_v11; do
+         case_v1 case_v2 case_v3 case_v4 case_v5 case_v6 case_v7 case_v8 case_v9 case_v10 case_v11 \
+         case_k1 case_k2 case_k3 case_k4 case_k5 case_k6; do
   with_temp_repo "$c" || true
 done
 

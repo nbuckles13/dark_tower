@@ -386,8 +386,10 @@ emit_verdict() {
   ( # shellcheck disable=SC1091
     source "__REAL_GATE2_LIB__"
     declare -a S=() D=()
-    for i in 1 2 3 4 5 6 7; do S[$i]=OK; D[$i]=1; done
-    emit_gate2_verdict "$1" S D ) >/dev/null 2>&1 || : >> "${M}/verdict.emit-failed"
+    for i in $(seq 1 "$LAYER_MAX"); do S[$i]=OK; D[$i]=1; done
+    snap="$(mktemp -d "${DEVLOOP_TMP:?}/snap.XXXXXX")" && gate2_snapshot_worktree "$snap" || exit 1
+    v=PASS; [ "$1" -eq 0 ] || v=FAIL
+    emit_gate2_verdict "$snap" "$v" "$([ "$v" = PASS ] && echo none || echo layer-failed)" "$1" none "" S D ) >/dev/null 2>&1 || : >> "${M}/verdict.emit-failed"
 }
 # FAKE_DEVLOOP_VERDICT (devloop + interactive commits): pass (default) | fail | none |
 # stale (a PASS verdict, then an edit the commit carries but the verdict does not) |
@@ -646,7 +648,7 @@ STUB
 # into the operator paragraph. This goes to the layer's STDOUT, which the runner
 # redirects into the per-task gate LOG file (never the test's own stdout), so it
 # is not a STATUS vote in this suite's Layer-3 verdict (see coupling #1 above).
-for n in 1 2 3 4 5 6 7; do
+for n in $(bash -c 'source "$1"; seq 1 "$LAYER_MAX"' _ "${REAL_REPO_ROOT}/scripts/lang/_layers.sh"); do
   cat > "$TEMPLATE/scripts/layer${n}.sh" <<STUB
 #!/usr/bin/env bash
 : >> "\${DEVLOOP_TEST_MARKERS}/ran.layer${n}"
@@ -1821,7 +1823,7 @@ REUSE_FIXTURE=1 run_story FAKE_LAYER3_RC=0 -- fixture --revalidate
 unset REUSE_FIXTURE
 assert_exit   "n7c-revalidate-green-exit0" 0 "$RC"
 # The operator's commit is covered by no layer-all run, so the verdict does not bind HEAD
-# and --revalidate runs the FULL gate (layers 1-7).
+# and --revalidate runs the FULL gate (layers 1..LAYER_MAX).
 assert_status "n7c-unbound-full-gate" "GATE2-VERDICT-UNBOUND task=1 (verdict-signature-mismatch" "$OUTPUT"
 assert_marker "n7c-full-gate-layer7-ran" "$MARK" 'ran.layer7'
 # ADR-0037 §D7 / S-11 PERSIST DIRECTION (@security F2): the knob must NOT persist past the per-invocation
@@ -1934,7 +1936,7 @@ assert_status    "n10v-none-guidance" "--revalidate then runs the FULL gate" "$O
 assert_no_marker "n10v-none-no-layer-ran" "$MARK" 'ran.layer1'
 assert_status    "n10v-none-escalated" "escalated" "$(manifest_status "$FIX" 1)"
 assert_status    "n10v-none-gatelog-names-why" "verdict-missing" "$(cat "$(RUN_DIR_OF "$DT")/task-1.gate.log" 2>/dev/null || true)"
-# ...and --revalidate recovers it through the FULL gate (layers 1-7), then completes.
+# ...and --revalidate recovers it through the FULL gate (layers 1..LAYER_MAX), then completes.
 REUSE_FIXTURE=1 run_story -- fixture --revalidate
 unset REUSE_FIXTURE
 assert_exit      "n10v-none-revalidate-exit0" 0 "$RC"

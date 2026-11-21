@@ -7,7 +7,7 @@
 # --layer mapping (per-verb-name, not per-layer-number):
 #   quick    → L1 compile, L2 format, L3 guards         (no tests/lint/audit/env-tests)
 #   standard → quick + L4 test                          (no lint/audit/env-tests)
-#   full     → all layers L1-L7 (canonical pipeline)    (literally invokes layer-all.sh)
+#   full     → all layers 1..LAYER_MAX (canonical)      (literally invokes layer-all.sh)
 #
 # `--layer full` IS `scripts/layer-all.sh` (paired-operations Q5): identical layer
 # scripts run, identical exit-code semantics. Layer loop is NOT reimplemented here.
@@ -46,7 +46,7 @@ Options:
                    quick    → L1 compile, L2 format, L3 guards
                    standard → quick + L4 test (incl. client unit/component via
                               the L4 ts wrapper, affected-gated)
-                   full     → all layers L1-L7 (= scripts/layer-all.sh; L7 adds
+                   full     → all layers (= scripts/layer-all.sh; the last adds
                               env-tests + the diff-triggered browser E2E)
   --format FORMAT  Output format: text, json (default: text)
   --verbose        Show detailed output
@@ -89,7 +89,7 @@ declare -a layers
 case "$LAYER" in
   quick)    layers=(1 2 3) ;;
   standard) layers=(1 2 3 4) ;;
-  full)     layers=(1 2 3 4 5 6 7) ;;
+  full)     mapfile -t layers < <(seq 1 "$LAYER_MAX") ;;
 esac
 
 # `--layer full` is structurally identical to layer-all.sh — invoke it directly.

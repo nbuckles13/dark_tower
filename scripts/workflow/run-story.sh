@@ -35,7 +35,7 @@
 #                   For a failure judged environmental, not diff-caused, or after
 #                   committing a fix on top. Depth follows the Gate-2 verdict
 #                   (ADR-0035 §3, 2026-11-10 amendment): layers 1-3 if a PASSING
-#                   layer-all verdict covers HEAD's tree, else the FULL gate (1-7).
+#                   layer-all verdict covers HEAD's tree, else the FULL gate (1..LAYER_MAX).
 #                   Green -> complete; red -> re-escalate. Composable with --stop-after.
 #   --restart <text>  operator-intervention retry for the escalated task the run
 #                   reaches: spawn a FRESH devloop seeded with <text> (the
@@ -812,9 +812,11 @@ trap 'rm -f "$INFLIGHT" "$STOP_REQUEST"' EXIT
 # gate killed layer-all mid-run and was recorded as a gate failure. (The canary
 # probe is already isolated by `timeout`, and is short.)
 command -v setsid >/dev/null 2>&1 || { slogerr "STORY_RUN: PRECONDITION — setsid (util-linux) not found; the runner cannot isolate its children from Ctrl-C."; exit 2; }
+# The child-session mechanism (spawn / interruptible wait / bounded group teardown, and the
+# __CHILD_PID / __WAIT_INTERRUPTED state on_sigint drives) is shared with layer-all.sh.
+# shellcheck source=../lang/_child_group.sh
+source "${REAL_REPO_ROOT}/scripts/lang/_child_group.sh"
 __INT_PRESSES=0
-__WAIT_INTERRUPTED=0
-__CHILD_PID=""
 __ABORT_LANE=""   # what a second Ctrl-C must leave recoverable: devloop | gate | "" (just exit)
 
 # run_isolated <lane> <logfile> <cmd...> — run a long child in its own session,
@@ -823,41 +825,23 @@ __ABORT_LANE=""   # what a second Ctrl-C must leave recoverable: devloop | gate 
 # for the same child (bash keeps a reaped child's status for the re-wait).
 # Returns the child's exit status. Preserves the caller's errexit state.
 run_isolated() {
-  local lane="$1" log="$2" pid rc had_e=0
+  local lane="$1" log="$2" rc had_e=0
   shift 2
   case "$-" in *e*) had_e=1 ;; esac
   set +e
   __ABORT_LANE="$lane"
-  setsid "$@" >>"$log" 2>&1 &
-  pid=$!
-  __CHILD_PID="$pid"
-  while :; do
-    __WAIT_INTERRUPTED=0
-    wait "$pid"
-    rc=$?
-    [ "$__WAIT_INTERRUPTED" -eq 1 ] && continue
-    break
-  done
+  child_group_spawn "$@" >>"$log" 2>&1
+  child_group_wait "$__CHILD_PID"
+  rc=$?
   __CHILD_PID=""
   __ABORT_LANE=""
   [ "$had_e" -eq 1 ] && set -e
   return "$rc"
 }
 
-# Terminate the in-flight child's whole session (setsid made it the group leader;
-# `timeout` forwards the TERM to claude), escalating to KILL if it lingers.
-kill_child_group() {
-  local pid="${__CHILD_PID:-}"
-  [ -n "$pid" ] || return 0
-  kill -TERM -- "-${pid}" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
-    kill -0 "$pid" 2>/dev/null || break
-    sleep 0.5
-  done
-  kill -KILL -- "-${pid}" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
-  __CHILD_PID=""
-}
+# kill_child_group (scripts/lang/_child_group.sh) terminates the in-flight child's whole
+# session (setsid made it the group leader; `timeout` forwards the TERM to claude),
+# escalating to KILL after the full CHILD_GROUP_GRACE_POLLS grace.
 
 operator_abort() {
   trap - INT   # a third press must not re-enter mid-cleanup
@@ -1060,7 +1044,7 @@ escalate() {
     slogerr "STORY_RUN: recover after diagnosing: rerun with --revalidate (re-run the gate ONLY, for an environmental failure) OR --restart 'what to fix' (fresh devloop from THIS commit). A plain rerun re-implements from scratch."
   fi
   if [ "$reason" = "gate2-verdict-unbound" ]; then
-    slogerr "STORY_RUN: gate2-verdict-unbound: the devloop committed a tree no PASSING layer-all.sh run covers (its Gate 2 was skipped or failed, or the tree changed afterwards). Read the commit and the devloop's main.md; --revalidate then runs the FULL gate (layers 1-7) on HEAD."
+    slogerr "STORY_RUN: gate2-verdict-unbound: the devloop committed a tree no PASSING layer-all.sh run covers (its Gate 2 was skipped or failed, or the tree changed afterwards). Read the commit and the devloop's main.md; --revalidate then runs the FULL gate (layers 1-${LAYER_MAX}) on HEAD."
   fi
   # Auto-suggest the interactive lane after the 2nd+ escalation of THIS task (count
   # the per-attempt records this escalate() writes). A SUGGESTION only — never an
@@ -1525,7 +1509,7 @@ latest_escalation_record() {
 #     only: re-runs the cheap layers on the COMMITTED tree, which is where a guard that
 #     answers differently before vs after the commit shows up (story 4: tasks 8, 9);
 #   - no binding verdict, <on-unbound>=full (--revalidate: operator present, e.g. fix
-#     commits on top that no layer-all run covered) → the full gate, layers 1-7;
+#     commits on top that no layer-all run covered) → the full gate, layers 1..LAYER_MAX;
 #   - no binding verdict, <on-unbound>=escalate (normal path) → run nothing, set
 #     gate_unbound="<token>: <detail>"; the caller escalates (a devloop commit with no
 #     PASS layer-all over its tree means Gate 2 was skipped or bypassed).
@@ -1545,8 +1529,8 @@ run_gate() {
     layers=(1 2 3)
     slog "STORY_RUN: GATE2-VERDICT-BOUND task=${id} — the devloop's PASSING layer-all (HEAD=$(gate2_verdict_get HEAD "$GATE2_VERDICT_FILE" | cut -c1-12), RUN_AT=$(gate2_verdict_get RUN_AT "$GATE2_VERDICT_FILE")) covers HEAD's tree; re-running layers 1-3 on the committed tree."
   elif [ "$on_unbound" = full ]; then
-    gate_layers="1-7"
-    layers=(1 2 3 4 5 6 7)
+    gate_layers="1-${LAYER_MAX}"
+    mapfile -t layers < <(seq 1 "$LAYER_MAX")
     slog "STORY_RUN: GATE2-VERDICT-UNBOUND task=${id} (${why}) — running the full gate."
   else
     gate_unbound="$why"

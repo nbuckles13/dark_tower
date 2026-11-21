@@ -142,6 +142,7 @@ test_ci_pr_before_after() {
   # OLD script sources _common.sh from its own __here. We extracted it into
   # ${tmp}/ which has no _common.sh — symlink so the OLD source line resolves.
   ln -sf "${__here}/_common.sh" "$tmp/_common.sh"
+  ln -sf "${__here}/_layers.sh" "$tmp/_layers.sh"
 
   # Case 1: OLD resolves to origin/main tip (M2).
   local out_old
@@ -205,6 +206,7 @@ test_local_mergebase_noop() {
   git -C "$REPO_ROOT" show "${START_COMMIT}:scripts/lang/_get_base_ref.sh" > "$old_script"
   chmod +x "$old_script"
   ln -sf "${__here}/_common.sh" "$tmp/_common.sh"
+  ln -sf "${__here}/_layers.sh" "$tmp/_layers.sh"
 
   local out_old out_new
   out_old=$(run_isolated "$old_script" 2>&1 >/dev/null)

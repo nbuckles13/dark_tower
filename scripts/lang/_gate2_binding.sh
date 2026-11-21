@@ -51,6 +51,12 @@
 [[ -n "${__DEVLOOP_GATE2_BINDING_SH:-}" ]] && return 0
 readonly __DEVLOOP_GATE2_BINDING_SH=1
 
+# LAYER_MAX / LAYER7_SUITES — the ONE home is the dependency-free
+# _layers.sh (plain assignments, no shell options: source-safe for the hook). The
+# emitter renders one LAYER line per layer 1..LAYER_MAX; run-story's full gate reads it.
+# shellcheck source=_layers.sh
+source "$(dirname "${BASH_SOURCE[0]}")/_layers.sh"
+
 # Per-function strict mode. Functions that want -euo pipefail open with
 # `local -; set -euo pipefail` directly (NOT via a helper call): `local -`
 # (bash 4.4+, which we already require) makes the option change FUNCTION-LOCAL
@@ -88,8 +94,11 @@ gate2_require_bash4() {
 # _common.sh to learn it. Flat KEY=VALUE file, NOT JSON (validator is coreutils-only).
 GATE2_VERDICT_FILE="${DEVLOOP_TMP:-/tmp/devloop}/gate2-verdict"
 
-# Schema version stamped into the artifact (bump if the line grammar changes).
-readonly GATE2_SCHEMA="gate2-verdict/v1"
+# Schema version stamped into the artifact (bump if the line grammar changes). v2
+# (2026-11-21, killed-run fix): REASON/SIGNAL/MISSING keys, a LAYER line per layer, and a
+# verdict decided by layer-all.sh derive_gate2 — a v1 file (whose PASS meant only "the
+# trap saw $?==0", forgeable by a signal) no longer binds.
+readonly GATE2_SCHEMA="gate2-verdict/v2"
 
 # -----------------------------------------------------------------------------
 # Exclusion set (the key judgment call — 3-way locked at Gate 1 with operations,
@@ -482,8 +491,7 @@ gate2_verdict_binds_commit() {
     return 1
   fi
   if [[ "$gate2" != "PASS" ]]; then
-    printf 'verdict-not-pass: GATE2=%s LAYER_ALL_EXIT=%s\n' "$(__gate2_printable "$gate2")" \
-      "$(__gate2_printable "$(gate2_verdict_get LAYER_ALL_EXIT "$file")")"
+    printf 'verdict-not-pass: GATE2=%s %s\n' "$(__gate2_printable "$gate2")" "$(__gate2_verdict_cause "$file")"
     return 1
   fi
   if ! [[ "$vhead" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]] || ! git cat-file -e "${vhead}^{commit}" 2>/dev/null; then
@@ -614,6 +622,80 @@ gate2_layer4_counts() {
     "$passed" "$failed" "$ignored" "$filtered"
 }
 
+# -----------------------------------------------------------------------------
+# Producer, part 1: the tree SNAPSHOT. The ONE reader of the worktree for the verdict.
+#
+# layer-all.sh takes it ONCE, before Layer 1, and every verdict it writes (the run-start
+# `REASON=in-progress` one and the exit one) is written FROM it — so the verdict attests the
+# tree the layers started on, never the tree as it happens to be at exit. At a clean exit
+# layer-all takes a second snapshot and derive_gate2 refuses PASS unless the two match
+# (REASON=tree-changed-during-run): an edit made while layers ran is never attested.
+#
+# gate2_snapshot_worktree <dir> — write into <dir> (which the caller created, 700):
+#   head       — HEAD's full OID
+#   base_ref   — merge-base(origin/main, HEAD), may be empty
+#   slug       — the active devloop slug from the RAW worktree changeset (pre-exclusion:
+#                the active main.md lives under docs/devloop-outputs/**, which IS excluded
+#                from the binding; mirror of gate2_staged_trigger_slug on the hook side)
+#   records    — the canonical NUL record stream (gate2_records_worktree)
+#   signature  — gate2_signature over it (authoritative; FILE lines are derived from records)
+# Returns non-zero (and leaves the dir incomplete) on ANY git/hash failure: the caller
+# treats that as a failed snapshot, never as an empty tree.
+# -----------------------------------------------------------------------------
+gate2_snapshot_worktree() {
+  # Run from the work-tree TOP whatever the caller's cwd (the record stream's paths are
+  # top-relative and its blobs are hashed by path); <dir> is made absolute first.
+  local top dir
+  top="$(git rev-parse --show-toplevel 2>/dev/null)" && [[ -n "$top" ]] || return 1
+  dir="$(cd "$1" 2>/dev/null && pwd -P)" || return 1
+  ( cd "$top" && __gate2_snapshot_here "$dir" )
+}
+__gate2_snapshot_here() {
+  local -; set -euo pipefail
+  local dir="$1" head sig slug
+  local -a raw_paths=()
+  gate2_require_bash4 || return 2
+  [[ -d "$dir" ]] || return 1
+  head="$(git rev-parse --verify --quiet HEAD^{commit})" || return 1
+  [[ -n "$head" ]] || return 1
+  __gate2_capture_nul raw_paths __gate2_raw_worktree_paths || return 1
+  slug="$(gate2_derive_slug "${raw_paths[@]+"${raw_paths[@]}"}")"
+  gate2_records_worktree > "${dir}/records" || return 1
+  sig="$(gate2_signature < "${dir}/records")" || return 1
+  [[ -n "$sig" ]] || return 1
+  printf '%s' "$head" > "${dir}/head"
+  printf '%s' "$(git merge-base origin/main HEAD 2>/dev/null || printf '')" > "${dir}/base_ref"
+  printf '%s' "$slug" > "${dir}/slug"
+  printf '%s' "$sig" > "${dir}/signature"
+}
+
+# gate2_snapshot_get <dir> <field> — print one snapshot field (empty if absent).
+gate2_snapshot_get() {
+  [[ -f "$1/$2" ]] || return 0
+  cat "$1/$2"
+}
+
+# gate2_snapshot_identity <dir> — "<head> <signature>" (empty if either is missing): what
+# two snapshots must share for the tree to count as unchanged. HEAD is part of it because
+# the record stream is a diff AGAINST HEAD — a commit made mid-run changes what it means.
+gate2_snapshot_identity() {
+  local h s
+  h="$(gate2_snapshot_get "$1" head)"; s="$(gate2_snapshot_get "$1" signature)"
+  [[ -n "$h" && -n "$s" ]] || return 0
+  printf '%s %s' "$h" "$s"
+}
+
+# gate2_snapshot_changed_paths <start-dir> <end-dir> [max] — the paths whose record differs
+# between two snapshots (added, removed or re-blobbed), comma-separated, at most <max>
+# (default 5), for the WARN GATE2_TREE_CHANGED_DURING_RUN line. Display only.
+gate2_snapshot_changed_paths() {
+  local a="$1/records" b="$2/records" max="${3:-5}"
+  [[ -f "$a" && -f "$b" ]] || return 0
+  LC_ALL=C comm -3 -z <(LC_ALL=C sort -z "$a") <(LC_ALL=C sort -z "$b") 2>/dev/null \
+    | tr '\0' '\n' | sed 's/^\t//; s/^[^ ]* //' | LC_ALL=C sort -u | head -n "$max" \
+    | tr -d '\r' | paste -sd, - 2>/dev/null || true
+}
+
 # __gate2_raw_worktree_paths — the producer's RAW (pre-exclusion) changed-path list,
 # NUL-delimited, for slug derivation. `&&` so a failing `git diff` fails the call.
 __gate2_raw_worktree_paths() {
@@ -622,37 +704,63 @@ __gate2_raw_worktree_paths() {
 }
 
 # -----------------------------------------------------------------------------
-# Producer: emit the verdict artifact. Called from layer-all.sh's EXIT trap as
-# the pipeline's FINAL step. Writes atomically (temp + mv) so a partial write can
-# never be read as a valid verdict.
+# Producer, part 2: write the verdict artifact from a snapshot. DECIDES NOTHING.
 #
-# A MISSING file and a FAILING run are DISTINCT states: this function always
-# writes a file when reached, with GATE2 derived from the real exit code. The
-# only way no file exists is "layer-all.sh was never invoked" — which is exactly
-# the authority skip-vector (C) the hook must catch.
+# The PASS/FAIL decision and its REASON have ONE home: scripts/layer-all.sh
+# derive_gate2 (which owns the layer record, LAYER_MAX completeness and the status
+# ladder this library cannot see). This function only RENDERS it, fail-closed:
+# GATE2=PASS is written iff <verdict> is the literal `PASS`; anything else — FAIL,
+# empty, a typo — is written as GATE2=FAIL.
 #
-# Tolerates being called from an EARLY exit (precondition exit 2, sentinel-leak
-# exit 1) where the per-layer arrays are unset: every array read is guarded with
-# a default, so an early-exit verdict is just GATE2=FAIL + LAYER_ALL_EXIT=<rc>
-# with no LAYER lines.
+# Writes atomically (temp + `mv -fT`, so a partial write is never readable and the
+# verdict can never land INSIDE a directory squatting at the path).
 #
-# Args:
-#   $1 = layer_all_exit (the real $? captured first in the trap)
-#   $2 = name of an associative-or-indexed array of per-layer STATUS (by ref)
-#   $3 = name of an indexed array of per-layer DURATION (by ref)
-# The arrays are passed BY NAME (bash namerefs) so an unset/empty array is fine.
+# Verdict lifecycle (runbook §8.5):
+#   - no file            — layer-all.sh never ran its authority mode here, refused at its
+#                          start, or was killed between removing the old verdict (right after
+#                          taking its lock) and writing the run-start one;
+#   - REASON=in-progress — written at authority-run start: a run is in flight, or the last
+#                          one died uncatchably (SIGKILL/OOM) before writing its own verdict;
+#   - anything else      — the verdict of the last run that reached its EXIT trap.
+#
+# emit_gate2_verdict <snapshot-dir> <verdict> <reason> <exit> <signal> <missing-csv> \
+#                    <status-array-name> <duration-array-name>
+#   snapshot-dir — MANDATORY (gate2_snapshot_worktree output); no exit-time fallback
+#   verdict      — PASS | FAIL (derive_gate2)
+#   reason       — closed set, derive_gate2's header (none on PASS)
+#   exit         — the derived LAYER_ALL_EXIT, or `none` for the run-start verdict
+#   signal       — TERM | INT | HUP | none
+#   missing-csv  — layers with no terminal record ("" = none)
+#   arrays       — per-layer STATUS / DURATION by name (namerefs; unset entries fine)
+# Renders one LAYER line per layer 1..LAYER_MAX: the recorded status, or MISSING for a
+# layer with no record (display only, like NOT-RUN — never an aggregation input).
 # -----------------------------------------------------------------------------
 emit_gate2_verdict() {
-  # bash-4 required (namerefs, mapfile -d). Non-fatal: a return here surfaces via
-  # the producer trap's warning without changing the pipeline's exit code.
   gate2_require_bash4 || return 2
+
+  local snap="$1" verdict="$2" reason="$3" layer_all_exit="$4" signal="$5" missing="$6"
+  local -n __ls="$7"
+  local -n __ld="$8"
+  local gate2 tmp n st du sig head
+
+  if [[ -z "$snap" || ! -d "$snap" ]]; then
+    printf 'WARN gate2: emit_gate2_verdict called without a snapshot dir — not writing a verdict.\n' >&2
+    return 2
+  fi
+  sig="$(gate2_snapshot_get "$snap" signature)"
+  head="$(gate2_snapshot_get "$snap" head)"
+  if [[ -z "$sig" || -z "$head" || ! -f "$snap/records" ]]; then
+    printf 'WARN gate2: snapshot %s is incomplete — not writing a verdict.\n' "$snap" >&2
+    return 2
+  fi
+  if ! [[ "${LAYER_MAX:-}" =~ ^[1-9][0-9]*$ ]]; then
+    printf 'WARN gate2: LAYER_MAX is unset/invalid (_layers.sh not sourced?) — not writing a verdict.\n' >&2
+    return 2
+  fi
 
   # DEVLOOP_TMP-inside-repo guard (code-reviewer): the verdict MUST be ephemeral and
   # never committable. If DEVLOOP_TMP is (mis)configured to a path inside the work
-  # tree, the artifact would land in the repo — at best polluting the changeset (and
-  # the binding, since it is NOT in the exclusion set), at worst getting committed.
-  # Warn loudly; don't write into the tree. (Non-fatal so a real pipeline run still
-  # completes, but the operator is told to fix DEVLOOP_TMP.)
+  # tree, the artifact would land in the repo. Warn loudly; don't write into the tree.
   local __wt; __wt="$(git rev-parse --show-toplevel 2>/dev/null || printf '')"
   local __vdir; __vdir="$(cd "$(dirname "$GATE2_VERDICT_FILE")" 2>/dev/null && pwd -P || printf '')"
   if [[ -n "$__wt" && -n "$__vdir" && ( "$__vdir" == "$__wt" || "$__vdir" == "$__wt"/* ) ]]; then
@@ -660,83 +768,47 @@ emit_gate2_verdict() {
     return 2
   fi
 
-  local layer_all_exit="$1"
-  # Namerefs to the caller's per-layer arrays. A nameref to an unset name is
-  # valid in bash; the guarded reads below (${__ls[$n]:-}) tolerate the early-exit
-  # case where the producer never populated them.
-  local -n __ls="$2"
-  local -n __ld="$3"
+  if [[ "$verdict" == "PASS" ]]; then gate2="PASS"; else gate2="FAIL"; fi
 
-  local gate2 head base_ref run_at slug sig tmp n
-  if [[ "$layer_all_exit" -eq 0 ]]; then
-    gate2="PASS"
-  else
-    gate2="FAIL"
-  fi
-
-  head="$(git rev-parse HEAD 2>/dev/null || printf 'UNKNOWN')"
-  base_ref="$(git merge-base origin/main HEAD 2>/dev/null || printf '')"
-  run_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-
-  # Slug from the RAW worktree changeset — pre-exclusion, because the active
-  # main.md lives under docs/devloop-outputs/** which IS excluded from the binding.
-  # Deriving the slug from gate2_changeset_worktree (post-exclusion) would always
-  # yield empty. Mirror the hook side (gate2_staged_trigger_slug also reads the
-  # raw, unfiltered name list). NUL-safe collect into array.
-  local -a raw_paths=()
-  if ! __gate2_capture_nul raw_paths __gate2_raw_worktree_paths; then
-    printf 'WARN gate2: enumerating the worktree changeset failed — not writing a verdict.\n' >&2
-    return 2
-  fi
-  slug="$(gate2_derive_slug "${raw_paths[@]+"${raw_paths[@]}"}")"
-
-  # Signature over the canonical blob-first NUL record stream (NOT the FILE lines).
-  # pipefail in the subshell: a failed record stream must not hash as a short one.
-  if ! sig="$(set -o pipefail; gate2_records_worktree | gate2_signature)"; then
-    printf 'WARN gate2: computing the tree signature failed — not writing a verdict.\n' >&2
-    return 2
-  fi
-
-  # Write atomically.
-  tmp="$(mktemp "${GATE2_VERDICT_FILE}.XXXXXX")"
+  tmp="$(mktemp "${GATE2_VERDICT_FILE}.XXXXXX")" || return 2
   {
     printf 'SCHEMA=%s\n'          "$GATE2_SCHEMA"
     printf 'GATE2=%s\n'           "$gate2"
+    printf 'REASON=%s\n'          "${reason:-none}"
     printf 'LAYER_ALL_EXIT=%s\n'  "$layer_all_exit"
-    printf 'SLUG=%s\n'            "$slug"
+    printf 'SIGNAL=%s\n'          "${signal:-none}"
+    printf 'MISSING=%s\n'         "$missing"
+    printf 'SLUG=%s\n'            "$(gate2_snapshot_get "$snap" slug)"
     printf 'HEAD=%s\n'            "$head"
-    printf 'BASE_REF=%s\n'        "$base_ref"
-    printf 'RUN_AT=%s\n'          "$run_at"
+    printf 'BASE_REF=%s\n'        "$(gate2_snapshot_get "$snap" base_ref)"
+    printf 'RUN_AT=%s\n'          "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     printf 'EXCLUSIONS=%s\n'      "$GATE2_EXCLUSIONS_SUMMARY"
 
-    # Per-layer recorded detail (RECORDED, not enforced). Layer 4 carries the
-    # cargo target counts. Guard every array read for the early-exit case.
-    for n in 1 2 3 4 5 6 7; do
-      local st="${__ls[$n]:-}" du="${__ld[$n]:-}"
-      [[ -z "$st" && -z "$du" ]] && continue
-      if [[ "$n" -eq 4 ]]; then
+    # Per-layer recorded detail (display). Layer 4 carries the cargo target counts.
+    for (( n = 1; n <= LAYER_MAX; n++ )); do
+      st="${__ls[$n]:-}" du="${__ld[$n]:-}"
+      if [[ -z "$st" ]]; then
+        printf 'LAYER %s MISSING 0\n' "$n"
+      elif [[ "$n" -eq 4 ]]; then
         printf 'LAYER %s %s %s %s\n' \
-          "$n" "${st:-UNKNOWN}" "${du:-0}" "$(gate2_layer4_counts "${DEVLOOP_TMP:-/tmp/devloop}/layer-4.log")"
+          "$n" "$st" "${du:-0}" "$(gate2_layer4_counts "${DEVLOOP_TMP:-/tmp/devloop}/layer-4.log")"
       else
-        printf 'LAYER %s %s %s\n' "$n" "${st:-UNKNOWN}" "${du:-0}"
+        printf 'LAYER %s %s %s\n' "$n" "$st" "${du:-0}"
       fi
     done
 
-    # Binding FILE lines — HUMAN-READABLE rendering only (path<TAB>token). The
-    # SIGNATURE above is authoritative and is NOT derived from these lines. Derived
-    # from the SAME records stream as the signature (gate2_records_worktree), so the
-    # token (blob OID, or GATE2_DELETED_OID for a deletion) is consistent and the
-    # deletion-handling is single-sourced — no independent per-path blob resolution.
+    # Binding FILE lines — HUMAN-READABLE rendering only (path<TAB>token), derived from
+    # the snapshot's record stream (the same bytes SIGNATURE hashes).
     local rec rtoken rpath
     while IFS= read -r -d '' rec; do
-      rtoken="${rec%% *}"          # first field = token (blob or DELETED)
-      rpath="${rec#* }"            # remainder = path (may contain spaces)
+      rtoken="${rec%% *}"
+      rpath="${rec#* }"
       printf 'FILE %s\t%s\n' "$rpath" "$rtoken"
-    done < <(gate2_records_worktree)
+    done < "$snap/records"
 
     printf 'SIGNATURE=%s\n' "$sig"
-  } > "$tmp"
-  mv -f "$tmp" "$GATE2_VERDICT_FILE"
+  } > "$tmp" || { rm -f "$tmp"; return 2; }
+  mv -fT "$tmp" "$GATE2_VERDICT_FILE" || { rm -f "$tmp"; return 2; }
 }
 
 # =============================================================================
@@ -765,6 +837,20 @@ gate2_verdict_get() {
   local line
   line="$(grep "^$key=" "$file" 2>/dev/null | tail -n1 || true)"
   printf '%s' "${line#"$key"=}"
+}
+
+# __gate2_verdict_cause <verdict-file> — the one-line "why not PASS" every consumer prints
+# (hook, run-story via gate2_verdict_binds_commit): REASON / SIGNAL / MISSING /
+# LAYER_ALL_EXIT, control bytes neutralised. Distinguishes a refused start
+# (pipeline-incomplete, MISSING=<all>, SIGNAL=none), a kill (SIGNAL=TERM), a run in flight
+# or uncatchably killed (in-progress) and a failed layer without opening the file.
+__gate2_verdict_cause() {
+  local f="$1"
+  printf 'REASON=%s SIGNAL=%s MISSING=%s LAYER_ALL_EXIT=%s' \
+    "$(__gate2_printable "$(gate2_verdict_get REASON "$f")")" \
+    "$(__gate2_printable "$(gate2_verdict_get SIGNAL "$f")")" \
+    "$(__gate2_printable "$(gate2_verdict_get MISSING "$f")")" \
+    "$(__gate2_printable "$(gate2_verdict_get LAYER_ALL_EXIT "$f")")"
 }
 
 # -----------------------------------------------------------------------------
@@ -1379,9 +1465,17 @@ gate2_validate_commit() {
   recorded_sig="$(gate2_verdict_get SIGNATURE "$verdict")"
   recorded_slug="$(gate2_verdict_get SLUG "$verdict")"
 
+  local schema
+  schema="$(gate2_verdict_get SCHEMA "$verdict")"
+  if [[ "$schema" != "$GATE2_SCHEMA" ]]; then
+    printf '\n❌ Gate-2: verdict SCHEMA=%s, expected %s — written by an older layer-all.sh; re-run:  ./scripts/layer-all.sh\n' \
+      "$(__gate2_printable "${schema:-MISSING}")" "$GATE2_SCHEMA" >&2
+    return 1
+  fi
+
   if [[ "$gate2" != "PASS" ]]; then
-    printf '\n❌ Gate-2: verdict is %s (not PASS) — the pipeline did not pass.\n' "${gate2:-MISSING}" >&2
-    printf '   Fix the failing layer(s) and re-run:  ./scripts/layer-all.sh\n' >&2
+    printf '\n❌ Gate-2: verdict is %s (not PASS) — %s\n' "$(__gate2_printable "${gate2:-MISSING}")" "$(__gate2_verdict_cause "$verdict")" >&2
+    printf '   Fix the cause and re-run:  ./scripts/layer-all.sh  (runbook §8.5 lists each REASON)\n' >&2
     return 1
   fi
 

@@ -224,6 +224,7 @@ run_synth_layer() {
     # cat the canned child stream through the real tee_collect_statuses, at top-level
     # command position so lastpipe applies (parent-shell __LAYER_* mutation).
     printf 'cat %q | tee_collect_statuses\n' "$stream"
+    printf 'layer_lifecycle_done\n'   # normal end, as every layerN.sh
     # layer_lifecycle_begin installed the EXIT trap → __layer_lifecycle_end fires here.
   } > "$layer"
   local out rc=0

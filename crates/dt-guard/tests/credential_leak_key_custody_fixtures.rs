@@ -361,7 +361,8 @@ fn mechanical_floor_extent_is_pinned_per_spelling() {
         // Scaffolding the guard's changed-file collection needs. Discovered by
         // running it, not assumed: it shells out to the diff-base resolver.
         std::fs::create_dir_all(root.join("scripts/lang")).expect("mkdir scripts/lang");
-        for f in ["_get_base_ref.sh", "_common.sh"] {
+        // `_layers.sh` because `_common.sh` sources it (the one home of LAYER_MAX).
+        for f in ["_get_base_ref.sh", "_common.sh", "_layers.sh"] {
             std::fs::copy(
                 repo_root().join("scripts/lang").join(f),
                 root.join("scripts/lang").join(f),

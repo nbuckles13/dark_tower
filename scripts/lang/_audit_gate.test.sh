@@ -170,7 +170,7 @@ make_wrapper_repo() {
     # The stub's path is the one the copied tool-bins.sh resolves, never retyped.
     local dtg; dtg="$(. scripts/lib/tool-bins.sh && printf '%s' "$DT_GUARD_BIN")"
     mkdir -p "$(dirname "$dtg")"
-    cp "${REPO_ROOT}/scripts/lang/_common.sh" scripts/lang/_common.sh
+    stage_common_lib scripts/lang
     cp "${REPO_ROOT}/scripts/lang/_changed_helpers.sh" scripts/lang/_changed_helpers.sh
     cp "${REPO_ROOT}/scripts/lang/_get_base_ref.sh" scripts/lang/_get_base_ref.sh
     cp "${REPO_ROOT}/scripts/lang/_audit_gate.sh" scripts/lang/_audit_gate.sh

@@ -1954,4 +1954,29 @@ print(("codegen-dep-ok" if dep else "codegen-dep-MISSING") + (" cache-off" if t.
 ' "$WEB_APP_PROJECT_JSON" "$tgt")"
 done
 
+# === Lifecycle normal-end mark at each deliberate exit (devloop 2026-11-21-killed-run-gate2-pass) ===
+# layer7.sh calls layer_lifecycle_done at its three deliberate `exit 0` sites and after
+# __layer7_main; a missing call renders the layer STATUS=UNKNOWN REASON=layer-incomplete (exit
+# 2). One named case per site, each pinning the lifecycle's OWN summary line (the last STATUS=),
+# so deleting any one call reds exactly its case.
+reset_case
+SOCK="$ABSENT_SOCK"; export CI_FLAG=true
+run_layer7 "$OUT" "$ERR"
+assert_status "l7-done-skipped-no-cluster" "STATUS=SKIPPED-NO-CLUSTER REASON=layer7-summary" "$(last_status "$OUT")"
+assert_exit   "l7-done-skipped-no-cluster-exit" 0 "$RC"
+reset_case
+SOCK="$ABSENT_SOCK"
+run_layer7 "$OUT" "$ERR"
+assert_status "l7-done-precondition-fail" "STATUS=PRECONDITION_FAILURE REASON=layer7-summary" "$(last_status "$OUT")"
+assert_exit   "l7-done-precondition-fail-exit" 2 "$RC"
+run_cluster_failure provision "PROVISION_FAILED REASON=step-failed STEP=kind-create"
+assert_status "l7-done-implementer-fail" "STATUS=FAIL REASON=layer7-summary" "$(last_status "$OUT")"
+assert_exit   "l7-done-implementer-fail-exit" 1 "$RC"
+reset_case
+SOCK="$PRESENT_SOCK"; export ENVCMD="true"
+run_layer7 "$OUT" "$ERR"
+assert_status "l7-done-normal-end" "STATUS=OK REASON=layer7-summary" "$(last_status "$OUT")"
+assert_exit   "l7-done-normal-end-exit" 0 "$RC"
+reset_case
+
 report_results "scripts/layer7.test.sh"

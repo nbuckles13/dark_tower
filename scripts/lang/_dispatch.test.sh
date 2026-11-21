@@ -12,6 +12,9 @@ set -euo pipefail
 IFS=$'\n\t'
 
 __here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# stage_common_lib (the one list of what _common.sh sources). PASS/FAIL are re-initialised below.
+# shellcheck source=_test_helpers.sh
+source "${__here}/_test_helpers.sh"
 
 PASS=0
 FAIL=0
@@ -46,7 +49,7 @@ test_single_lang_no_double_emit() {
   trap "rm -rf '$tmp'" RETURN
 
   mkdir -p "${tmp}/lang/fakelang"
-  cp "${__here}/_common.sh" "${tmp}/lang/_common.sh"
+  stage_common_lib "${tmp}/lang"
   cp "${__here}/_dispatch.sh" "${tmp}/lang/_dispatch.sh"
 
   # Synthetic verb that emits its own STATUS (the dispatcher always-runs it — there is no
@@ -103,7 +106,7 @@ test_stream_verbatim_masking_closed() {
   trap "rm -rf '$tmp'" RETURN
 
   mkdir -p "${tmp}/lang/no_verb_lang" "${tmp}/lang/ok_lang"
-  cp "${__here}/_common.sh" "${tmp}/lang/_common.sh"
+  stage_common_lib "${tmp}/lang"
   cp "${__here}/_dispatch.sh" "${tmp}/lang/_dispatch.sh"
 
   # no_verb_lang: no test.sh → the dispatcher must emit FAIL-MISSING-VERB for this lang.
@@ -178,7 +181,7 @@ test_include_langs_keeps() {
   trap "rm -rf '$tmp'" RETURN
 
   mkdir -p "${tmp}/lang/kept_lang" "${tmp}/lang/excluded_lang"
-  cp "${__here}/_common.sh"   "${tmp}/lang/_common.sh"
+  stage_common_lib "${tmp}/lang"
   cp "${__here}/_dispatch.sh" "${tmp}/lang/_dispatch.sh"
 
   for lang in kept_lang excluded_lang; do
@@ -236,7 +239,7 @@ test_exclude_langs_drops() {
   trap "rm -rf '$tmp'" RETURN
 
   mkdir -p "${tmp}/lang/kept_lang" "${tmp}/lang/excluded_lang"
-  cp "${__here}/_common.sh"   "${tmp}/lang/_common.sh"
+  stage_common_lib "${tmp}/lang"
   cp "${__here}/_dispatch.sh" "${tmp}/lang/_dispatch.sh"
 
   for lang in kept_lang excluded_lang; do
@@ -298,7 +301,7 @@ test_filter_empty_after_filter() {
   trap "rm -rf '$tmp'" RETURN
 
   mkdir -p "${tmp}/lang/fakelang"
-  cp "${__here}/_common.sh"   "${tmp}/lang/_common.sh"
+  stage_common_lib "${tmp}/lang"
   cp "${__here}/_dispatch.sh" "${tmp}/lang/_dispatch.sh"
   # fakelang has no wrappers — irrelevant here: INCLUDE=nonexistent clears the lang set
   # before any dispatch, so the outcome is SKIPPED-NO-VERB all-langs-filtered.
@@ -516,7 +519,8 @@ __run_audit_dispatch_through_layer6() {
     # Mirror layer6.sh: the audit dispatch (dispatcher is unconditionally always-run) piped
     # through tee_collect_statuses at top-level command position (lastpipe) so the layer
     # aggregates the full stream.
-    printf 'DEVLOOP_LANG_ROOT=%q for_each_lang_with_verb "audit" 2>&1 | tee_collect_statuses\n' "$lang_root"
+    printf 'DEVLOOP_LANG_ROOT=%q for_each_lang_with_verb "audit" 2>&1 | tee_collect_statuses || layer_lifecycle_child_rc "$?"\n' "$lang_root"
+    printf 'layer_lifecycle_done\n'   # normal end, as layer6.sh
   } > "$layer"
   local out rc=0
   out=$(bash "$layer" 2>&1) || rc=$?
@@ -527,7 +531,7 @@ __run_audit_dispatch_through_layer6() {
 test_audit_missing_wrapper_reds_layer() {
   local tmp; tmp=$(mktemp -d)
   trap "rm -rf '$tmp'" RETURN
-  cp "${__here}/_common.sh"   "${tmp}/_common.sh"
+  stage_common_lib "${tmp}"
   cp "${__here}/_dispatch.sh" "${tmp}/_dispatch.sh"
 
   # Masking case (criterion f): `present` lang has a working audit.sh (OK); `gone` lang
@@ -559,7 +563,7 @@ test_audit_missing_wrapper_reds_layer() {
 test_audit_placeholder_gap_stays_0() {
   local tmp; tmp=$(mktemp -d)
   trap "rm -rf '$tmp'" RETURN
-  cp "${__here}/_common.sh"   "${tmp}/_common.sh"
+  stage_common_lib "${tmp}"
   cp "${__here}/_dispatch.sh" "${tmp}/_dispatch.sh"
 
   mkdir -p "${tmp}/present" "${tmp}/protolike"
@@ -613,7 +617,7 @@ test_missing_verb_single_lang() {
   local tmp; tmp=$(mktemp -d)
   trap "rm -rf '$tmp'" RETURN
   mkdir -p "${tmp}/lang/fakeland"
-  cp "${__here}/_common.sh"   "${tmp}/lang/_common.sh"
+  stage_common_lib "${tmp}/lang"
   cp "${__here}/_dispatch.sh" "${tmp}/lang/_dispatch.sh"
   # fakeland has no test.sh — the dispatcher always-runs the verb and finds it missing.
 
@@ -635,7 +639,7 @@ test_missing_verb_all_langs() {
   local tmp; tmp=$(mktemp -d)
   trap "rm -rf '$tmp'" RETURN
   mkdir -p "${tmp}/lang/alpha" "${tmp}/lang/beta"
-  cp "${__here}/_common.sh"   "${tmp}/lang/_common.sh"
+  stage_common_lib "${tmp}/lang"
   cp "${__here}/_dispatch.sh" "${tmp}/lang/_dispatch.sh"
   # Neither alpha nor beta ships test.sh → each FAIL-MISSING-VERB.
 
@@ -656,7 +660,7 @@ test_placeholder_gap_verb_zero() {
   local tmp; tmp=$(mktemp -d)
   trap "rm -rf '$tmp'" RETURN
   mkdir -p "${tmp}/lang/fakeland"
-  cp "${__here}/_common.sh"   "${tmp}/lang/_common.sh"
+  stage_common_lib "${tmp}/lang"
   cp "${__here}/_dispatch.sh" "${tmp}/lang/_dispatch.sh"
   # Placeholder verb wrapper — the intentional-gap registration.
   printf '#!/usr/bin/env bash\necho "STATUS=N/A REASON=not-applicable-to-this-lang"\n' > "${tmp}/lang/fakeland/test.sh"
@@ -689,7 +693,7 @@ test_placeholder_gap_verb_zero() {
 test_parametric_masking_closed_all_verbs() {
   local tmp; tmp=$(mktemp -d)
   trap "rm -rf '$tmp'" RETURN
-  cp "${__here}/_common.sh"   "${tmp}/_common.sh"
+  stage_common_lib "${tmp}"
   cp "${__here}/_dispatch.sh" "${tmp}/_dispatch.sh"
 
   # ok lang: a working wrapper for EVERY verb (emits OK).
@@ -736,7 +740,7 @@ test_parametric_masking_closed_all_verbs() {
 __synth_lang_root() {
   local tmp="$1"; shift
   mkdir -p "${tmp}/lang"
-  cp "${__here}/_common.sh"   "${tmp}/lang/_common.sh"
+  stage_common_lib "${tmp}/lang"
   cp "${__here}/_dispatch.sh" "${tmp}/lang/_dispatch.sh"
   local pair name line
   for pair in "$@"; do

@@ -416,6 +416,7 @@ __run_cleanup_layer() {
     layer_register_cleanup second_cleanup
     __LAYER_STATUSES+=("$3")
     __LAYER_REASONS+=("child-reason")
+    layer_lifecycle_done
   ' _ "${__here}/_common.sh" "$__cleanup_marks" "$status" 2>"$__cleanup_marks/stderr"
 }
 
@@ -451,7 +452,7 @@ assert_cleanup_case "fail-layer" "FAIL" "$(status_to_exit_code FAIL)"
 # unguarded empty-array expansion under `set -u` (an error on bash 4.0-4.3) would abort the
 # handler before STATUS=/LAYER=, so pin that it emits both and keeps the status's exit code.
 set +e
-__zero_out="$(bash -c 'set -euo pipefail; source "$1"; layer_lifecycle_begin 95; __LAYER_STATUSES+=("OK"); __LAYER_REASONS+=("r")' \
+__zero_out="$(bash -c 'set -euo pipefail; source "$1"; layer_lifecycle_begin 95; __LAYER_STATUSES+=("OK"); __LAYER_REASONS+=("r"); layer_lifecycle_done' \
   _ "${__here}/_common.sh" 2>"$__cleanup_marks/zero-stderr")"; __zero_rc=$?
 set -e
 if [[ "$__zero_rc" == "$(status_to_exit_code OK)" && "$__zero_out" == "STATUS=OK REASON=layer95-summary" ]] \
@@ -478,6 +479,122 @@ else
   PASS=$((PASS + 1))
 fi
 rm -rf "$__cleanup_marks"
+
+# =============================================================================
+# Lifecycle normal-end mark (devloop 2026-11-21-killed-run-gate2-pass). A layer that does
+# NOT reach layer_lifecycle_done — killed by a signal or aborted by `set -e` — must render
+# STATUS=UNKNOWN REASON=layer-incomplete (exit 2), NEVER the worst status of the children
+# that finished (it used to print STATUS=OK for a layer killed after one passing child).
+# Each case runs a REAL child bash so the real EXIT trap fires.
+# =============================================================================
+__lc="$(mktemp -d)"
+# __lc_layer <file> — a layer: one OK child collected, then (if $2=block) a blocking child
+# that records "<layer-pid> <grandchild-pid>" in $__lc/started, or (if $2=abort) `false`
+# under set -e, or (if $2=done) the normal end.
+__lc_layer() {
+  local mode="$1"
+  cat > "$__lc/layer.sh" <<LAYER
+#!/usr/bin/env bash
+set -euo pipefail
+source "${__here}/_common.sh"
+layer_lifecycle_begin 94
+printf 'STATUS=OK REASON=first-child\n' | tee_collect_statuses
+case "$mode" in
+  block) sleep 120 & printf '%s %s\n' "\$\$" "\$!" > "$__lc/started"; wait ;;
+  abort) false ;;
+  done)  layer_lifecycle_done ;;
+esac
+LAYER
+}
+# __lc_kill <TERM-target: pid|group> — run the blocking layer in its own session, wait for
+# its marker (bounded), signal it, and set __lc_out / __lc_err / __lc_rc.
+__lc_kill() {
+  local target="$1" p i pg
+  rm -f "$__lc/started"
+  __lc_layer block
+  setsid bash "$__lc/layer.sh" >"$__lc/out" 2>"$__lc/err" &
+  p=$!
+  for (( i = 0; i < 600; i++ )); do [[ -s "$__lc/started" ]] && break; sleep 0.05; done
+  if [[ ! -s "$__lc/started" ]]; then
+    kill -KILL -- "-$p" 2>/dev/null; wait "$p" 2>/dev/null
+    __lc_rc="marker-timeout"; __lc_out=""; return
+  fi
+  if [[ "$target" == "group" ]]; then pg="-$p"; else pg="$p"; fi
+  kill -TERM -- "$pg"
+  # Bounded: a regression that defers the layer's exit must fail BY NAME, never stall 120 s.
+  for (( i = 0; i < 400; i++ )); do kill -0 "$p" 2>/dev/null || break; [[ "$(cut -d' ' -f3 "/proc/$p/stat" 2>/dev/null)" == Z ]] && break; sleep 0.05; done
+  if kill -0 "$p" 2>/dev/null && [[ "$(cut -d' ' -f3 "/proc/$p/stat" 2>/dev/null)" != Z ]]; then
+    FAIL=$((FAIL + 1)); FAILURES+=("[lifecycle:L1-${target}-exit-prompt] layer still running 20s after TERM")
+    kill -KILL -- "-$p" 2>/dev/null
+  fi
+  wait "$p"; __lc_rc=$?
+  kill -KILL -- "-$p" 2>/dev/null || true   # reap the sleeper (a pid-only TERM leaves it)
+  __lc_out="$(cat "$__lc/out")"
+}
+__lc_assert() {
+  # The LAST stdout line is the lifecycle's own STATUS line (tee_collect_statuses echoes the
+  # children's lines before it); the stderr LAYER=94 line must carry <want_reason> exactly.
+  local label="$1" want_out="$2" want_rc="$3" want_reason="$4" last
+  last="$(printf '%s\n' "$__lc_out" | tail -n1)"
+  if [[ "$last" == "$want_out" && "$__lc_rc" == "$want_rc" ]] \
+     && grep -qE "^LAYER=94 .* REASON=${want_reason}\$" "$__lc/err" 2>/dev/null; then
+    PASS=$((PASS + 1)); return
+  fi
+  FAIL=$((FAIL + 1))
+  FAILURES+=("[lifecycle:${label}] rc=${__lc_rc} (want ${want_rc}) last-stdout=[${last}] (want [${want_out}]) stderr=[$(tr '\n' '|' < "$__lc/err" 2>/dev/null)]")
+}
+set +e
+# L1 — a signal after one passing child (pid-only TERM, and the whole group as a reaper does).
+__lc_kill pid
+__lc_assert "L1-term-pid"   "STATUS=UNKNOWN REASON=layer-incomplete" 143 "layer-incomplete"
+__lc_kill group
+__lc_assert "L1-term-group" "STATUS=UNKNOWN REASON=layer-incomplete" 143 "layer-incomplete"
+# L2 — the same class with no signal: a `set -e` abort after one passing child.
+__lc_layer abort
+__lc_out="$(bash "$__lc/layer.sh" 2>"$__lc/err")"; __lc_rc=$?
+__lc_assert "L2-set-e-abort" "STATUS=UNKNOWN REASON=layer-incomplete" 2 "layer-incomplete"
+# L3a — control: the normal end renders the children's status (no false positive).
+__lc_layer done
+__lc_out="$(bash "$__lc/layer.sh" 2>"$__lc/err")"; __lc_rc=$?
+__lc_assert "L3a-normal-end-ok" "STATUS=OK REASON=layer94-summary" 0 "first-child"
+# L3b — control: a deliberate emit-then-exit (the precondition_fail / implementer_fail shape)
+# renders its own status, not UNKNOWN.
+cat > "$__lc/layer.sh" <<LAYER
+#!/usr/bin/env bash
+set -euo pipefail
+source "${__here}/_common.sh"
+layer_lifecycle_begin 94
+printf 'STATUS=PRECONDITION_FAILURE REASON=deliberate\n' | tee_collect_statuses
+layer_lifecycle_done
+exit 0
+LAYER
+__lc_out="$(bash "$__lc/layer.sh" 2>"$__lc/err")"; __lc_rc=$?
+__lc_assert "L3b-deliberate-exit" "STATUS=PRECONDITION_FAILURE REASON=layer94-summary" 2 "deliberate"
+# L4 — security F1: a DISPATCHER cut short (SIGKILLed) after one language streamed OK. Its
+# non-zero exit over an all-OK aggregate must render UNKNOWN layer-incomplete, never OK.
+cat > "$__lc/layer.sh" <<LAYER
+#!/usr/bin/env bash
+set -euo pipefail
+source "${__here}/_common.sh"
+layer_lifecycle_begin 94
+bash -c 'echo "STATUS=OK REASON=lang-rust"; kill -KILL \$\$' 2>&1 | tee_collect_statuses || layer_lifecycle_child_rc "\$?"
+layer_lifecycle_done
+LAYER
+__lc_out="$(bash "$__lc/layer.sh" 2>"$__lc/err")"; __lc_rc=$?
+__lc_assert "L4-dispatcher-cut-short" "STATUS=UNKNOWN REASON=layer-incomplete" 2 "layer-incomplete"
+# L4b — control: a dispatcher that exits non-zero BECAUSE a child FAILed keeps the real FAIL.
+cat > "$__lc/layer.sh" <<LAYER
+#!/usr/bin/env bash
+set -euo pipefail
+source "${__here}/_common.sh"
+layer_lifecycle_begin 94
+bash -c 'echo "STATUS=OK REASON=lang-ts"; echo "STATUS=FAIL REASON=lang-rust"; exit 1' 2>&1 | tee_collect_statuses || layer_lifecycle_child_rc "\$?"
+layer_lifecycle_done
+LAYER
+__lc_out="$(bash "$__lc/layer.sh" 2>"$__lc/err")"; __lc_rc=$?
+__lc_assert "L4b-dispatcher-real-fail" "STATUS=FAIL REASON=layer94-summary" 1 "lang-rust"
+set -e
+rm -rf "$__lc"
 
 # =============================================================================
 # parallel_queue_run — output replayed in registration order (not completion order),
