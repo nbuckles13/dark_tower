@@ -43,31 +43,14 @@ shopt -s lastpipe
 # Cheap to lock the dir; expensive to retrofit if a leak occurs.
 DEVLOOP_TMP="${DEVLOOP_TMP:-/tmp/devloop}"
 
+# LAYER_MAX, LAYER7_SUITES and layer7_suite_known live in the dependency-free _layers.sh
+# (the ONE home, also sourced by _gate2_binding.sh). Re-exported here unchanged.
+# shellcheck source=_layers.sh
+source "$(dirname "${BASH_SOURCE[0]}")/_layers.sh"
+
 # Args: (none)
 # Outputs: (none)
 # Returns: 0 on success
-# The pipeline's layers are 1..LAYER_MAX; the last one is the cluster layer (env-tests +
-# browser E2E). The ONE home of that range: layer-all.sh validates --max-layer / --layers
-# against it and checks --aggregate completeness against it; layer-fast.sh runs all but
-# the last. A plain assignment (not readonly): several wrappers source this file twice.
-LAYER_MAX=7
-
-# Layer LAYER_MAX's Phase-2 suites, in run order. The ONE home of the list: layer7.sh
-# validates DEVLOOP_LAYER7_SUITE against it, and layer-all.sh --aggregate requires the CI
-# shards' SUITE= fields to cover it exactly (a suite no shard ran fails the aggregate).
-# A plain assignment for the same reason as LAYER_MAX.
-LAYER7_SUITES=(env-tests browser-e2e)
-
-# True iff $1 is exactly one name from LAYER7_SUITES.
-# Args: $1=candidate  Returns: 0 if known, 1 otherwise.
-layer7_suite_known() {
-  local s
-  for s in "${LAYER7_SUITES[@]}"; do
-    [[ "$1" == "$s" ]] && return 0
-  done
-  return 1
-}
-
 init_devloop_tmp() {
   mkdir -p "$DEVLOOP_TMP"
   chmod 700 "$DEVLOOP_TMP"
@@ -703,12 +686,41 @@ layer_lifecycle_begin() {
   __LAYER_REASONS=()
   __LAYER_RESULT="UNKNOWN"
   __LAYER_CLEANUPS=()
+  __LAYER_DONE=0
+  __LAYER_CHILD_RC=0
   # Export DEVLOOP_LAYER for child processes (dry-reviewer F3).
   # _get_base_ref.sh reads this to namespace the per-layer changed-files cache,
   # avoiding the duplicated `DEVLOOP_LAYER=N` per-line prefix on every layer-script
   # subprocess invocation.
   export DEVLOOP_LAYER="$1"
   trap '__layer_lifecycle_end' EXIT
+}
+
+# Mark that the layer reached a NORMAL end. Call it as the last statement of every layer
+# script and immediately before every deliberate `exit` (layer7.sh: precondition_fail,
+# implementer_fail, the SKIPPED-NO-CLUSTER exit, after __layer7_main).
+#
+# Why (devloop 2026-11-21-killed-run-gate2-pass): the lifecycle EXIT trap also fires when
+# the layer is KILLED (a signal) or ABORTS (`set -e`) — and it used to render the worst
+# status of the children that had finished, i.e. `STATUS=OK` for a layer killed after one
+# passing child. Without this mark the trap now renders STATUS=UNKNOWN (exit 2) with the
+# constant LAYER REASON `layer-incomplete`, whatever the finished children said. A layer
+# script that forgets the call reads UNKNOWN on EVERY run — loud, never a silent green.
+# Args: (none)  Returns: 0
+layer_lifecycle_done() {
+  __LAYER_DONE=1
+}
+
+# Record a dispatcher pipeline's non-zero exit: `<dispatcher> | tee_collect_statuses ||
+# layer_lifecycle_child_rc "$?"`. A dispatcher derives its exit from its children's STATUS
+# lines, so a non-zero exit over statuses that aggregate to an exit-0 result means it was CUT
+# SHORT (OOM-killed, set -e abort) after some languages reported OK and before the rest ran —
+# __layer_lifecycle_end then renders UNKNOWN layer-incomplete, never OK over un-run languages.
+# Args: $1=the pipeline's exit status  Returns: 0 (keeps `set -e` from skipping the layer's end)
+layer_lifecycle_child_rc() {
+  [[ "${1:-0}" =~ ^[0-9]+$ ]] || set -- 1
+  (( $1 > ${__LAYER_CHILD_RC:-0} )) && __LAYER_CHILD_RC=$1
+  return 0
 }
 
 # Register a cleanup to run when the layer exits — on EVERY exit path, including a
@@ -827,7 +839,13 @@ __layer_lifecycle_end() {
   __run_layer_cleanups
   end=$(date +%s)
   duration=$((end - __LAYER_START))
-  if [[ ${#__LAYER_STATUSES[@]} -eq 0 ]]; then
+  if [[ "${__LAYER_DONE:-0}" != "1" ]]; then
+    # Killed or aborted before its normal end (layer_lifecycle_done): what the children
+    # that finished said is NOT the layer's result. Constant token, no rc suffix — `$?`
+    # inside a signal-run EXIT trap is not the cause (it is the last completed command's).
+    result="UNKNOWN"
+    worst_reason="layer-incomplete"
+  elif [[ ${#__LAYER_STATUSES[@]} -eq 0 ]]; then
     result="$__LAYER_RESULT"
     worst_reason="no-child-statuses"
   else
@@ -843,10 +861,18 @@ __layer_lifecycle_end() {
     done
     worst_reason=$(worst_reason_for_status "$result" "${pairs[@]}")
   fi
+  # A dispatcher that exited non-zero over an exit-0 aggregate was cut short (see
+  # layer_lifecycle_child_rc): the languages it never reached are not validated.
+  if [[ "${__LAYER_CHILD_RC:-0}" != "0" && "$(status_to_exit_code "$result")" == "0" ]]; then
+    result="UNKNOWN"
+    worst_reason="layer-incomplete"
+  fi
   # stdout STATUS line keeps the human-summary REASON (backward-compat: layer-all.sh +
   # verify-completion.sh parse this for the ENUM only). The attributable cause rides
   # the stderr LAYER= line below.
   reason="layer${__LAYER_NUM}-summary"
+  # An incomplete layer names that on its STATUS line too (it is not a summary of children).
+  [[ "$worst_reason" == "layer-incomplete" ]] && reason="layer-incomplete"
   printf 'STATUS=%s REASON=%s\n' "$result" "$reason"
   # The §CRITICAL 3am anchor (O2): LAYER= line ALWAYS emits before exit on EVERY branch
   # incl. the new verb-missing-non-zero one. Its REASON field carries worst_reason (the

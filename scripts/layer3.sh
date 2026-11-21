@@ -277,4 +277,7 @@ layer_lifecycle_begin 3
   # the TSFMT_* seams. Deliberately NOT under guards/simple/ (the find -name '*.sh' reason). No cluster.
   parallel_queue_add "ts-fmt-proto-excluded-guard-selftest" "${__here}/guards/validate-ts-fmt-proto-excluded.test.sh"
   parallel_queue_run "${DEVLOOP_LAYER3_JOBS:-4}" || true
-} | tee_collect_statuses
+} | tee_collect_statuses || layer_lifecycle_child_rc "$?"
+# Normal end (lifecycle): without this mark a killed/aborted layer renders
+# STATUS=UNKNOWN layer-incomplete instead of the worst status its finished guards reported.
+layer_lifecycle_done

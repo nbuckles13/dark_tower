@@ -174,7 +174,7 @@ placeholder wrapper (task #52) — distinct enum, distinct exit code, no infix a
 
 **`REASON=` and `SELF_HEAL CASE=` are two deliberately-overlapping token families.** The Layer-7 self-heal classifies a `SELF_HEAL CASE=` (its own case enum) and then, where it escalates, emits a `precondition_fail` `REASON=`. Some spellings appear in BOTH on purpose — `helper-unreachable` is a `SELF_HEAL CASE=` value AND a `REASON=` token (the self-heal reuses the existing REASON), while `CASE=probe-inconclusive` maps to the deliberately DIFFERENT `REASON=cluster-self-heal-probe-inconclusive`. Do not merge or "align" the two families; the full mapping is in §6.7.
 
-`UNKNOWN` is **not** a wrapper-emitted enum — it appears in the aggregator when a child wrapper crashes before emitting `STATUS=` AND its EXIT trap did not fire (e.g. killed `-9`), or when stdout streaming breaks. Since task #50 the verb wrappers self-emit `STATUS=FAIL REASON=wrapper-aborted-early-exit-<rc>` via an EXIT trap when they abort before emitting, so a true `UNKNOWN` is now genuinely exceptional. `UNKNOWN` ranks at the TOP of the precedence ladder (above `FAIL-MISSING-VERB`) because it signals a dispatcher/wrapper bug, not a real-work failure; it maps to exit 2 — the same wiring-fault exit class as `FAIL-MISSING-VERB`.
+`UNKNOWN` is emitted by exactly one wrapper-level path and otherwise by the aggregator. **The layer lifecycle emits it** (since 2026-11-21): a layer that did not reach its normal end (`_common.sh::layer_lifecycle_done`) renders `STATUS=UNKNOWN REASON=layer-incomplete` instead of the worst status of the children that finished — see the `layer-incomplete` row in §8. **The aggregator** reports it when a child wrapper crashes before emitting `STATUS=` AND its EXIT trap did not fire (e.g. killed `-9`), when stdout streaming breaks, and when `layer-all.sh` has no terminal record for a layer (`derive_layer_all_exit`). Since task #50 the verb wrappers self-emit `STATUS=FAIL REASON=wrapper-aborted-early-exit-<rc>` via an EXIT trap when they abort before emitting, so a true `UNKNOWN` is now genuinely exceptional. `UNKNOWN` ranks at the TOP of the precedence ladder (above `FAIL-MISSING-VERB`) because it signals a dispatcher/wrapper bug, not a real-work failure; it maps to exit 2 — the same wiring-fault exit class as `FAIL-MISSING-VERB`.
 
 ### Worst-child STATUS aggregation
 
@@ -249,7 +249,9 @@ byte-identical under both modes — there is nothing to stop at, so fail-fast ne
 predicate is `rc != 0` (never status-based), un-run layers render `NOT-RUN` and NEVER aggregate or map
 to exit 0, and `TOTAL_RESULT`/`LAYER_ALL_EXIT` reflect ONLY the layers that ran (through the failing
 one). So fail-fast can report an equal-or-earlier failure, never a greener one, and can never exit 0
-over layers that never ran (`emit_gate2_verdict` derives `GATE2=PASS` solely from `LAYER_ALL_EXIT==0`).
+over layers that never ran. The Gate-2 verdict is decided in ONE place, `layer-all.sh::derive_gate2`
+(over `derive_layer_all_exit`, the exit rule): a fail-fast stop is a complete run (`REASON=layer-failed`,
+un-run layers rendered `NOT-RUN`), and a NOT-RUN layer without a fail-fast stop derives exit 2 (§8.5).
 
 **Un-run ≠ skipped.** `RESULT=NOT-RUN` is a display-only marker, distinct from the `SKIPPED-*` enum
 family (which are real exit-0 states that DID run their check). An implementer must NOT rationalize a
@@ -952,11 +954,21 @@ Grep-driven entry point. Match the symptom, jump to the section.
 | `FMT_APPLIED=<comma-sep repo-rel paths>` | An APPLY-lane fmt wrapper rewrote these files in place (still `STATUS=OK` — auto-applying a semantically-empty formatter is not a failure). An advisory breadcrumb, not an authenticated record — review + stage the files. Its absence on an APPLY run = the tree was already clean. | §6.2 |
 | `FAILED_GUARD_NAMES=<comma-sep guard names>` | The greppable, closed-vocabulary list of WHICH Layer-3 guards VIOLATED — on stdout only on a violation run (`run-guards.sh`), and surfaced in the D8 `FAILURE_TRIAGE` directive. The one channel that NAMES the guards (the STATUS `REASON=` is the anonymous fused `guard-violations`; see the caveat "a violation's STATUS line names no guard"). Carries no secret by construction. | §6.3 |
 | `STOPPED_EARLY LAYER=<n> RESULT=<enum> NOT_RUN=<list>` + `RESULT=NOT-RUN` cells | Interactive fail-fast stopped at the first failing layer; layers in `NOT_RUN` did not run (NOT the same as `SKIPPED-*` or a truncated log). Exit = the failing layer's code. `NOT-RUN` never aggregates and is never OK — it's not a Gate-2 pass over un-run layers. | §3 |
+| `PIPELINE_INCOMPLETE MISSING=<list> IN_FLIGHT=<n\|none> SIGNAL=<TERM\|INT\|HUP\|none> LAYER_ALL_EXIT=<n>` (stderr) | Printed on exactly the condition that makes the verdict `pipeline-incomplete` (once the loop started): `layer-all.sh` was ended before its layer loop finished — a caught signal (`SIGNAL=`), an untrapped one or a `set -e` abort (`SIGNAL=none`) — or a signal arrived after the last layer (`MISSING=none IN_FLIGHT=none`). The in-flight layer's session was torn down; the verdict is `REASON=pipeline-incomplete`. Never printed for a fail-fast stop (a complete run). **Operator lane**: re-run; repeats → memory pressure (low-memory reaper) or a concurrent run. | §8.5 |
+| layer-all exit **129 / 130 / 143** (HUP / INT / TERM) or **137** (KILL) | Killed. 129/130/143: caught — the in-flight layer was torn down and the verdict says `pipeline-incomplete`. **137**: uncatchable — the verdict stays `in-progress`, and the in-flight layer's session may still be running; the NEXT `layer-all.sh` reaps it automatically (`REAPED_STALE_LAYER_GROUP`) before Layer 1, so there is nothing to clean up by hand — just re-run. Operator lane; does not consume an implementer attempt. | §8.5 |
+| `REAPED_STALE_LAYER_GROUP PGID=<g> LAYER=<n> OWNER_PID=<p> RECORDED_AT=<t>[ REASON=leader-gone]` (stderr, run start) | The previous run died uncatchably (SIGKILL/OOM) mid-layer `<n>` and its layer kept running; this run held the lock (so the owner is provably dead), matched the leader's identity (start time + script path) — or, with `REASON=leader-gone`, found the leader dead but members of its group alive (a pgid number stays allocated while its group lives, so they are provably that session's) — and tore the group down (group signals only). Informational — the reason the previous run vanished. Repeats → memory pressure. | §8.5 |
+| `STALE_LAYER_RECORD_DROPPED PGID=<g> LAYER=<n> REASON=<leader-gone\|identity-mismatch>` (stderr, run start) | A previous run's in-flight record was found but its layer is already gone, or the pid now belongs to another process. **Benign: nothing was signalled.** | §8.5 |
+| `LAYER_START LAYER=<n> PGID=<g>` (stderr) | Informational: layer `<n>` started in its own session `<g>` — correlate a pgid seen in `/proc` with a layer. | §8.5 |
+| `PRECONDITION_FAILURE: another layer-all.sh holds …/layer-all.lock (PID=… STARTED_AT=… MODE=…) … REASON=concurrent-layer-all` (exit 2) | Another `layer-all.sh` (ANY mode — a fast lane beside an authority run counts) is running against the same `DEVLOOP_TMP`; they would clobber each other's logs, snapshot and verdict. Nothing was touched. | `kill -0 <PID>`: wait for it, or stop it; then re-run. |
+| `PRECONDITION_FAILURE: … REASON=gate2-snapshot-failed` / `REASON=gate2-verdict-invalidate-failed` (exit 2, before Layer 1) | The run-start tree snapshot failed (not a git work tree / git error — the old verdict was removed), or the previous verdict could not be replaced (something non-removable squats at the path). | Fix the cause named in the line; for the second, remove the path by hand. |
+| `WARN GATE2_DERIVE_FAILED` (stderr) | The exit derivation itself failed inside the EXIT trap; the verdict was forced FAIL with `MISSING=?`. An orchestrator bug, never a diff defect — escalate to infrastructure with the stderr. | §8.5 |
+| `WARN GATE2_TREE_CHANGED_DURING_RUN PATHS=<first 5>` (stderr, end of run) | The tree changed while the layers ran; the verdict is `tree-changed-during-run` and will not bind. Usually Layer 2 fmt APPLY. | `./scripts/layer-fast.sh`, then `./scripts/layer-all.sh`. |
+| `STATUS=UNKNOWN REASON=layer-incomplete` (a layer's own log; LAYER line `REASON=layer-incomplete`) | The layer did not reach its normal end (`layer_lifecycle_done`). If `layer-all` printed `PIPELINE_INCOMPLETE` / exited 128+N, or the layer's rc is 128+N, the environment killed it (reaper / Ctrl-C): **re-run**; repeats on a quiet machine → investigate. Otherwise a command aborted the layer under `set -e` — a wrapper bug: read `layer-<n>.stderr.log` for the failing command. | §3 |
 | `WARN FAIL_FAST_OVERRIDE_IGNORED REQUESTED=1 MODE=run-all` | An explicit `DEVLOOP_FAIL_FAST=1` was refused under an unattended lane (`GITHUB_ACTIONS` / `DEVLOOP_HEADLESS`) — the authority gate runs all layers regardless (an ambient `=1` must not shrink its coverage). To fail-fast, run interactively (neither env set). | §3 |
 | `PRECONDITION_FAILURE: DEVLOOP_FAIL_FAST=<v> is not a recognized boolean` (layer-all startup, exit 2) | A malformed `DEVLOOP_FAIL_FAST` value (typo). Fail-closed. Use `1/0/true/false/yes/no` (or unset). | §3 |
 | `PRECONDITION_FAILURE: … REASON=fail-fast-exit-invariant` | Orchestrator bug — fail-fast broke early but `final_exit==0`. Should be impossible (fail-fast only stops on `rc != 0`); if seen, it's a `layer-all.sh` regression, exit 2 (fail-closed). | §3 |
 | `❌ Gate-2: no validation verdict found` (at commit) | Devloop-completion commit but no verdict — pipeline never run this session. Run `./scripts/layer-all.sh`. | §8.5 |
-| `❌ Gate-2: verdict is FAIL` (at commit) | The recorded pipeline run did not pass — fix the failing layer(s) and re-run. | §8.5 |
+| `❌ Gate-2: verdict is FAIL (not PASS) — REASON=…` (at commit) | The recorded pipeline run did not pass; the REASON selects the fix (`in-progress` = still running or killed uncatchably). | §8.5 |
 | `❌ Gate-2: ... signature mismatch` + `modified after validation: <path>` | A validated file changed after the run — re-stage + re-run. | §8.5 |
 | `❌ Gate-2: ... staged but not in verdict: <path>` | A new validated file was staged the verdict never saw — re-run. | §8.5 |
 | `❌ Gate-2: ... validated but not staged: <path>` | A validated (often untracked/transient, e.g. a dirtied lockfile) file is in the verdict but not staged — re-run, or `--no-verify` if intentional. | §8.5 |
@@ -1050,7 +1062,8 @@ The pre-commit hook (`.githooks/pre-commit`, wired via `core.hooksPath`) enforce
 **Gate-2 authority verdict** for devloop-completion commits. This closes skip-vector
 **C**: a Lead (or agent) asserting a pipeline pass *in lieu of* actually running it.
 The producer is `scripts/layer-all.sh`, which emits `/tmp/devloop/gate2-verdict` as
-its final step via an `EXIT` trap (`scripts/lang/_gate2_binding.sh::emit_gate2_verdict`);
+its final step via an `EXIT` trap (`scripts/lang/_gate2_binding.sh::emit_gate2_verdict` renders
+what `layer-all.sh::derive_gate2` decided — see [Verdict lifecycle](#verdict-lifecycle-killed-and-incomplete-runs));
 the validator is `scripts/lang/_gate2_binding.sh::gate2_validate_commit`. Design:
 `docs/devloop-outputs/2026-06-09-gate2-authority-verdict-gate/main.md`.
 
@@ -1229,12 +1242,78 @@ the only complete devloop main.md.
 The exception adds no state and no kill switch; `git commit --no-verify` remains the escape
 hatch, and reverting the commit that introduced it restores the old behaviour.
 
+### Verdict lifecycle (killed and incomplete runs)
+
+Since 2026-11-21 (`docs/devloop-outputs/2026-11-21-killed-run-gate2-pass/`). Before it, a run
+SIGTERMed mid-Layer-7 wrote `GATE2=PASS LAYER_ALL_EXIT=0` with no `LAYER 7` line: bash runs the
+EXIT trap from its fatal-signal handler with `$?` = the last *completed* command's status, and the
+trap trusted it. Now **only a complete, green, tree-stable run can write PASS**:
+
+- **One decision home.** `layer-all.sh::derive_gate2` decides `GATE2` and `REASON`;
+  `emit_gate2_verdict` only renders it (it writes `GATE2=PASS` for the literal `PASS` alone).
+  The exit rule is `derive_layer_all_exit` (shared with `--aggregate`): a layer counts only when it
+  has BOTH a status and a process rc; an unrecorded layer is `UNKNOWN` (exit 2), never skipped.
+- **Run start.** Every layer-running mode takes `flock` on `${DEVLOOP_TMP}/layer-all.lock` first
+  (a held lock → `concurrent-layer-all`, nothing touched). An authority run then **removes the
+  previous verdict at once**, reaps any stale layer session, snapshots the tree
+  (`gate2_snapshot_worktree`) and writes `REASON=in-progress` before Layer 1 — so an older PASS
+  never survives a run that got past its lock, whatever kills it. A missing file now means: never
+  invoked here, refused at its start, or killed before the run-start verdict was written.
+- **Signals.** Each layer runs in its own session and layer-all waits on it interruptibly, so a
+  TERM / INT / HUP is handled at once: the trap tears the in-flight layer's whole tree down
+  (bounded TERM→KILL: `CHILD_GROUP_INNER_POLLS` in `scripts/lang/_child_group.sh`, strictly inside run-story's outer
+  grace), prints `PIPELINE_INCOMPLETE …`, writes the verdict, and exits 128+N. The teardown runs
+  BEFORE the emit on purpose (the exit snapshot must follow the layer's death); a reaper KILL inside
+  that ≤2.5 s window leaves the `in-progress` verdict, which is correct.
+- **What the tree check does NOT see.** It compares the tree at start with the tree at a clean end.
+  An edit made AND reverted inside one run (a middle layer validated T′, the verdict attests T) is
+  invisible to it — acceptable under the anti-drift model (the attested tree is the committed one,
+  and the first and last layers saw it), but it is not a per-layer guarantee.
+- **A run that stops advancing after a layer's log ends in its `STATUS=` line**: the layer process
+  is gone but a child it left still holds its stdout, so `tee` (and the wait) stays open until that
+  child exits. A signal to `layer-all.sh` still tears the whole session down.
+- **Known bash limit (5.2.x).** A trapped signal that lands while `layer-all.sh` itself is running a
+  command substitution can be lost (`trap: … unexpected EOF while looking for matching ')'` on
+  stderr) — the run then simply carries on. The spawn→`wait` window is kept fork-free for this, and
+  layer-all spends nearly all its time in `wait`. A lost signal is never a forged PASS: the run
+  either completes for real, or the reaper's follow-up KILL leaves `in-progress`.
+- **The tree is bound at START.** The verdict is written from the run-start snapshot; at a clean end
+  a second snapshot must match it, else `REASON=tree-changed-during-run` +
+  `WARN GATE2_TREE_CHANGED_DURING_RUN PATHS=…` on stderr (the process exit stays the layers' result).
+  **The usual cause is Layer 2 fmt APPLY** (`DEVLOOP_FMT_APPLY=1`, the interactive default)
+  rewriting files during an authority run: opting into APPLY now always forces a re-run when fmt
+  rewrites anything — run `./scripts/layer-fast.sh` (or `scripts/fmt.sh`), then `./scripts/layer-all.sh`.
+  The run-story gates run CHECK-only and never pay this.
+- **The killed layer's own log.** On a pipeline kill the in-flight layer's `layer-N.log` ends with
+  its lifecycle's `STATUS=UNKNOWN REASON=layer-incomplete` (tee ignores the teardown TERM so those
+  last words land). If it ever ends on a finished child's line instead (a teardown that had to
+  KILL), `PIPELINE_INCOMPLETE` and the verdict are authoritative — never the layer log's last line.
+- **Verdict keys** (schema `gate2-verdict/v2`; a v1 file no longer binds): `REASON`, `SIGNAL`
+  (`TERM|INT|HUP|none`), `MISSING` (layers with no record), and one `LAYER n …` line per layer —
+  `MISSING` for an unrecorded layer, `NOT-RUN` for a fail-fast skip (both display-only).
+- **`LAYER_ALL_EXIT` vs the process exit.** For a caught signal both are 128+N. For an untrapped
+  fatal signal, a pre-loop refusal or a `set -e` abort, the verdict carries the DERIVED value
+  (≥2, from the record) while the process exits with bash's own code (e.g. 138, or 1 for the CI
+  sentinel refusal) — by design; run-story's lanes read the process exit.
+
+`REASON` (closed set; when several hold, the first in this order wins — `derive_gate2`'s header):
+
+| `REASON=` | Meaning | Action |
+|---|---|---|
+| `pipeline-incomplete` | The loop did not run to its end, or a signal arrived after it: a signal (`SIGNAL=` names a trapped one), an untrapped death, a `set -e` abort, a pre-loop refusal (`MISSING=<all>`, `SIGNAL=none`), or a layer with no record. `MISSING=?` means the exit derivation itself failed (stderr `WARN GATE2_DERIVE_FAILED`) — an orchestrator bug: escalate to infrastructure. | Operator lane. Read the `PIPELINE_INCOMPLETE` / `PRECONDITION_FAILURE` stderr line; re-run. Repeats → check memory pressure or a concurrent run. |
+| `layer-failed` | Complete record, `LAYER_ALL_EXIT≠0` (incl. a fail-fast stop). | Fix the failing layer (§6), re-run. |
+| `tree-snapshot-failed` | Green run, but the exit snapshot could not be taken (`gate2-emit.stderr.log`). | Fix the git error, re-run. |
+| `tree-changed-during-run` | Green run, but the tree at exit ≠ the tree at start. | Usually fmt APPLY (above): `./scripts/layer-fast.sh`, then `./scripts/layer-all.sh`. Otherwise find what edited the tree mid-run. |
+| `in-progress` | Written at authority-run start. Seen at commit: a run is still going, or the last one died uncatchably (SIGKILL/OOM). | Check for a running `layer-all.sh` (`cat ${DEVLOOP_TMP}/layer-all.lock`); if none, re-run and look at memory pressure. |
+| `none` | PASS. | — |
+
 ### Failure shapes (all block the commit)
 
 | Hook message | Meaning | Fix |
 |--------------|---------|-----|
 | `no validation verdict found` | No verdict file — pipeline never ran this session. | `./scripts/layer-all.sh`, then commit. |
-| `verdict is FAIL` | The run did not pass (`GATE2=FAIL`, emitted even on early-exit via the trap). | Fix the failing layer(s) (§6), re-run. |
+| `verdict is FAIL (not PASS) — REASON=… SIGNAL=… MISSING=… LAYER_ALL_EXIT=…` | The last run did not pass; the REASON says why ([Verdict lifecycle](#verdict-lifecycle-killed-and-incomplete-runs)). A FAIL with every `LAYER` line `MISSING` and `REASON=in-progress` = a run is in flight or died uncatchably. | Per the REASON table above; re-run. |
+| `verdict SCHEMA=gate2-verdict/v1, expected …/v2` | The verdict was written by a pre-2026-11-21 `layer-all.sh`, whose PASS a killed run could forge. | Re-run `./scripts/layer-all.sh`. |
 | `signature mismatch` → `modified after validation: <path>` | A validated file changed after the run. | Re-stage + re-run. |
 | `signature mismatch` → `staged but not in verdict: <path>` | A new validated file was staged the verdict never bound. | Re-run so the new file is bound. |
 | `signature mismatch` → `validated but not staged: <path>` | A path the verdict bound is not in the staged commit. Common benign cause: a layer transiently **dirtied a lockfile** (`Cargo.lock`/`pnpm-lock.yaml`) the producer saw in the worktree but you never staged. | If the lockfile change is real, `git add` it and re-run. If transient/unwanted, revert it and re-run — or `git commit --no-verify` if you are sure the staged tree is correct. (Lockfiles are deliberately NOT excluded: a *real* committed lockfile change must stay bound.) |
@@ -1465,7 +1544,7 @@ eviction thrash (shards + `coverage-cache` + `ci-client-dt-guard` + PR refs).
 
 | Escalation target | Trigger |
 |-------------------|---------|
-| operations | A layer reports `RESULT=UNKNOWN` (dispatcher / wrapper bug — child crashed before STATUS line AND its EXIT trap did not fire, e.g. killed `-9`). Since task #50 this is rarer: the 14 verb wrappers self-emit `STATUS=FAIL REASON=wrapper-aborted-early-exit-<rc>` via an EXIT trap when they abort before emitting, so a pre-emit crash now surfaces as `FAIL`, not `UNKNOWN`. A genuine `UNKNOWN` therefore points at a non-trap path. |
+| operations | A layer reports `RESULT=UNKNOWN` with a REASON other than `layer-incomplete` (dispatcher / wrapper bug — child crashed before STATUS line AND its EXIT trap did not fire, e.g. killed `-9`). For `layer-incomplete`, see its §8 row first: a kill is an operator re-run, not an escalation. Since task #50 this is rarer: the 14 verb wrappers self-emit `STATUS=FAIL REASON=wrapper-aborted-early-exit-<rc>` via an EXIT trap when they abort before emitting, so a pre-emit crash now surfaces as `FAIL`, not `UNKNOWN`. A genuine `UNKNOWN` therefore points at a non-trap path. |
 | operations | A layer reports `RESULT=FAIL-MISSING-VERB` (exit 2 — task #52). A verb wrapper that should exist is missing/non-executable (deleted, `chmod`-stripped, or a new lang dir missing a verb). Restore + `chmod +x` it, or register an intentional-gap placeholder `<verb>.sh` emitting `N/A` if the gap is genuinely intended. |
 | operations | `BASE_REF=` line missing from a layer's stderr log (resolver did not run; layer-skeleton regression). |
 | operations **AND** security | Layer 6 reports `RESULT=FAIL-MISSING-VERB` for an `audit` verb (`<lang>-audit-verb-missing-or-not-executable`). A dependency-vuln scan wrapper is missing/non-executable — a fail-OPEN on a security gate, now caught by the ladder (FAIL-MISSING-VERB outranks the sibling's OK → layer reds at exit 2). Operations: restore `<lang>/audit.sh` + `chmod +x` (or register a placeholder if the gap is intended). Security: confirm whether the lang's dep-audit coverage lapsed in any prior green run and whether a manual scan is warranted. |

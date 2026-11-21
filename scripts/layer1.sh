@@ -26,7 +26,12 @@ layer_lifecycle_begin 1
 # proto + rust/ts state in one run, not need a second invocation after
 # fixing proto). __layer_lifecycle_end aggregates STATUS via worst-wins, so
 # stage-1 FAIL still propagates to layer-final FAIL via __LAYER_STATUSES.
-DEVLOOP_DISPATCH_INCLUDE_LANGS=proto "$(dirname "$0")/build.sh" 2>&1 | tee_collect_statuses || true
+DEVLOOP_DISPATCH_INCLUDE_LANGS=proto "$(dirname "$0")/build.sh" 2>&1 | tee_collect_statuses || layer_lifecycle_child_rc "$?"
 
 # Stage 2: code (rust + ts) — depends on proto codegen artifacts from stage 1.
-DEVLOOP_DISPATCH_EXCLUDE_LANGS=proto "$(dirname "$0")/build.sh" 2>&1 | tee_collect_statuses || true
+DEVLOOP_DISPATCH_EXCLUDE_LANGS=proto "$(dirname "$0")/build.sh" 2>&1 | tee_collect_statuses || layer_lifecycle_child_rc "$?"
+# Normal end (lifecycle). The dispatcher's exit is RECORDED (layer_lifecycle_child_rc), not
+# discarded: a dispatcher cut short after a sibling streamed STATUS=OK exits non-zero over
+# all-green statuses, and the lifecycle renders that UNKNOWN layer-incomplete. Without this
+# mark a killed/aborted layer renders the same.
+layer_lifecycle_done

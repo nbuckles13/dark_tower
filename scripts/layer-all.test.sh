@@ -25,6 +25,14 @@ IFS=$'\n\t'
 __here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lang/_test_helpers.sh
 source "${__here}/lang/_test_helpers.sh"
+# LAYER_MAX (the one home), the verdict reader, and the zombie-aware liveness check the kill
+# cases use. All three are source-safe (no shell options).
+# shellcheck source=lang/_layers.sh
+source "${__here}/lang/_layers.sh"
+# shellcheck source=lang/_gate2_binding.sh
+source "${__here}/lang/_gate2_binding.sh"
+# shellcheck source=lang/_child_group.sh
+source "${__here}/lang/_child_group.sh"
 
 # layer-all exits non-zero on the failure lanes we drive; set -e must NOT abort the harness
 # on a captured non-zero. report_results provides the final pass/fail exit code.
@@ -62,7 +70,7 @@ EOF
 }
 
 # mk_all_ok <dir> — fill layer1.sh..layer7.sh with OK/exit-0 stubs.
-mk_all_ok() { local n; for n in 1 2 3 4 5 6 7; do mk_stub "$1" "$n" OK "layer$n-ok" 0; done; }
+mk_all_ok() { local n; for (( n = 1; n <= LAYER_MAX; n++ )); do mk_stub "$1" "$n" OK "layer$n-ok" 0; done; }
 
 # new_stubdir — mint a fresh all-OK stub dir; echo its path.
 new_stubdir() { local d; d="$(mktemp -d "$WORK/stub.XXXXXX")"; mk_all_ok "$d"; printf '%s\n' "$d"; }
@@ -499,9 +507,9 @@ assert_no_marker "f3-no-stub-ran"     "$LA_DT" 'ran.layer*'
 
 # (F4) ARG VALIDATION: out-of-range and unknown flags fail loud (exit 2), no stub runs.
 d="$(new_stubdir)"
-run_la_args "$d" "--max-layer 9" DEVLOOP_TEST=1 LAYER_SCRIPT_DIR="$d"
+run_la_args "$d" "--max-layer $((LAYER_MAX + 2))" DEVLOOP_TEST=1 LAYER_SCRIPT_DIR="$d"
 assert_exit      "f4-range-exit2"     2 "$LA_RC"
-assert_status    "f4-range-token"     "--max-layer must be an integer 1..7" "$(cat "$LA_ERR")"
+assert_status    "f4-range-token"     "--max-layer must be an integer 1..${LAYER_MAX}" "$(cat "$LA_ERR")"
 assert_no_marker "f4-range-no-stub"   "$LA_DT" 'ran.layer*'
 d="$(new_stubdir)"
 run_la_args "$d" "--bogus" DEVLOOP_TEST=1 LAYER_SCRIPT_DIR="$d"
@@ -802,5 +810,461 @@ assert_status "i7-subset-bad-list-token"  "REASON=shard-layer-list-invalid" "$(c
 run_agg_args --aggregate "$a" --max-layer 3
 assert_exit   "i7-max-with-aggregate-exit2" 2 "$LA_RC"
 assert_status "i7-max-with-aggregate-says"  "mutually exclusive" "$(cat "$LA_ERR")"
+
+# =============================================================================
+# (K) KILLED / INCOMPLETE RUNS — a killed or incomplete layer-all must NEVER yield GATE2=PASS
+#     (devloop 2026-11-21-killed-run-gate2-pass). REAL signals against the REAL orchestrator:
+#     every run under test is launched in its own session with SIGINT at its default
+#     (`setsid env --default-signal=INT`), so a group signal reaches only it and an INT is
+#     deliverable; synchronisation is on a marker the blocking stub writes (never a sleep);
+#     every wait is capped and fails BY NAME, then SIGKILLs the group so the suite never hangs.
+# =============================================================================
+env --default-signal=INT true 2>/dev/null || {
+  printf 'layer-all.test.sh: PRECONDITION — env --default-signal (coreutils >= 9.1) is required to deliver SIGINT to a background run; the kill cases MUST NOT be skipped.\n' >&2
+  exit 2
+}
+# Backstop: whatever an aborted case leaves behind (every blocking stub records "<layer-pid>
+# <grandchild-pid>"; every launched run records its session id) is killed before $WORK goes.
+__k_backstop() {
+  local f p
+  for f in "$WORK"/*/dt/l*.started "$WORK"/*/l*.started "$WORK"/k.pids; do
+    [[ -f "$f" ]] || continue
+    for p in $(tr ' \n' '\n\n' < "$f"); do
+      [[ "$p" =~ ^[0-9]+$ ]] && { kill -KILL -- "-$p" 2>/dev/null; kill -KILL "$p" 2>/dev/null; }
+    done
+  done
+  rm -rf "$WORK"
+}
+trap '__k_backstop' EXIT
+
+# mk_block_stub <dir> <n> [ignore-term] — a layer that is a TREE (bash → sleep 120), prints
+# its STATUS line, then records "<layer-pid> <grandchild-pid>" in $DEVLOOP_TMP/l<n>.started
+# and blocks. ignore-term: the layer (and its sleeper) ignore SIGTERM — only KILL ends it.
+mk_block_stub() {
+  local ign=""; [[ "${3:-}" == "ignore-term" ]] && ign="trap '' TERM"
+  cat > "$1/layer$2.sh" <<EOF2
+#!/usr/bin/env bash
+${ign}
+printf 'STATUS=OK REASON=blocking-stub\n'
+: > "\${DEVLOOP_TMP}/ran.layer$2"
+sleep 120 & printf '%s %s\n' "\$\$" "\$!" > "\${DEVLOOP_TMP}/l$2.started"
+wait
+EOF2
+  chmod +x "$1/layer$2.sh"
+}
+
+# k_start <stubdir> <dt> [layer-all args...] — launch layer-all in its own session (the
+# session id IS LA_PID), env -i + the seam, into <dt>. Sets LA_PID/LA_DT/LA_OUT/LA_ERR.
+# KV env for the run comes from the K_ENV array (default empty).
+K_ENV=()
+k_start() {
+  local stubdir="$1"; LA_DT="$2"; shift 2
+  local t; t="$(mktemp -d "$WORK/run.XXXXXX")"
+  LA_OUT="$t/out"; LA_ERR="$t/err"
+  mkdir -p "$LA_DT"
+  setsid env --default-signal=INT env -i PATH="$PATH" HOME="$HOME" DEVLOOP_TMP="$LA_DT" \
+      DEVLOOP_TEST=1 LAYER_SCRIPT_DIR="$stubdir" "${K_ENV[@]}" \
+      bash "$LAYER_ALL" "$@" >"$LA_OUT" 2>"$LA_ERR" &
+  LA_PID=$!
+  printf '%s\n' "$LA_PID" >> "$WORK/k.pids"
+}
+# k_wait_marker <label> <file> — poll (30 s cap, 0.05 s steps) for the stub's marker.
+k_wait_marker() {
+  local i
+  for (( i = 0; i < 600; i++ )); do [[ -s "$2" ]] && return 0; sleep 0.05; done
+  FAIL=$((FAIL+1)); FAILURES+=("[$1] marker $2 never appeared (stub did not start)")
+  kill -KILL -- "-$LA_PID" 2>/dev/null; { wait "$LA_PID"; } 2>/dev/null
+  return 1
+}
+# k_wait_exit <label> [cap-secs] — the run must EXIT within the cap (default 20 s; a blocking
+# stub sleeps 120 s, so a deferred trap or an unbounded teardown fails here BY NAME). Sets LA_RC.
+k_wait_exit() {
+  local i cap=$(( ${2:-20} * 20 ))
+  for (( i = 0; i < cap; i++ )); do child_group_alive "$LA_PID" || break; sleep 0.05; done
+  if child_group_alive "$LA_PID"; then
+    FAIL=$((FAIL+1)); FAILURES+=("[$1-exit-prompt] layer-all still running ${2:-20}s after the signal")
+    kill -KILL -- "-$LA_PID" 2>/dev/null
+  else
+    PASS=$((PASS+1))
+  fi
+  { wait "$LA_PID"; } 2>/dev/null; LA_RC=$?   # brace: also swallows bash's job-death notice
+} 2>/dev/null   # bash prints a "Killed"/"User defined signal" job notice when it reaps
+                # a signal-killed run; the deaths are the point of these cases, not noise.
+
+# k_no_survivors <label> <pid...> — BEFORE any reaping by this harness: every recorded
+# layer / grandchild pid must be gone within 10 s.
+k_no_survivors() {
+  local label="$1" i p alive; shift
+  for (( i = 0; i < 200; i++ )); do
+    alive=""; for p in "$@"; do child_group_alive "$p" && alive+=" $p"; done
+    [[ -z "$alive" ]] && break; sleep 0.05
+  done
+  if [[ -z "$alive" ]]; then PASS=$((PASS+1)); else
+    FAIL=$((FAIL+1)); FAILURES+=("[${label}] process(es)${alive} outlived layer-all")
+    for p in $alive; do kill -KILL "$p" 2>/dev/null; done
+  fi
+}
+kv() { gate2_verdict_get "$1" "$LA_DT/gate2-verdict"; }
+# k_assert_killed <label> <rc> <signal> <missing> <in-flight> — the exact killed-run shape.
+k_assert_killed() {
+  local l="$1" rc="$2" sig="$3" missing="$4" inflight="$5" lae
+  lae="$rc"; [[ "$sig" == none ]] && lae=2
+  assert_exit   "$l-rc"            "$rc" "$LA_RC"
+  assert_exit   "$l-verdict-exists" 0 "$([[ -f "$LA_DT/gate2-verdict" ]] && echo 0 || echo 1)"
+  assert_exit   "$l-gate2-fail"    0 "$([[ "$(kv GATE2)" == FAIL ]] && echo 0 || echo "1 ($(kv GATE2))")"
+  assert_exit   "$l-reason"        0 "$([[ "$(kv REASON)" == pipeline-incomplete ]] && echo 0 || echo "1 ($(kv REASON))")"
+  assert_exit   "$l-signal"        0 "$([[ "$(kv SIGNAL)" == "$sig" ]] && echo 0 || echo "1 ($(kv SIGNAL))")"
+  assert_exit   "$l-missing"       0 "$([[ "$(kv MISSING)" == "$missing" ]] && echo 0 || echo "1 ($(kv MISSING))")"
+  assert_exit   "$l-layer-all-exit" 0 "$([[ "$(kv LAYER_ALL_EXIT)" == "$lae" ]] && echo 0 || echo "1 ($(kv LAYER_ALL_EXIT))")"
+  assert_absent "$l-no-pass"       "GATE2=PASS" "$(cat "$LA_DT/gate2-verdict" 2>/dev/null)"
+  assert_status "$l-incomplete-line" \
+    "PIPELINE_INCOMPLETE MISSING=${missing} IN_FLIGHT=${inflight} SIGNAL=${sig} LAYER_ALL_EXIT=${lae}" "$(cat "$LA_ERR")"
+}
+# k_case <label> <block-layer> <signal> <pid|group> <rc> — one full killed-run case.
+k_case() {
+  local l="$1" n="$2" sig="$3" target="$4" rc="$5" d dt missing="" m lp gp
+  d="$(new_stubdir)"; mk_block_stub "$d" "$n"
+  dt="$(mktemp -d "$WORK/run.XXXXXX")/dt"
+  K_ENV=(DEVLOOP_FAIL_FAST=0); k_start "$d" "$dt"; K_ENV=()
+  k_wait_marker "$l" "$dt/l${n}.started" || return
+  IFS=' ' read -r lp gp < "$dt/l${n}.started"
+  if [[ "$target" == group ]]; then kill "-$sig" -- "-$LA_PID"; else kill "-$sig" "$LA_PID"; fi
+  k_wait_exit "$l"
+  k_no_survivors "$l-no-surviving-layer" "$lp" "$gp"
+  for (( m = n; m <= LAYER_MAX; m++ )); do missing="${missing:+${missing},}${m}"; done
+  local s="$sig"; [[ "$sig" == USR1 ]] && s=none
+  k_assert_killed "$l" "$rc" "$s" "$missing" "$n"
+  assert_no_marker "$l-later-layer-never-ran" "$dt" "ran.layer$((n+1))"
+  kill -KILL -- "-$LA_PID" 2>/dev/null
+}
+
+# K1-K6 — the incident (killed mid-Layer-7), every trapped signal, to the pid and to the group.
+k_case k1-term-pid   "$LAYER_MAX" TERM pid   143
+k_case k2-term-group "$LAYER_MAX" TERM group 143
+k_case k3-int-pid    "$LAYER_MAX" INT  pid   130
+k_case k4-int-group  "$LAYER_MAX" INT  group 130
+k_case k5-hup-pid    "$LAYER_MAX" HUP  pid   129
+k_case k6-hup-group  "$LAYER_MAX" HUP  group 129
+# K7 — not Layer-7-specific: killed mid-Layer-3 → MISSING=3..LAYER_MAX, layer 4 never ran.
+k_case k7-term-mid-layer3 3 TERM pid 143
+# K8 — an UNTRAPPED default-fatal signal (SIGUSR1): bash runs the EXIT trap with `$?`=0, so
+#      only "an unrecorded layer is UNKNOWN" (derive_layer_all_exit) keeps the verdict FAIL.
+#      The isolating test for the completeness rule: revert that rule alone and this reds.
+k_case k8-usr1-untrapped 5 USR1 pid 138
+
+# K9 — an UNCATCHABLE SIGKILL of layer-all alone: the run-start verdict (REASON=in-progress)
+#      replaced the earlier PASS, the orphaned layer survives it, and the NEXT run takes the
+#      lock (the lock fd never reached the layer), reaps the orphan by identity, and passes.
+d_ok="$(new_stubdir)"; d_blk="$(new_stubdir)"; mk_block_stub "$d_blk" 4
+k9dt="$(mktemp -d "$WORK/run.XXXXXX")/dt"
+k_start "$d_ok" "$k9dt"; k_wait_exit k9-control
+assert_exit "k9-control-pass" 0 "$([[ "$(kv GATE2)" == PASS && "$(kv REASON)" == none ]] && echo 0 || echo "1 ($(kv GATE2) $(kv REASON))")"
+cp "$k9dt/gate2-verdict" "$WORK/k9.pass-copy"
+k_start "$d_blk" "$k9dt"
+if k_wait_marker k9 "$k9dt/l4.started"; then
+  IFS=' ' read -r k9lp k9gp < "$k9dt/l4.started"
+  kill -KILL "$LA_PID"; k_wait_exit k9-kill
+  assert_exit   "k9-rc137"            137 "$LA_RC"
+  assert_exit   "k9-gate2-fail"       0 "$([[ "$(kv GATE2)" == FAIL ]] && echo 0 || echo "1 ($(kv GATE2))")"
+  assert_exit   "k9-reason-in-progress" 0 "$([[ "$(kv REASON)" == in-progress ]] && echo 0 || echo "1 ($(kv REASON))")"
+  assert_exit   "k9-not-the-old-pass" 0 "$(cmp -s "$k9dt/gate2-verdict" "$WORK/k9.pass-copy" && echo 1 || echo 0)"
+  assert_absent "k9-no-recorded-layer" "LAYER 1 OK" "$(cat "$k9dt/gate2-verdict")"
+  assert_exit   "k9-orphan-survived-kill" 0 "$(child_group_alive "$k9lp" && echo 0 || echo 1)"
+  k_start "$d_ok" "$k9dt"; k_wait_exit k9-next
+  assert_exit   "k9-next-exit0"        0 "$LA_RC"
+  assert_absent "k9-next-not-refused"  "concurrent-layer-all" "$(cat "$LA_ERR")"
+  assert_status "k9-next-reaped"       "REAPED_STALE_LAYER_GROUP PGID=" "$(cat "$LA_ERR")"
+  assert_status "k9-next-reaped-layer" " LAYER=4 " "$(grep REAPED_STALE_LAYER_GROUP "$LA_ERR")"
+  k_no_survivors "k9-orphan-reaped" "$k9lp" "$k9gp"
+  assert_exit   "k9-next-pass"         0 "$([[ "$(kv GATE2)" == PASS ]] && echo 0 || echo "1 ($(kv GATE2))")"
+fi
+
+# K10 — a stale record whose leader identity does NOT match (a live, unrelated process now
+#       holds that pid with another start time) is dropped and NEVER signalled.
+d="$(new_stubdir)"; k10dt="$(mktemp -d "$WORK/run.XXXXXX")/dt"; mkdir -p "$k10dt"
+setsid sleep 120 & k10sl=$!; printf '%s\n' "$k10sl" >> "$WORK/k.pids"
+printf 'OWNER_PID=1\nOWNER_START=1\nLAYER=6\nPGID=%s\nLEADER_START=1\nSCRIPT=/nonexistent/layer6.sh\nRECORDED_AT=2026-01-01T00:00:00Z\n' "$k10sl" > "$k10dt/layer-all.inflight"
+k_start "$d" "$k10dt"; k_wait_exit k10
+assert_status "k10-dropped"        "STALE_LAYER_RECORD_DROPPED PGID=${k10sl} LAYER=6 REASON=identity-mismatch" "$(cat "$LA_ERR")"
+assert_absent "k10-not-reaped"     "REAPED_STALE_LAYER_GROUP" "$(cat "$LA_ERR")"
+assert_exit   "k10-not-signalled"  0 "$(child_group_alive "$k10sl" && echo 0 || echo 1)"
+assert_exit   "k10-record-removed" 0 "$([[ ! -e "$k10dt/layer-all.inflight" ]] && echo 0 || echo 1)"
+kill -KILL "$k10sl" 2>/dev/null; wait "$k10sl" 2>/dev/null
+
+# K11 — a CONCURRENT run in the same DEVLOOP_TMP is refused before touching anything: run A
+#       blocks in layer 3; run B exits 2 concurrent-layer-all; A's snapshot, verdict and
+#       in-flight layer are untouched (security C4 — no cross-read of A's start snapshot).
+d_blk="$(new_stubdir)"; mk_block_stub "$d_blk" 3; k11dt="$(mktemp -d "$WORK/run.XXXXXX")/dt"
+k_start "$d_blk" "$k11dt"; k11a=$LA_PID; k11a_err="$LA_ERR"
+if k_wait_marker k11 "$k11dt/l3.started"; then
+  IFS=' ' read -r k11lp _ < "$k11dt/l3.started"
+  k11sig="$(cat "$k11dt/gate2-snapshot/start/signature")"; k11ver="$(cat "$k11dt/gate2-verdict")"
+  k_start "$(new_stubdir)" "$k11dt"; k_wait_exit k11-b
+  assert_exit   "k11-b-refused-exit2" 2 "$LA_RC"
+  assert_status "k11-b-token"         "REASON=concurrent-layer-all" "$(cat "$LA_ERR")"
+  assert_status "k11-b-names-lock"    "layer-all.lock" "$(cat "$LA_ERR")"
+  assert_exit   "k11-a-snapshot-untouched" 0 "$([[ "$(cat "$k11dt/gate2-snapshot/start/signature" 2>/dev/null)" == "$k11sig" ]] && echo 0 || echo 1)"
+  assert_exit   "k11-a-verdict-untouched"  0 "$([[ "$(cat "$k11dt/gate2-verdict")" == "$k11ver" ]] && echo 0 || echo 1)"
+  assert_exit   "k11-a-layer-alive"   0 "$(child_group_alive "$k11lp" && echo 0 || echo 1)"
+  LA_PID=$k11a; LA_ERR="$k11a_err"; kill -TERM "$LA_PID"; k_wait_exit k11-a
+fi
+
+# K12 — a layer that IGNORES SIGTERM is still torn down (bounded TERM→KILL) and the run
+#       exits promptly with nothing left behind.
+d="$(new_stubdir)"; mk_block_stub "$d" 6 ignore-term; k12dt="$(mktemp -d "$WORK/run.XXXXXX")/dt"
+k_start "$d" "$k12dt"
+if k_wait_marker k12 "$k12dt/l6.started"; then
+  IFS=' ' read -r k12lp k12gp < "$k12dt/l6.started"
+  kill -TERM "$LA_PID"; k_wait_exit k12
+  assert_exit "k12-rc143" 143 "$LA_RC"
+  k_no_survivors "k12-no-surviving-layer" "$k12lp" "$k12gp"
+fi
+
+# K13 — NESTED grace race (ops B3(b)): an outer run-story-style teardown (kill_child_group,
+#       the FULL grace) hits layer-all's session while its layer ignores TERM. layer-all's
+#       inner teardown (CHILD_GROUP_INNER_POLLS, derived from the same constant) must KILL the
+#       layer before the outer KILL lands on layer-all, so nothing survives.
+assert_exit "k13-inner-below-outer" 0 "$(( CHILD_GROUP_INNER_POLLS < CHILD_GROUP_GRACE_POLLS ? 0 : 1 ))"
+d="$(new_stubdir)"; mk_block_stub "$d" 6 ignore-term; k13dt="$(mktemp -d "$WORK/run.XXXXXX")/dt"
+k_start "$d" "$k13dt"
+if k_wait_marker k13 "$k13dt/l6.started"; then
+  IFS=' ' read -r k13lp k13gp < "$k13dt/l6.started"
+  kill_child_group "$CHILD_GROUP_GRACE_POLLS" "$LA_PID"
+  k_no_survivors "k13-no-surviving-layer" "$k13lp" "$k13gp"
+fi
+
+# K14 — a layer KILLED ON ITS OWN (the reaper picks one process) while layer-all carries on:
+#       a real _common.sh lifecycle layer that recorded one passing child renders UNKNOWN
+#       layer-incomplete in its own log, the summary row and the verdict's LAYER line (never
+#       OK), the run is FAIL, and the per-layer session reap takes its grandchild.
+d="$(new_stubdir)"
+cat > "$d/layer3.sh" <<EOF2
+#!/usr/bin/env bash
+set -euo pipefail
+source "${__here}/lang/_common.sh"
+layer_lifecycle_begin 3
+printf 'STATUS=OK REASON=first-child\n' | tee_collect_statuses
+# The straggler does NOT hold the layer's stdout (like a port-forward logging to a file): a
+# child that still holds the pipe keeps tee — and so the layer's wait — open until it exits.
+sleep 120 >/dev/null 2>&1 & printf '%s %s\n' "\$\$" "\$!" > "\${DEVLOOP_TMP}/l3.started"
+wait
+layer_lifecycle_done
+EOF2
+chmod +x "$d/layer3.sh"
+k14dt="$(mktemp -d "$WORK/run.XXXXXX")/dt"
+K_ENV=(DEVLOOP_FAIL_FAST=0); k_start "$d" "$k14dt"; K_ENV=()
+if k_wait_marker k14 "$k14dt/l3.started"; then
+  IFS=' ' read -r k14lp k14gp < "$k14dt/l3.started"
+  kill -TERM "$k14lp"; k_wait_exit k14
+  assert_exit   "k14-run-red"        143 "$LA_RC"   # rc floor: the layer died of SIGTERM
+  assert_status "k14-layer-log"      "STATUS=UNKNOWN REASON=layer-incomplete" "$(tail -n1 "$k14dt/layer-3.log")"
+  assert_status "k14-summary-row"    "LAYER=3 RESULT=UNKNOWN" "$(cat "$LA_OUT")"
+  assert_exit   "k14-verdict-line"   0 "$(grep -qx 'LAYER 3 UNKNOWN [0-9]*' "$k14dt/gate2-verdict" && echo 0 || echo 1)"
+  assert_exit   "k14-gate2-fail"     0 "$([[ "$(kv GATE2)" == FAIL && "$(kv REASON)" == layer-failed ]] && echo 0 || echo "1 ($(kv GATE2) $(kv REASON))")"
+  assert_marker "k14-pipeline-continued" "$k14dt" 'ran.layer4'
+  k_no_survivors "k14-grandchild-reaped" "$k14gp"
+fi
+
+# K21 — layer-all KILLED while a real _common.sh lifecycle layer is in flight (one passing
+#       child recorded): the stderr PIPELINE_INCOMPLETE line AND the layer's own log agree —
+#       the log's LAST STATUS line is the lifecycle's `UNKNOWN layer-incomplete`, never the
+#       finished child's OK (tee ignores the teardown TERM so the layer's last words land).
+d="$(new_stubdir)"
+cat > "$d/layer3.sh" <<EOF2
+#!/usr/bin/env bash
+set -euo pipefail
+source "${__here}/lang/_common.sh"
+layer_lifecycle_begin 3
+printf 'STATUS=OK REASON=first-child\n' | tee_collect_statuses
+sleep 120 >/dev/null 2>&1 & printf '%s %s\n' "\$\$" "\$!" > "\${DEVLOOP_TMP}/l3.started"
+wait
+layer_lifecycle_done
+EOF2
+chmod +x "$d/layer3.sh"
+k21dt="$(mktemp -d "$WORK/run.XXXXXX")/dt"
+K_ENV=(DEVLOOP_FAIL_FAST=0); k_start "$d" "$k21dt"; K_ENV=()
+if k_wait_marker k21 "$k21dt/l3.started"; then
+  IFS=' ' read -r k21lp k21gp < "$k21dt/l3.started"
+  kill -TERM "$LA_PID"; k_wait_exit k21
+  k_no_survivors "k21-no-surviving-layer" "$k21lp" "$k21gp"
+  assert_status "k21-incomplete-line" "PIPELINE_INCOMPLETE MISSING=3,4,5,6,7 IN_FLIGHT=3 SIGNAL=TERM LAYER_ALL_EXIT=143" "$(cat "$LA_ERR")"
+  assert_exit   "k21-layer-log-last-status" 0 "$([[ "$(grep '^STATUS=' "$k21dt/layer-3.log" | tail -n1)" == "STATUS=UNKNOWN REASON=layer-incomplete" ]] && echo 0 || echo "1 ($(tr '\n' '|' < "$k21dt/layer-3.log"))")"
+fi
+
+# K22 — a `set -e` abort AFTER the loop (every layer OK; stdout is /dev/full, so the summary
+#       printf fails) is pipeline-incomplete — completion is only the final `exit` — never
+#       layer-failed, and the stderr line agrees with the verdict.
+d="$(new_stubdir)"; LA_DT="$(mktemp -d "$WORK/run.XXXXXX")/dt"; LA_ERR="$LA_DT.err"
+env -i PATH="$PATH" HOME="$HOME" DEVLOOP_TMP="$LA_DT" DEVLOOP_TEST=1 LAYER_SCRIPT_DIR="$d" \
+    bash "$LAYER_ALL" >/dev/full 2>"$LA_ERR"; LA_RC=$?
+assert_exit   "k22-post-loop-abort-nonzero" 0 "$(( LA_RC != 0 ? 0 : 1 ))"
+assert_exit   "k22-reason" 0 "$([[ "$(kv GATE2)" == FAIL && "$(kv REASON)" == pipeline-incomplete && -z "$(kv MISSING)" ]] && echo 0 || echo "1 ($(kv GATE2) $(kv REASON) $(kv MISSING))")"
+assert_status "k22-line" "PIPELINE_INCOMPLETE MISSING=none IN_FLIGHT=none SIGNAL=none LAYER_ALL_EXIT=${LA_RC}" "$(cat "$LA_ERR")"
+
+# K23 — the recorded LEADER died too (a tree-walking reaper got it and layer-all), but its
+#       session's members live on: the next run reaps them GROUP-ONLY (a pgid number stays
+#       allocated while its group lives) and says so; the leader's bare pid is never used.
+d_blk="$(new_stubdir)"; mk_block_stub "$d_blk" 4; k23dt="$(mktemp -d "$WORK/run.XXXXXX")/dt"
+k_start "$d_blk" "$k23dt"
+if k_wait_marker k23 "$k23dt/l4.started"; then
+  IFS=' ' read -r k23lp k23gp < "$k23dt/l4.started"
+  k23pg="$(sed -n 's/^PGID=//p' "$k23dt/layer-all.inflight")"
+  kill -KILL "$LA_PID" "$k23pg"; k_wait_exit k23-kill
+  assert_exit "k23-members-survived" 0 "$(child_group_alive "$k23gp" && echo 0 || echo 1)"
+  k_start "$(new_stubdir)" "$k23dt"; k_wait_exit k23-next
+  assert_status "k23-reaped-leader-gone" "REAPED_STALE_LAYER_GROUP PGID=${k23pg} LAYER=4 " "$(cat "$LA_ERR")"
+  assert_status "k23-reason" "REASON=leader-gone" "$(grep REAPED_STALE_LAYER_GROUP "$LA_ERR")"
+  k_no_survivors "k23-members-reaped" "$k23lp" "$k23gp"
+fi
+
+# K24 — kill_child_group group-only NEVER signals the bare pid (the post-wait reap and the
+#       stale reap use it: their leader may be reaped and its pid recycled). A live process
+#       that is NOT a group leader stands in for the recycled pid: it must survive.
+sleep 120 & k24=$!; printf '%s\n' "$k24" >> "$WORK/k.pids"
+kill_child_group 1 "$k24" group-only
+assert_exit "k24-group-only-spares-bare-pid" 0 "$(child_group_alive "$k24" && echo 0 || echo 1)"
+kill -KILL "$k24" 2>/dev/null; wait "$k24" 2>/dev/null
+
+# K25 — a signal DURING the post-wait reap (the layer exited, a TERM-ignoring straggler is
+#       still in its session): the trap tears the group down GROUP-ONLY (the leader was just
+#       reaped — its bare pid may be recycled) and the straggler is KILLed within the bound.
+d="$(new_stubdir)"
+cat > "$d/layer5.sh" <<'EOF2'
+#!/usr/bin/env bash
+printf 'STATUS=OK REASON=leaves-straggler\n'
+( trap '' TERM; exec sleep 120 ) >/dev/null 2>&1 &
+printf '%s %s\n' "$$" "$!" > "${DEVLOOP_TMP}/l5.started"
+exit 0
+EOF2
+chmod +x "$d/layer5.sh"
+k25dt="$(mktemp -d "$WORK/run.XXXXXX")/dt"
+k_start "$d" "$k25dt"
+if k_wait_marker k25 "$k25dt/l5.started"; then
+  IFS=' ' read -r _ k25gp < "$k25dt/l5.started"
+  sleep 0.5   # the layer has exited; layer-all is inside the post-wait reap's grace polls
+  kill -TERM "$LA_PID"; k_wait_exit k25
+  assert_exit "k25-rc143" 143 "$LA_RC"
+  k_no_survivors "k25-straggler-killed" "$k25gp"
+fi
+# Structural pin: the trap's teardown is group-only once `wait` reaped the leader.
+assert_status "k25-trap-group-only-after-reap" '(( __inflight_reaped )) && mode="group-only"' "$(cat "$LAYER_ALL")"
+
+# K26 — the teardown GRANTS the grace: a real _common.sh lifecycle layer whose registered
+#       cleanup takes ~1 s (a port-forward stop, a helper shutdown) finishes it — and its
+#       `STATUS=UNKNOWN REASON=layer-incomplete` line lands — before any KILL, because the
+#       teardown waits on the layer's whole SESSION, not on the wrapper that leads it.
+d="$(new_stubdir)"
+cat > "$d/layer3.sh" <<EOF2
+#!/usr/bin/env bash
+set -euo pipefail
+source "${__here}/lang/_common.sh"
+layer_lifecycle_begin 3
+slow_cleanup() { sleep 1; : > "\${DEVLOOP_TMP}/l3.cleanup-done"; }
+layer_register_cleanup slow_cleanup
+printf 'STATUS=OK REASON=first-child\n' | tee_collect_statuses
+sleep 120 >/dev/null 2>&1 & printf '%s %s\n' "\$\$" "\$!" > "\${DEVLOOP_TMP}/l3.started"
+wait
+layer_lifecycle_done
+EOF2
+chmod +x "$d/layer3.sh"
+k26dt="$(mktemp -d "$WORK/run.XXXXXX")/dt"
+k_start "$d" "$k26dt"
+if k_wait_marker k26 "$k26dt/l3.started"; then
+  IFS=' ' read -r k26lp k26gp < "$k26dt/l3.started"
+  kill -TERM "$LA_PID"; k_wait_exit k26
+  assert_exit   "k26-rc143" 143 "$LA_RC"
+  assert_marker "k26-cleanup-ran-before-kill" "$k26dt" 'l3.cleanup-done'
+  assert_exit   "k26-incomplete-line-landed" 0 "$([[ "$(grep '^STATUS=' "$k26dt/layer-3.log" | tail -n1)" == "STATUS=UNKNOWN REASON=layer-incomplete" ]] && echo 0 || echo "1 ($(tr '\n' '|' < "$k26dt/layer-3.log"))")"
+  k_no_survivors "k26-no-surviving-layer" "$k26lp" "$k26gp"
+fi
+
+# K15 — a killed SHARD and a killed FAST LANE never write, remove or overwrite a verdict
+#       (and never take a snapshot), and still leave nothing behind.
+for k15 in "shard --layers 3" "fast --max-layer 6"; do
+  k15l="${k15%% *}"; k15args="${k15#* }"
+  d="$(new_stubdir)"; mk_block_stub "$d" 3; k15dt="$(mktemp -d "$WORK/run.XXXXXX")/dt"
+  mkdir -p "$k15dt"; printf 'sentinel-verdict\n' > "$k15dt/gate2-verdict"
+  IFS=' ' read -r -a k15a <<< "$k15args"
+  k_start "$d" "$k15dt" "${k15a[@]}"
+  if k_wait_marker "k15-$k15l" "$k15dt/l3.started"; then
+    IFS=' ' read -r k15lp k15gp < "$k15dt/l3.started"
+    kill -TERM "$LA_PID"; k_wait_exit "k15-$k15l"
+    assert_exit "k15-$k15l-rc143"            143 "$LA_RC"
+    assert_exit "k15-$k15l-verdict-untouched" 0 "$([[ "$(cat "$k15dt/gate2-verdict")" == sentinel-verdict ]] && echo 0 || echo 1)"
+    assert_no_marker "k15-$k15l-no-snapshot" "$k15dt" 'gate2-snapshot'
+    k_no_survivors "k15-$k15l-no-surviving-layer" "$k15lp" "$k15gp"
+  fi
+done
+
+# K16 — the run-start snapshot cannot be taken (cwd is not a git work tree): refused exit 2
+#       BEFORE Layer 1, and the PREVIOUS verdict (a pre-seeded PASS) is gone, not left behind.
+d="$(new_stubdir)"; k16cwd="$(mktemp -d "$WORK/nogit.XXXXXX")"; k16dt="$(mktemp -d "$WORK/run.XXXXXX")/dt"
+mkdir -p "$k16dt"; printf 'SCHEMA=gate2-verdict/v2\nGATE2=PASS\n' > "$k16dt/gate2-verdict"
+( cd "$k16cwd" && env -i PATH="$PATH" HOME="$HOME" GIT_CEILING_DIRECTORIES="$WORK" DEVLOOP_TMP="$k16dt" \
+    DEVLOOP_TEST=1 LAYER_SCRIPT_DIR="$d" bash "$LAYER_ALL" >"$k16cwd.out" 2>"$k16cwd.err" ); k16rc=$?
+assert_exit      "k16-snapshot-failed-exit2" 2 "$k16rc"
+assert_status    "k16-token"                 "REASON=gate2-snapshot-failed" "$(cat "$k16cwd.err")"
+assert_exit      "k16-old-pass-removed"      0 "$([[ ! -e "$k16dt/gate2-verdict" ]] && echo 0 || echo 1)"
+assert_no_marker "k16-no-stub-ran"           "$k16dt" 'ran.layer*'
+
+# K17 — the previous verdict cannot be replaced (a non-empty DIRECTORY squats on the path;
+#       rm -f fails on it even as root): refused exit 2, nothing runs.
+d="$(new_stubdir)"; k17dt="$(mktemp -d "$WORK/run.XXXXXX")/dt"
+mkdir -p "$k17dt/gate2-verdict/sub"
+K_ENV=(); k_start "$d" "$k17dt"; k_wait_exit k17
+assert_exit      "k17-invalidate-failed-exit2" 2 "$LA_RC"
+assert_status    "k17-token"   "REASON=gate2-verdict-invalidate-failed" "$(cat "$LA_ERR")"
+assert_no_marker "k17-no-stub-ran" "$k17dt" 'ran.layer*'
+
+# K18 — the TREE must be the same at exit as at start. A hermetic git fixture (git init, a
+#       synthetic origin/main) so stubs can edit it; the real layer-all runs with cwd there.
+k18_fixture() {
+  local r; r="$(mktemp -d "$WORK/repo.XXXXXX")"
+  git -C "$r" -c init.defaultBranch=main init -q
+  printf 'tracked\n' > "$r/a.txt"
+  git -C "$r" add a.txt
+  git -C "$r" -c user.name=t -c user.email=t@example.com -c commit.gpgsign=false commit -qm seed
+  git -C "$r" update-ref refs/remotes/origin/main HEAD
+  printf '%s\n' "$r"
+}
+# k18_run <label> <stub-layer-3-body> — run every layer OK except a custom layer 3.
+k18_run() {
+  local r d; r="$(k18_fixture)"; d="$(new_stubdir)"
+  printf '#!/usr/bin/env bash\n%s\n: > "${DEVLOOP_TMP}/ran.layer3"\n' "$2" > "$d/layer3.sh"; chmod +x "$d/layer3.sh"
+  LA_DT="$(mktemp -d "$WORK/run.XXXXXX")/dt"; LA_OUT="$LA_DT.out"; LA_ERR="$LA_DT.err"
+  ( cd "$r" && env -i PATH="$PATH" HOME="$HOME" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+      DEVLOOP_TMP="$LA_DT" DEVLOOP_TEST=1 DEVLOOP_FAIL_FAST=0 LAYER_SCRIPT_DIR="$d" \
+      bash "$LAYER_ALL" >"$LA_OUT" 2>"$LA_ERR" ); LA_RC=$?
+}
+k18_run t2-control "printf 'STATUS=OK REASON=ok\n'"
+assert_exit "k18-t2-control-pass" 0 "$([[ "$(kv GATE2)" == PASS && "$(kv REASON)" == none ]] && echo 0 || echo "1 ($(kv GATE2) $(kv REASON) rc=$LA_RC)")"
+k18_run t1-edit "printf 'STATUS=OK REASON=ok\n'; printf 'edited\n' >> a.txt"
+assert_exit   "k18-t1-exit0"  0 "$LA_RC"
+assert_exit   "k18-t1-fail"   0 "$([[ "$(kv GATE2)" == FAIL && "$(kv REASON)" == tree-changed-during-run ]] && echo 0 || echo "1 ($(kv GATE2) $(kv REASON))")"
+assert_status "k18-t1-warn"   "WARN GATE2_TREE_CHANGED_DURING_RUN PATHS=a.txt" "$(cat "$LA_ERR")"
+k18_run t3-untracked "printf 'STATUS=OK REASON=ok\n'; printf 'new\n' > b.txt"
+assert_exit   "k18-t3-fail"   0 "$([[ "$(kv REASON)" == tree-changed-during-run ]] && echo 0 || echo "1 ($(kv REASON))")"
+assert_status "k18-t3-warn"   "PATHS=b.txt" "$(cat "$LA_ERR")"
+# T4 — two causes at once (a failed layer that also edits): the precedence puts layer-failed first.
+k18_run t4-two-causes "printf 'STATUS=FAIL REASON=bad\n'; printf 'edited\n' >> a.txt; exit 1"
+assert_exit "k18-t4-precedence" 0 "$([[ "$(kv REASON)" == layer-failed ]] && echo 0 || echo "1 ($(kv REASON))")"
+
+# K19 — CONTROLS: a fail-fast stop is a COMPLETE run (layer-failed, no PIPELINE_INCOMPLETE,
+#       the un-run layers render NOT-RUN); a green run is PASS with REASON=none.
+d="$(new_stubdir)"; mk_stub "$d" 3 FAIL boom 1
+run_la "$d" DEVLOOP_TEST=1 LAYER_SCRIPT_DIR="$d" DEVLOOP_FAIL_FAST=1
+assert_exit   "k19-failfast-reason"  0 "$([[ "$(kv GATE2)" == FAIL && "$(kv REASON)" == layer-failed ]] && echo 0 || echo "1 ($(kv GATE2) $(kv REASON))")"
+assert_absent "k19-failfast-no-incomplete" "PIPELINE_INCOMPLETE" "$(cat "$LA_ERR")"
+assert_exit   "k19-failfast-not-run-line" 0 "$(grep -qx 'LAYER 5 NOT-RUN 0' "$LA_DT/gate2-verdict" && echo 0 || echo 1)"
+d="$(new_stubdir)"; run_la "$d" DEVLOOP_TEST=1 LAYER_SCRIPT_DIR="$d"
+assert_exit   "k19-green-pass" 0 "$([[ "$(kv GATE2)" == PASS && "$(kv REASON)" == none && "$(kv SIGNAL)" == none && -z "$(kv MISSING)" ]] && echo 0 || echo 1)"
+assert_absent "k19-green-no-incomplete" "PIPELINE_INCOMPLETE" "$(cat "$LA_ERR")"
+
+# K20 — LAYER_MAX has exactly ONE home (scripts/lang/_layers.sh). Production files only
+#       (*.test.sh excluded: a test may legitimately set `LAYER_MAX=3 cmd` inline); the anchor
+#       is an assignment at line start, so a `${LAYER_MAX}` read or a comment never counts.
+k20="$(grep -rlE '^[[:space:]]*(readonly[[:space:]]+|export[[:space:]]+)?LAYER_MAX=' "${__here}" --include='*.sh' \
+        | grep -v '\.test\.sh$' | sort)"
+assert_exit "k20-layer-max-single-home" 0 "$([[ "$k20" == "${__here}/lang/_layers.sh" ]] && echo 0 || echo "1 (${k20//$'\n'/,})")"
 
 report_results "scripts/layer-all.test.sh"
