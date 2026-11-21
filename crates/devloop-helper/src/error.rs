@@ -200,7 +200,7 @@ mod tests {
     #[test]
     fn test_busy_kind() {
         let err = HelperError::Busy {
-            op: "test-sleep".to_string(),
+            op: "test-hold".to_string(),
             args: vec!["5".to_string()],
         };
         assert_eq!(err.kind(), "busy");
@@ -209,11 +209,11 @@ mod tests {
     #[test]
     fn test_busy_display_contains_op_and_args() {
         let err = HelperError::Busy {
-            op: "test-sleep".to_string(),
+            op: "test-hold".to_string(),
             args: vec!["5".to_string()],
         };
         let s = err.to_string();
-        assert!(s.contains("test-sleep 5"), "got: {s}");
+        assert!(s.contains("test-hold 5"), "got: {s}");
         assert!(s.contains("dev-cluster cancel"), "got: {s}");
     }
 

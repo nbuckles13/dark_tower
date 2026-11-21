@@ -98,6 +98,7 @@ fn run() -> Result<(), HelperError> {
         shutdown: Arc::clone(&shutdown),
         write_state: Arc::new(Mutex::new(commands::WriteState::new())),
         recreate_bound: AtomicBool::new(false),
+        cancel_grace: commands::CANCEL_GRACEFUL_TIMEOUT,
     });
 
     // Bind socket
@@ -626,25 +627,6 @@ fn cleanup(pid_path: &Path, socket_path: &Path, runtime_dir: &Path) {
     let _ = fs::remove_file(runtime_dir.join("auth-token"));
 }
 
-/// Test-only: build a stock `commands::Context` rooted at `dir` (typically a
-/// `TempDir` path). Centralizes the setup repeated by socket-roundtrip and
-/// concurrency tests so a future field addition only edits one place.
-#[cfg(test)]
-fn build_test_context(dir: &Path) -> commands::Context {
-    commands::Context {
-        slug: "test".to_string(),
-        cluster_name: "devloop-test".to_string(),
-        project_root: PathBuf::from("/tmp/devloop-test-nonexistent"),
-        runtime_dir: dir.to_path_buf(),
-        registry_path: dir.join("port-registry.json"),
-        container_runtime: commands::ContainerRuntime::Podman,
-        host_gateway_ip: None,
-        shutdown: Arc::new(AtomicBool::new(false)),
-        write_state: Arc::new(Mutex::new(commands::WriteState::new())),
-        recreate_bound: AtomicBool::new(false),
-    }
-}
-
 /// Test-only: read all newline-delimited JSON lines from `reader` until EOF.
 /// Errors are treated as EOF — callers want best-effort drain. Shared by the
 /// socket-roundtrip helpers in `tests` and the `TestHelper` methods in
@@ -719,7 +701,7 @@ mod tests {
         let listener = UnixListener::bind(&sock_path).unwrap();
 
         let token = auth::generate_token().unwrap();
-        let ctx = build_test_context(dir.path());
+        let ctx = commands::test_context(dir.path());
         let log_path = dir.path().join("helper.log");
         let audit_log = logging::AuditLog::new(&log_path).unwrap();
 
@@ -772,7 +754,7 @@ mod tests {
         let listener = UnixListener::bind(&sock_path).unwrap();
 
         let token = auth::generate_token().unwrap();
-        let ctx = build_test_context(dir.path());
+        let ctx = commands::test_context(dir.path());
         let log_path = dir.path().join("helper.log");
         let audit_log = logging::AuditLog::new(&log_path).unwrap();
 
@@ -804,7 +786,7 @@ mod tests {
         let sock_path = dir.path().join("test.sock");
         let listener = UnixListener::bind(&sock_path).unwrap();
         let token = auth::generate_token().unwrap();
-        let mut ctx = build_test_context(dir.path());
+        let mut ctx = commands::test_context(dir.path());
         let root = dir.path().join("root");
         let script = root.join("infra/kind/scripts/deploy.sh");
         fs::create_dir_all(script.parent().unwrap()).unwrap();
@@ -1036,25 +1018,132 @@ mod tests {
 /// per Security S1/S2 + Obs O1/O2/O3/O4.
 ///
 /// These tests use a shared `Context` + multi-accept server thread to
-/// exercise the real thread-per-connection + write-mutex + cancel paths.
-/// They use `HelperCommand::TestSleep` (cfg-test) to avoid Kind cluster
-/// dependency.
+/// exercise the real thread-per-connection + write-mutex + cancel paths,
+/// with `HelperCommand::TestHold` (cfg-test) as the write.
+///
+/// THE RULE OF THIS MODULE: no test synchronizes on a duration. A held write
+/// ends only when the test cancels or releases it (never on a clock — so
+/// `status`'s real `kind`/`kubectl`/inspect latency, or a loaded runner, can't
+/// end it early); every "has X happened yet?" is an event waited on through
+/// `poll_until`/`HeldWrite::join`, bounded only by the fail-loud
+/// `WAIT_DEADLINE` hang detector. No elapsed-time assertion is made.
 #[cfg(test)]
 mod concurrency_tests {
     use super::*;
-    use protocol::CommandResult;
+    use protocol::{CommandResult, HelperCommand, HoldShape};
     use std::os::unix::net::UnixStream;
+    use std::sync::mpsc;
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
+
+    use commands::{poll_until, WAIT_DEADLINE};
+
+    /// Cancel grace that never expires (`run_command_streaming` only compares
+    /// `elapsed() >= grace`; nothing adds to it, so `MAX` cannot overflow).
+    /// For tests that must observe a cancelled write still holding the slot
+    /// across `status` calls — whose kind/kubectl latency is uncontrolled, so
+    /// any FINITE grace would be a duration racing it — or that must prove the
+    /// SIGTERM path ALONE ends a write (no SIGKILL can rescue a broken SIGTERM
+    /// path; it fails at the `join` deadline instead). Set only through
+    /// `commands::test_context_with_grace`.
+    const NEVER_ESCALATE: Duration = Duration::MAX;
+    // SIGKILL-escalation tests run at the production grace and must see the
+    // escalation land inside one wait.
+    const _: () = assert!(WAIT_DEADLINE.as_secs() > commands::CANCEL_GRACEFUL_TIMEOUT.as_secs());
+
+    /// Run `cmd` as a write on its own thread, the way `handle_connection`
+    /// would (in-process: `TestHold` has no parse arm). The result arrives on
+    /// the returned channel.
+    fn spawn_write(
+        ctx: &Arc<commands::Context>,
+        cmd: HelperCommand,
+    ) -> mpsc::Receiver<CommandResult> {
+        let (tx, rx) = mpsc::channel();
+        let ctx = Arc::clone(ctx);
+        std::thread::spawn(move || {
+            let mut output = Vec::new();
+            let _ = tx.send(commands::execute(&cmd, &ctx, &mut output));
+        });
+        rx
+    }
+
+    /// A `TestHold` write in flight. `spawn` returns once the write holds the
+    /// slot AND its stub is set up (TERM trap installed / grandchild forked).
+    /// It ends only on cancel or `release()`; dropping it releases it, so a
+    /// failing test leaves no stub behind (and the stub also exits if this
+    /// test process dies — see `commands::hold_command`).
+    struct HeldWrite {
+        latch: PathBuf,
+        result: mpsc::Receiver<CommandResult>,
+        _dir: tempfile::TempDir,
+    }
+
+    impl HeldWrite {
+        fn spawn(ctx: &Arc<commands::Context>, shape: HoldShape) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let latch = dir.path().join("latch");
+            let ready = dir.path().join("ready");
+            let result = spawn_write(
+                ctx,
+                HelperCommand::TestHold {
+                    latch: latch.clone(),
+                    ready: ready.clone(),
+                    shape,
+                },
+            );
+            let held = Self {
+                latch,
+                result,
+                _dir: dir,
+            };
+            poll_until("the write to claim the slot", || {
+                ctx.snapshot_busy().is_some()
+            });
+            poll_until("the hold stub to be ready", || ready.exists());
+            held
+        }
+
+        /// The write's logged args (`in_flight.args`, audit `*_args=`).
+        fn args(&self) -> Vec<String> {
+            vec![self.latch.display().to_string()]
+        }
+
+        /// Let the stub exit 0 on its own.
+        fn release(&self) {
+            fs::write(&self.latch, b"").unwrap();
+        }
+
+        /// The write's result once it has ended. On the deadline: release the
+        /// stub, then fail.
+        fn join(self) -> CommandResult {
+            match self.result.recv_timeout(WAIT_DEADLINE) {
+                Ok(r) => r,
+                Err(e) => {
+                    self.release();
+                    #[expect(clippy::panic, reason = "test harness: fail loudly with context")]
+                    {
+                        panic!("held write did not end within {WAIT_DEADLINE:?}: {e}")
+                    }
+                }
+            }
+        }
+    }
+
+    impl Drop for HeldWrite {
+        fn drop(&mut self) {
+            let _ = fs::write(&self.latch, b"");
+            // Let the stub see the latch before `_dir` (which holds it) goes.
+            let _ = self.result.recv_timeout(WAIT_DEADLINE);
+        }
+    }
 
     /// Test harness: long-lived helper accepting connections on a unix socket
-    /// using the same thread-per-connection model as production. Returns the
-    /// socket path, auth token, audit-log path, shared context, and a
-    /// shutdown handle.
+    /// using the same thread-per-connection model as production.
     struct TestHelper {
         sock_path: PathBuf,
         token: String,
         log_path: PathBuf,
+        conn_count: Arc<AtomicUsize>,
         shutdown: Arc<AtomicBool>,
         _dir: tempfile::TempDir,
         accept_thread: Option<std::thread::JoinHandle<()>>,
@@ -1069,6 +1158,12 @@ mod concurrency_tests {
             read_all_ndjson(&mut BufReader::new(&client))
         }
 
+        /// No wait needed before reading: `handle_connection` appends its
+        /// audit entry (a synchronous, unbuffered `writeln`) BEFORE it returns
+        /// and drops the stream, and `request()` reads to that EOF — so every
+        /// entry for a request has hit the file by the time `request()`
+        /// returns. (Likewise the accept loop logs a cap rejection before it
+        /// drops the rejected stream.)
         fn read_audit_log(&self) -> Vec<serde_json::Value> {
             let contents = fs::read_to_string(&self.log_path).unwrap_or_default();
             contents
@@ -1088,32 +1183,19 @@ mod concurrency_tests {
         }
     }
 
-    /// Start a long-running write via the helper's internal API directly
-    /// (TestSleep has no parse arm — by design). Returns a join handle that
-    /// completes when the write finishes (cancel/error/normal).
-    fn spawn_test_sleep_write(
-        ctx: Arc<commands::Context>,
-        seconds: u64,
-    ) -> std::thread::JoinHandle<protocol::CommandResult> {
-        std::thread::spawn(move || {
-            let mut output = Vec::new();
-            commands::execute(
-                &protocol::HelperCommand::TestSleep { seconds },
-                &ctx,
-                &mut output,
-            )
-        })
-    }
-
-    /// Build a TestHelper that exposes its Context for in-process write
-    /// dispatch (TestSleep bypasses the wire layer).
+    /// A TestHelper plus its Context, for in-process write dispatch.
     struct TestHelperWithCtx {
         helper: TestHelper,
         ctx: Arc<commands::Context>,
     }
 
     impl TestHelperWithCtx {
+        /// At the production cancel grace.
         fn start() -> Self {
+            Self::start_with_grace(commands::CANCEL_GRACEFUL_TIMEOUT)
+        }
+
+        fn start_with_grace(cancel_grace: Duration) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let sock_path = dir.path().join("test.sock");
             let log_path = dir.path().join("helper.log");
@@ -1122,7 +1204,7 @@ mod concurrency_tests {
             let listener = UnixListener::bind(&sock_path).unwrap();
             listener.set_nonblocking(true).unwrap();
 
-            let ctx = Arc::new(build_test_context(dir.path()));
+            let ctx = Arc::new(commands::test_context_with_grace(dir.path(), cancel_grace));
             let audit_log = Arc::new(logging::AuditLog::new(&log_path).unwrap());
             let token_arc = Arc::new(token.clone());
             let shutdown = Arc::new(AtomicBool::new(false));
@@ -1130,6 +1212,7 @@ mod concurrency_tests {
             let last_reject_ms = Arc::new(AtomicI64::new(0));
 
             let shutdown_clone = Arc::clone(&shutdown);
+            let conn_count_loop = Arc::clone(&conn_count);
             let ctx_for_thread = Arc::clone(&ctx);
             let accept_thread = std::thread::spawn(move || loop {
                 if shutdown_clone.load(Ordering::Relaxed) {
@@ -1138,9 +1221,9 @@ mod concurrency_tests {
                 match listener.accept() {
                     Ok((stream, _)) => {
                         stream.set_nonblocking(false).unwrap();
-                        let current = conn_count.fetch_add(1, Ordering::SeqCst);
+                        let current = conn_count_loop.fetch_add(1, Ordering::SeqCst);
                         if current >= MAX_CONCURRENT_CONNECTIONS {
-                            conn_count.fetch_sub(1, Ordering::SeqCst);
+                            conn_count_loop.fetch_sub(1, Ordering::SeqCst);
                             maybe_log_cap_reject(&audit_log, &last_reject_ms);
                             drop(stream);
                             continue;
@@ -1148,7 +1231,7 @@ mod concurrency_tests {
                         let token_clone = Arc::clone(&token_arc);
                         let ctx_clone = Arc::clone(&ctx_for_thread);
                         let audit_clone = Arc::clone(&audit_log);
-                        let conn_count_clone = Arc::clone(&conn_count);
+                        let conn_count_clone = Arc::clone(&conn_count_loop);
                         std::thread::spawn(move || {
                             let _guard = ConnGuard {
                                 counter: conn_count_clone,
@@ -1157,6 +1240,8 @@ mod concurrency_tests {
                                 handle_connection(stream, &token_clone, &ctx_clone, &audit_clone);
                         });
                     }
+                    // Accept-loop idle poll (the production loop's shape), not
+                    // a test synchronization.
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(10));
                     }
@@ -1168,6 +1253,7 @@ mod concurrency_tests {
                 sock_path,
                 token,
                 log_path,
+                conn_count,
                 shutdown,
                 _dir: dir,
                 accept_thread: Some(accept_thread),
@@ -1175,18 +1261,32 @@ mod concurrency_tests {
             Self { helper, ctx }
         }
 
-        fn status_json(&self) -> String {
-            format!(r#"{{"token":"{}","command":"status"}}"#, self.helper.token)
+        /// Send wire verb `verb` with the valid token; its final result.
+        fn command(&self, verb: &str) -> CommandResult {
+            let json = format!(r#"{{"token":"{}","command":"{verb}"}}"#, self.helper.token);
+            Self::parse_result(&self.helper.request(&json))
         }
 
-        fn cancel_json(&self) -> String {
-            format!(r#"{{"token":"{}","command":"cancel"}}"#, self.helper.token)
+        fn status(&self) -> serde_json::Value {
+            self.command("status").data.expect("status data missing")
+        }
+
+        /// Send `cancel` and return its data (`cancelled`, `op`, …).
+        fn cancel(&self) -> serde_json::Value {
+            self.command("cancel").data.expect("cancel data missing")
+        }
+
+        /// Send `cancel` and require that it hit an in-flight write.
+        fn cancel_in_flight(&self) {
+            let data = self.cancel();
+            assert_eq!(
+                data["cancelled"],
+                serde_json::Value::Bool(true),
+                "cancel did not find the held write: {data}"
+            );
         }
 
         /// Parse the LAST line of an NDJSON response stream as a CommandResult.
-        /// Helpers in `#[cfg(test)]` are allowed to panic on assertion-style
-        /// failures via `expect`; this helper turns a missing CommandResult
-        /// line into a failed test.
         fn parse_result(lines: &[String]) -> CommandResult {
             lines
                 .iter()
@@ -1201,11 +1301,9 @@ mod concurrency_tests {
                 .next()
                 .unwrap_or_else(|| {
                     let dump = lines.join("");
-                    eprintln!("test failure: no CommandResult line found in {dump}");
-                    // Test-only failure path; allow panic in cfg(test) helper.
-                    #[allow(clippy::panic)]
+                    #[expect(clippy::panic, reason = "test harness: fail loudly with context")]
                     {
-                        panic!("no CommandResult line found")
+                        panic!("no CommandResult line found in {dump}")
                     }
                 })
         }
@@ -1228,59 +1326,84 @@ mod concurrency_tests {
                 .next()
                 .unwrap_or_else(|| {
                     let dump = lines.join("");
-                    eprintln!("test failure: no Response line found in {dump}");
-                    #[allow(clippy::panic)]
+                    #[expect(clippy::panic, reason = "test harness: fail loudly with context")]
                     {
-                        panic!("no Response line found")
+                        panic!("no Response line found in {dump}")
                     }
                 })
         }
     }
 
+    fn string_args(v: &serde_json::Value) -> Vec<String> {
+        v.as_array()
+            .expect("args is an array")
+            .iter()
+            .map(|a| a.as_str().expect("arg is a string").to_string())
+            .collect()
+    }
+
+    fn audit_args(entry: &serde_json::Value) -> Vec<String> {
+        string_args(&entry["args"])
+    }
+
+    /// The `cancel` audit entry with outcome `completed` (it hit a write).
+    fn completed_cancel_entry(h: &TestHelperWithCtx) -> serde_json::Value {
+        let entries = h.helper.read_audit_log();
+        entries
+            .iter()
+            .find(|e| e["cmd"] == "cancel" && e["outcome"] == "completed")
+            .cloned()
+            .unwrap_or_else(|| {
+                #[expect(clippy::panic, reason = "test harness: fail loudly with context")]
+                {
+                    panic!("no completed cancel entry in {entries:#?}")
+                }
+            })
+    }
+
+    /// The write ended by cancel, with EXACTLY the error string
+    /// `handle_connection` would copy into the audit entry — derived from
+    /// `HelperError::Cancelled`'s Display (whose Obs O3 `cancelled` prefix is
+    /// pinned in error.rs), so no literal can drift. `escalated` says which
+    /// path ended it: SIGTERM alone, or the SIGKILL escalation.
+    fn assert_cancelled(result: &CommandResult, escalated: bool) {
+        assert_eq!(
+            result.error_kind.as_deref(),
+            Some("cancelled"),
+            "{result:?}"
+        );
+        assert_eq!(
+            result.error.as_deref(),
+            Some(HelperError::Cancelled { escalated }.to_string().as_str()),
+            "expected the {} cancel path: {result:?}",
+            if escalated {
+                "SIGKILL-escalated"
+            } else {
+                "SIGTERM-only"
+            }
+        );
+    }
+
     // --- Test (a): concurrent reads during long-running write ---
 
+    /// Status does not wait for an in-flight write: the write cannot end until
+    /// the test cancels it, so a status that waited on it would never return —
+    /// and it returns showing the write in flight.
     #[test]
     fn test_status_does_not_block_on_write() {
         let h = TestHelperWithCtx::start();
-        // Spawn a 10s TestSleep write directly (TestSleep has no parse arm).
-        let write_handle = spawn_test_sleep_write(Arc::clone(&h.ctx), 10);
+        let w = HeldWrite::spawn(&h.ctx, HoldShape::Plain);
 
-        // Wait for the write to claim the slot.
-        let mut claimed = false;
-        for _ in 0..50 {
-            if h.ctx.snapshot_busy().is_some() {
-                claimed = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert!(claimed, "write did not claim the slot in time");
-
-        // No wall clock: status snapshots the busy hint first, so a status that
-        // waited on the write would report busy=false. busy=true plus the write
-        // still holding the slot afterwards proves the read did not block.
-        let lines = h.helper.request(&h.status_json());
-        let result = TestHelperWithCtx::parse_result(&lines);
-        let data = result.data.expect("status data missing");
+        let data = h.status();
         assert_eq!(data["busy"], serde_json::Value::Bool(true), "got: {data}");
         let in_flight = &data["in_flight"];
-        assert_eq!(in_flight["op"], "test-sleep", "got: {data}");
-        assert_eq!(
-            in_flight["args"][0], "10",
-            "in_flight.args mismatch: {data}"
-        );
-        // started_at parses as RFC3339.
+        assert_eq!(in_flight["op"], "test-hold", "got: {data}");
+        assert_eq!(string_args(&in_flight["args"]), w.args(), "got: {data}");
         let started_at = in_flight["started_at"].as_str().unwrap();
         chrono::DateTime::parse_from_rfc3339(started_at).expect("started_at not RFC3339");
-        assert!(
-            h.ctx.snapshot_busy().is_some(),
-            "write finished before status returned"
-        );
 
-        // Cancel the write to clean up quickly.
-        let cancel = h.helper.request(&h.cancel_json());
-        let _ = TestHelperWithCtx::parse_result(&cancel);
-        let _ = write_handle.join().unwrap();
+        h.cancel_in_flight();
+        assert_cancelled(&w.join(), false);
     }
 
     // --- Test (b): write-while-write returns busy ---
@@ -1288,78 +1411,30 @@ mod concurrency_tests {
     #[test]
     fn test_write_while_write_returns_busy() {
         let h = TestHelperWithCtx::start();
-        let write_handle = spawn_test_sleep_write(Arc::clone(&h.ctx), 5);
+        let w = HeldWrite::spawn(&h.ctx, HoldShape::Plain);
 
-        // Wait for the write to claim the slot.
-        for _ in 0..50 {
-            if h.ctx.snapshot_busy().is_some() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert!(h.ctx.snapshot_busy().is_some());
-
-        // Try a real wire write (deploy).
-        let deploy_json = format!(r#"{{"token":"{}","command":"deploy"}}"#, h.helper.token);
-        let lines = h.helper.request(&deploy_json);
-        let result = TestHelperWithCtx::parse_result(&lines);
+        let result = h.command("deploy");
         assert_eq!(result.error_kind.as_deref(), Some("busy"));
         let data = result.data.expect("busy data missing");
-        assert_eq!(data["op"], "test-sleep");
-        assert_eq!(data["args"][0], "5");
+        assert_eq!(data["op"], "test-hold");
+        assert_eq!(string_args(&data["args"]), w.args());
 
-        // Cleanup.
-        let _ = h.helper.request(&h.cancel_json());
-        let _ = write_handle.join().unwrap();
+        w.release();
+        assert_eq!(w.join().exit_code, Some(0));
     }
 
     // --- Test (c): cancel mid-write terminates the handler ---
 
+    /// SIGTERM alone ends a cancelled write: under NEVER_ESCALATE no SIGKILL can
+    /// arrive before the wait deadline, so a broken SIGTERM/pgid path fails
+    /// here instead of being rescued by escalation.
     #[test]
     fn test_cancel_mid_write_terminates_handler() {
-        let h = TestHelperWithCtx::start();
-        let write_handle = spawn_test_sleep_write(Arc::clone(&h.ctx), 30);
-
-        // Wait for the write to claim the slot, then 200ms of "real work".
-        for _ in 0..50 {
-            if h.ctx.snapshot_busy().is_some() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert!(h.ctx.snapshot_busy().is_some());
-        std::thread::sleep(Duration::from_millis(200));
-
-        // Cancel returns immediately.
-        let cancel_start = Instant::now();
-        let cancel_lines = h.helper.request(&h.cancel_json());
-        let cancel_elapsed = cancel_start.elapsed();
-        let cancel_result = TestHelperWithCtx::parse_result(&cancel_lines);
-        let cancel_data = cancel_result.data.expect("cancel data missing");
-        assert_eq!(cancel_data["cancelled"], serde_json::Value::Bool(true));
-        assert!(
-            cancel_elapsed < Duration::from_secs(1),
-            "cancel took too long: {cancel_elapsed:?}"
-        );
-
-        // Write resolves with cancelled within ~3s (SIGTERM-then-2s-SIGKILL slack).
-        let write_start = Instant::now();
-        let write_result = write_handle.join().unwrap();
-        let write_elapsed = write_start.elapsed();
-        assert!(
-            write_elapsed < Duration::from_secs(3),
-            "write didn't terminate within 3s: {write_elapsed:?}"
-        );
-        assert_eq!(write_result.error_kind.as_deref(), Some("cancelled"));
-        assert!(
-            write_result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .starts_with("cancelled"),
-            "got: {:?}",
-            write_result.error
-        );
+        let h = TestHelperWithCtx::start_with_grace(NEVER_ESCALATE);
+        let w = HeldWrite::spawn(&h.ctx, HoldShape::Plain);
+        h.cancel_in_flight();
+        assert_cancelled(&w.join(), false);
+        assert!(h.ctx.snapshot_busy().is_none(), "slot not released");
     }
 
     // --- Test (d): cancel when idle is no-op ---
@@ -1367,8 +1442,7 @@ mod concurrency_tests {
     #[test]
     fn test_cancel_when_idle_is_noop() {
         let h = TestHelperWithCtx::start();
-        let lines = h.helper.request(&h.cancel_json());
-        let result = TestHelperWithCtx::parse_result(&lines);
+        let result = h.command("cancel");
         assert_eq!(result.error_kind, None);
         assert_eq!(result.exit_code, Some(0));
         let data = result.data.expect("no-op data missing");
@@ -1381,17 +1455,13 @@ mod concurrency_tests {
     #[test]
     fn test_cancel_after_write_completes_is_noop() {
         let h = TestHelperWithCtx::start();
-        // Run a 1s write to completion.
-        let write_result = spawn_test_sleep_write(Arc::clone(&h.ctx), 1)
-            .join()
-            .unwrap();
-        assert_eq!(write_result.exit_code, Some(0));
+        let w = HeldWrite::spawn(&h.ctx, HoldShape::Plain);
+        w.release();
+        assert_eq!(w.join().exit_code, Some(0));
         // Slot is cleared by WriteSlotGuard::drop.
         assert!(h.ctx.snapshot_busy().is_none());
         // Cancel sees nothing in flight.
-        let lines = h.helper.request(&h.cancel_json());
-        let result = TestHelperWithCtx::parse_result(&lines);
-        let data = result.data.expect("no-op data missing");
+        let data = h.cancel();
         assert_eq!(data["cancelled"], serde_json::Value::Bool(false));
         assert_eq!(data["reason"], "no-op");
     }
@@ -1400,19 +1470,14 @@ mod concurrency_tests {
     fn test_repeated_cancel_when_idle() {
         let h = TestHelperWithCtx::start();
         for _ in 0..5 {
-            let lines = h.helper.request(&h.cancel_json());
-            let result = TestHelperWithCtx::parse_result(&lines);
-            let data = result.data.expect("no-op data missing");
-            assert_eq!(data["cancelled"], serde_json::Value::Bool(false));
+            assert_eq!(h.cancel()["cancelled"], serde_json::Value::Bool(false));
         }
     }
 
     #[test]
     fn test_status_when_idle_busy_false() {
         let h = TestHelperWithCtx::start();
-        let lines = h.helper.request(&h.status_json());
-        let result = TestHelperWithCtx::parse_result(&lines);
-        let data = result.data.expect("status data missing");
+        let data = h.status();
         assert_eq!(data["busy"], serde_json::Value::Bool(false), "got: {data}");
         // Per CR11: in_flight is literally null (not absent) when idle.
         assert_eq!(data["in_flight"], serde_json::Value::Null, "got: {data}");
@@ -1426,23 +1491,15 @@ mod concurrency_tests {
 
     /// `cluster_write_in_progress` must reflect the mutex view, not the legacy
     /// `setup.pid` heuristic. Asserts that a write that is NOT a cluster write
-    /// (TestSleep) leaves it false while `busy=true`; the positive set is
-    /// pinned by `commands::tests::is_cluster_write_exact_set`.
+    /// (TestHold) leaves it false while `busy=true`; the positive set is
+    /// pinned by `commands::tests::is_cluster_write_exact_set` and the probe
+    /// window by `commands::tests::observe_cluster_writes_around_*`.
     #[test]
     fn test_status_cluster_write_in_progress_only_for_cluster_writes() {
         let h = TestHelperWithCtx::start();
-        let write_handle = spawn_test_sleep_write(Arc::clone(&h.ctx), 5);
-        for _ in 0..50 {
-            if h.ctx.snapshot_busy().is_some() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert!(h.ctx.snapshot_busy().is_some());
+        let w = HeldWrite::spawn(&h.ctx, HoldShape::Plain);
 
-        let lines = h.helper.request(&h.status_json());
-        let result = TestHelperWithCtx::parse_result(&lines);
-        let data = result.data.expect("status data missing");
+        let data = h.status();
         assert_eq!(data["busy"], serde_json::Value::Bool(true), "got: {data}");
         assert_eq!(
             data["cluster_write_in_progress"],
@@ -1450,28 +1507,17 @@ mod concurrency_tests {
             "a non-cluster write in flight must not show cluster_write_in_progress=true: {data}",
         );
 
-        // Cancel and reap.
-        let _ = h.helper.request(&h.cancel_json());
-        let _ = write_handle.join();
+        w.release();
+        assert_eq!(w.join().exit_code, Some(0));
     }
 
     #[test]
     fn test_busy_rejection_is_audit_logged() {
         let h = TestHelperWithCtx::start();
-        let write_handle = spawn_test_sleep_write(Arc::clone(&h.ctx), 5);
-        for _ in 0..50 {
-            if h.ctx.snapshot_busy().is_some() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert!(h.ctx.snapshot_busy().is_some());
+        let w = HeldWrite::spawn(&h.ctx, HoldShape::Plain);
 
-        let deploy_json = format!(r#"{{"token":"{}","command":"deploy"}}"#, h.helper.token);
-        let _ = h.helper.request(&deploy_json);
+        let _ = h.command("deploy");
 
-        // Give the audit log a moment to flush.
-        std::thread::sleep(Duration::from_millis(100));
         let entries = h.helper.read_audit_log();
         let busy_entries: Vec<_> = entries
             .iter()
@@ -1485,64 +1531,48 @@ mod concurrency_tests {
         assert_eq!(entry["outcome"], "rejected");
         assert!(entry.get("error").map(|v| v.is_null()).unwrap_or(true));
         // Args should contain all four collision-pair keyed strings.
-        let args: Vec<&str> = entry["args"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
+        let args = audit_args(entry);
         assert!(
             args.iter().any(|a| a.starts_with("rejected=deploy")),
             "got: {args:?}"
         );
-        assert!(args.contains(&"rejected_args="), "got: {args:?}");
         assert!(
-            args.iter().any(|a| a.starts_with("in_flight=test-sleep")),
+            args.contains(&"rejected_args=".to_string()),
             "got: {args:?}"
         );
-        assert!(args.contains(&"in_flight_args=5"), "got: {args:?}");
+        assert!(
+            args.iter().any(|a| a.starts_with("in_flight=test-hold")),
+            "got: {args:?}"
+        );
+        assert!(
+            args.contains(&format!("in_flight_args={}", w.args().join(" "))),
+            "got: {args:?}"
+        );
 
-        let _ = h.helper.request(&h.cancel_json());
-        let _ = write_handle.join().unwrap();
+        w.release();
+        assert_eq!(w.join().exit_code, Some(0));
     }
 
     #[test]
     fn test_cancel_completed_is_audit_logged() {
         let h = TestHelperWithCtx::start();
-        let write_handle = spawn_test_sleep_write(Arc::clone(&h.ctx), 30);
-        for _ in 0..50 {
-            if h.ctx.snapshot_busy().is_some() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        let _ = h.helper.request(&h.cancel_json());
-        std::thread::sleep(Duration::from_millis(100));
-        let entries = h.helper.read_audit_log();
-        let cancel_entry = entries
-            .iter()
-            .find(|e| e["cmd"] == "cancel")
-            .expect("no cancel entry");
-        assert_eq!(cancel_entry["outcome"], "completed");
-        assert_eq!(cancel_entry["error"], "test-sleep");
-        let args: Vec<&str> = cancel_entry["args"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
+        let w = HeldWrite::spawn(&h.ctx, HoldShape::Plain);
+        h.cancel_in_flight();
+
+        let cancel_entry = completed_cancel_entry(&h);
+        assert_eq!(cancel_entry["error"], "test-hold");
+        let args = audit_args(&cancel_entry);
         assert!(
-            args.iter().any(|a| a.starts_with("target=test-sleep")),
+            args.iter().any(|a| a.starts_with("target=test-hold")),
             "got: {args:?}"
         );
-        let _ = write_handle.join().unwrap();
+        assert_cancelled(&w.join(), false);
     }
 
     #[test]
     fn test_cancel_noop_is_audit_logged() {
         let h = TestHelperWithCtx::start();
-        let _ = h.helper.request(&h.cancel_json());
-        std::thread::sleep(Duration::from_millis(100));
+        let _ = h.cancel();
         let entries = h.helper.read_audit_log();
         let cancel_entry = entries
             .iter()
@@ -1552,58 +1582,33 @@ mod concurrency_tests {
         assert_eq!(cancel_entry["error"], "none");
     }
 
+    /// The `target_args=<args>` token of a completed cancel's audit entry.
+    fn cancel_target_args(cancel_entry: &serde_json::Value) -> String {
+        audit_args(cancel_entry)
+            .iter()
+            .find_map(|s| s.strip_prefix("target_args=").map(str::to_string))
+            .expect("no target_args in cancel entry")
+    }
+
     /// Obs O4: status's in-flight view and the audit log's record agree.
     /// `cancel`'s audit entry includes `target_args=<args>` derived from the
     /// in-flight op — that's the same source as status's `in_flight.args`,
-    /// so they MUST match. (test-sleep itself is invoked in-process via
+    /// so they MUST match. (The write itself is invoked in-process via
     /// `commands::execute`, bypassing handle_connection's audit log; the
     /// cancel entry below is the cross-source pin.)
     #[test]
     fn test_status_audit_drift_invariant() {
         let h = TestHelperWithCtx::start();
-        let write_handle = spawn_test_sleep_write(Arc::clone(&h.ctx), 10);
-        for _ in 0..50 {
-            if h.ctx.snapshot_busy().is_some() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        // Read status to capture in_flight.args.
-        let lines = h.helper.request(&h.status_json());
-        let result = TestHelperWithCtx::parse_result(&lines);
-        let data = result.data.expect("status data");
-        let status_args: Vec<String> = data["in_flight"]["args"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap().to_string())
-            .collect();
-        // Cancel writes an audit entry whose `args` carries `target_args=<args>`
-        // — that string IS the join of the in-flight op's args.
-        let _ = h.helper.request(&h.cancel_json());
-        let _ = write_handle.join().unwrap();
-        std::thread::sleep(Duration::from_millis(100));
+        let w = HeldWrite::spawn(&h.ctx, HoldShape::Plain);
 
-        let entries = h.helper.read_audit_log();
-        let cancel_entry = entries
-            .iter()
-            .find(|e| e["cmd"] == "cancel" && e["outcome"] == "completed")
-            .expect("no completed cancel entry");
-        let cancel_args: Vec<&str> = cancel_entry["args"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
-        let target_args = cancel_args
-            .iter()
-            .find(|s| s.starts_with("target_args="))
-            .expect("no target_args in cancel entry")
-            .strip_prefix("target_args=")
-            .unwrap();
-        // Status reported `["10"]`; audit's `target_args=` is the joined string.
+        let status_args = string_args(&h.status()["in_flight"]["args"]);
+        assert_eq!(status_args, w.args(), "status reports the write's args");
+
+        h.cancel_in_flight();
+        assert_cancelled(&w.join(), false);
+
         assert_eq!(
-            target_args,
+            cancel_target_args(&completed_cancel_entry(&h)),
             status_args.join(" "),
             "status's in_flight.args does not match cancel audit's target_args"
         );
@@ -1628,26 +1633,20 @@ mod concurrency_tests {
 
         // Hold MAX_CONCURRENT_CONNECTIONS streams open without writing a
         // newline. handle_connection's read_line blocks until EOF/newline
-        // arrives, so each accepted connection consumes a slot until we drop
+        // arrives, so each accepted connection holds a slot until we drop
         // the client end at test cleanup.
-        let mut holders: Vec<UnixStream> = Vec::with_capacity(MAX_CONCURRENT_CONNECTIONS);
-        for _ in 0..MAX_CONCURRENT_CONNECTIONS {
-            let client = UnixStream::connect(&h.helper.sock_path).unwrap();
-            holders.push(client);
-            // Short sleep lets the accept loop pick up the connection and
-            // increment the counter before we try the next one.
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        // Extra slack so all 32 are definitely accepted server-side.
-        std::thread::sleep(Duration::from_millis(100));
+        let holders: Vec<UnixStream> = (0..MAX_CONCURRENT_CONNECTIONS)
+            .map(|_| UnixStream::connect(&h.helper.sock_path).unwrap())
+            .collect();
+        poll_until("the server to accept every held connection", || {
+            h.helper.conn_count.load(Ordering::SeqCst) == MAX_CONCURRENT_CONNECTIONS
+        });
 
-        // The 33rd connection should be accepted then immediately closed by
-        // the server (drop(stream) after fetch_sub). Reading from it returns
-        // EOF (0 bytes) without any response payload.
+        // The 33rd connection is accepted then immediately closed by the
+        // server (drop(stream) after fetch_sub). Reading from it returns EOF
+        // (0 bytes) without any response payload.
         let rejected = UnixStream::connect(&h.helper.sock_path).unwrap();
-        rejected
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .unwrap();
+        rejected.set_read_timeout(Some(WAIT_DEADLINE)).unwrap();
         let mut buf = [0u8; 64];
         let n = (&rejected).read(&mut buf).unwrap_or(usize::MAX);
         assert_eq!(
@@ -1657,10 +1656,8 @@ mod concurrency_tests {
             &buf[..n.min(64)]
         );
 
-        // Audit log: one cap-rejection entry. The dedup window is 1s, but
-        // there's only one over-cap connection in this test so dedup doesn't
-        // matter.
-        std::thread::sleep(Duration::from_millis(100));
+        // Audit log: one cap-rejection entry (logged before the EOF above).
+        // The dedup window is 1s, but there's only one over-cap connection.
         let entries = h.helper.read_audit_log();
         let cap_rejections: Vec<_> = entries
             .iter()
@@ -1679,212 +1676,43 @@ mod concurrency_tests {
     }
 
     /// Security S5 + Obs O3: a child that ignores SIGTERM forces the
-    /// 2s-grace-then-SIGKILL escalation path. The error string carries the
-    /// `(sigterm timeout, escalated to sigkill)` suffix from
-    /// `HelperError::Cancelled { escalated: true }`.
+    /// grace-then-SIGKILL escalation path (production grace). The error string
+    /// carries the `(sigterm timeout, escalated to sigkill)` suffix from
+    /// `HelperError::Cancelled { escalated: true }` — the escalation event.
     #[test]
     fn test_sigkill_escalation_logged() {
         let h = TestHelperWithCtx::start();
-
-        // Sleep duration must comfortably exceed CANCEL_GRACEFUL_TIMEOUT (2s)
-        // so the child is still alive when the grace window expires.
-        let write_handle = std::thread::spawn({
-            let ctx = Arc::clone(&h.ctx);
-            move || {
-                let mut output = Vec::new();
-                commands::execute(
-                    &protocol::HelperCommand::TestSleepIgnoringTerm { seconds: 30 },
-                    &ctx,
-                    &mut output,
-                )
-            }
-        });
-
-        // Wait for the write to claim the slot.
-        for _ in 0..100 {
-            if h.ctx.snapshot_busy().is_some() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert!(h.ctx.snapshot_busy().is_some());
-        // Let the shell install the trap before we cancel.
-        std::thread::sleep(Duration::from_millis(200));
-
-        // Cancel — SIGTERM is delivered but ignored; after 2s the streaming
-        // loop escalates to SIGKILL.
-        let cancel_lines = h.helper.request(&h.cancel_json());
-        let cancel_result = TestHelperWithCtx::parse_result(&cancel_lines);
-        assert_eq!(
-            cancel_result
-                .data
-                .as_ref()
-                .and_then(|d| d["cancelled"].as_bool()),
-            Some(true),
-            "cancel did not report cancelled=true: {cancel_result:?}"
-        );
-
-        // Write resolves with escalated cancellation. Must complete within
-        // grace + slack (≈3s).
-        let start = Instant::now();
-        let write_result = write_handle.join().unwrap();
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed < Duration::from_secs(5),
-            "escalation path took too long: {elapsed:?}"
-        );
-        assert_eq!(write_result.error_kind.as_deref(), Some("cancelled"));
-        let err_str = write_result
-            .error
-            .as_deref()
-            .expect("cancelled write must carry an error string");
-        assert!(
-            err_str.starts_with("cancelled (sigterm timeout, escalated to sigkill)"),
-            "expected SIGKILL-escalated suffix, got: {err_str:?}"
-        );
+        let w = HeldWrite::spawn(&h.ctx, HoldShape::IgnoringTerm);
+        h.cancel_in_flight();
+        assert_cancelled(&w.join(), true);
     }
 
     // --- Iter-2: process-group cancel reaches grandchildren ---
 
-    /// Iter-2 headline test: a `bash -c 'sleep 30 & wait'` write spawns a
-    /// grandchild `sleep` that inherits stdout/stderr. Without
-    /// `Command::process_group(0)` + `kill(-pgid, SIGTERM)`, killing only
-    /// `bash` would leave `sleep` holding the pipes for ~30s. The pgid
-    /// signal reaches the grandchild and cancel completes promptly.
+    /// Iter-2 headline test: the holder is a backgrounded grandchild that
+    /// inherits stdout/stderr. Without `Command::process_group(0)` +
+    /// `kill(-pgid, SIGTERM)`, killing only the immediate shell would leave the
+    /// grandchild holding the pipes, and (latch never released, NEVER_ESCALATE so
+    /// no SIGKILL) the write would never end — failing at the wait deadline.
     #[test]
     fn test_cancel_kills_grandchild_holding_pipes() {
-        let h = TestHelperWithCtx::start();
-
-        let write_handle = std::thread::spawn({
-            let ctx = Arc::clone(&h.ctx);
-            move || {
-                let mut output = Vec::new();
-                commands::execute(
-                    &protocol::HelperCommand::TestSleepWithChild { seconds: 30 },
-                    &ctx,
-                    &mut output,
-                )
-            }
-        });
-
-        // Wait for the write to claim the slot + bash to fork the sleep.
-        for _ in 0..100 {
-            if h.ctx.snapshot_busy().is_some() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert!(h.ctx.snapshot_busy().is_some());
-        // Let bash fork the `sleep` grandchild before we cancel.
-        std::thread::sleep(Duration::from_millis(200));
-
-        let cancel_start = Instant::now();
-        let cancel_lines = h.helper.request(&h.cancel_json());
-        let cancel_result = TestHelperWithCtx::parse_result(&cancel_lines);
-        assert_eq!(
-            cancel_result
-                .data
-                .as_ref()
-                .and_then(|d| d["cancelled"].as_bool()),
-            Some(true),
-            "cancel did not report cancelled=true: {cancel_result:?}"
-        );
-
-        // Write resolves with cancellation. Without pgid signalling this
-        // would block ~30s (waiting for the orphaned `sleep` grandchild
-        // to release the pipes). With pgid the bash + sleep both die on
-        // SIGTERM and the read loop sees EOF promptly.
-        let write_result = write_handle.join().unwrap();
-        let elapsed = cancel_start.elapsed();
-        assert!(
-            elapsed < Duration::from_secs(5),
-            "process-group cancel took too long (regression: grandchild orphaned?): {elapsed:?}"
-        );
-        assert_eq!(
-            write_result.error_kind.as_deref(),
-            Some("cancelled"),
-            "expected cancelled error_kind, got: {write_result:?}"
-        );
-        // Obs O3 prefix invariant — clean-SIGTERM error must start with
-        // "cancelled". This is the same string handle_connection copies into
-        // the audit-log entry's `error` field (see main.rs `outcome` mapping).
-        let err_str = write_result
-            .error
-            .as_deref()
-            .expect("cancelled write must carry an error string");
-        assert!(
-            err_str.starts_with("cancelled"),
-            "Obs O3 prefix invariant: clean-SIGTERM error must start with `cancelled`, got: {err_str:?}"
-        );
-        // Pin the absence of the SIGKILL-escalation suffix — clean PG-SIGTERM
-        // should NOT escalate. If a future regression breaks the SIGTERM-pgid
-        // path (e.g., setpgid not configured correctly on the child), the
-        // SIGKILL-pgid escalation would silently take over and the timing
-        // assertion alone would still pass. This negative assertion forces
-        // the SIGTERM path to remain load-bearing.
-        assert!(
-            !err_str.starts_with("cancelled (sigterm timeout, escalated to sigkill)"),
-            "PG-SIGTERM should kill bash+sleep promptly without SIGKILL escalation, got: {err_str:?}"
-        );
+        let h = TestHelperWithCtx::start_with_grace(NEVER_ESCALATE);
+        let w = HeldWrite::spawn(&h.ctx, HoldShape::WithChild);
+        h.cancel_in_flight();
+        // Also pins the absence of the SIGKILL suffix: the SIGTERM-pgid path
+        // alone must end it.
+        assert_cancelled(&w.join(), false);
     }
 
-    /// Iter-2: TERM-trapped bash with a backgrounded `sleep` grandchild
-    /// forces both the SIGKILL escalation branch AND the grandchild reach
-    /// via process-group SIGKILL. Cancel must still complete within ~grace
-    /// + slack (~7s upper bound).
+    /// Iter-2: TERM-trapped shell with a backgrounded TERM-ignoring
+    /// grandchild forces both the SIGKILL escalation branch AND the grandchild
+    /// reach via process-group SIGKILL (production grace).
     #[test]
     fn test_cancel_kills_grandchild_with_sigkill_escalation() {
         let h = TestHelperWithCtx::start();
-
-        let write_handle = std::thread::spawn({
-            let ctx = Arc::clone(&h.ctx);
-            move || {
-                let mut output = Vec::new();
-                commands::execute(
-                    &protocol::HelperCommand::TestSleepWithChildIgnoringTerm { seconds: 30 },
-                    &ctx,
-                    &mut output,
-                )
-            }
-        });
-
-        for _ in 0..100 {
-            if h.ctx.snapshot_busy().is_some() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert!(h.ctx.snapshot_busy().is_some());
-        // Let the shell install the trap and fork the `sleep`.
-        std::thread::sleep(Duration::from_millis(200));
-
-        let cancel_start = Instant::now();
-        let cancel_lines = h.helper.request(&h.cancel_json());
-        let cancel_result = TestHelperWithCtx::parse_result(&cancel_lines);
-        assert_eq!(
-            cancel_result
-                .data
-                .as_ref()
-                .and_then(|d| d["cancelled"].as_bool()),
-            Some(true),
-            "cancel did not report cancelled=true: {cancel_result:?}"
-        );
-
-        let write_result = write_handle.join().unwrap();
-        let elapsed = cancel_start.elapsed();
-        assert!(
-            elapsed < Duration::from_secs(7),
-            "SIGKILL-pgid path took too long (regression): {elapsed:?}"
-        );
-        assert_eq!(write_result.error_kind.as_deref(), Some("cancelled"));
-        let err_str = write_result
-            .error
-            .as_deref()
-            .expect("cancelled write must carry an error string");
-        assert!(
-            err_str.starts_with("cancelled (sigterm timeout, escalated to sigkill)"),
-            "expected SIGKILL-escalated suffix, got: {err_str:?}"
-        );
+        let w = HeldWrite::spawn(&h.ctx, HoldShape::WithChildIgnoringTerm);
+        h.cancel_in_flight();
+        assert_cancelled(&w.join(), true);
     }
 
     // --- Iter-2: cancel_pending field on status response ---
@@ -1895,84 +1723,47 @@ mod concurrency_tests {
     /// released, `cancel_pending` returns to false (and `busy` to false,
     /// `in_flight` to null).
     ///
-    /// Uses `TestSleepIgnoringTerm` (5s busy-loop) to widen the SIGTERM-
-    /// grace + drain observation window — the writer enters the 2s grace
-    /// after SIGTERM, then escalates to SIGKILL. Status during that 2s
-    /// window observes `cancel_pending=true`.
+    /// The TERM-ignoring hold under NEVER_ESCALATE stays in flight after cancel
+    /// until the test releases it, so the pending window is held open by the
+    /// test, not by a clock. That cancel returned while the write still holds
+    /// the slot is also the proof that cancel does not wait for the writer.
     #[test]
     fn test_cancel_pending_visible_in_status() {
-        let h = TestHelperWithCtx::start();
-
-        let write_handle = std::thread::spawn({
-            let ctx = Arc::clone(&h.ctx);
-            move || {
-                let mut output = Vec::new();
-                commands::execute(
-                    &protocol::HelperCommand::TestSleepIgnoringTerm { seconds: 5 },
-                    &ctx,
-                    &mut output,
-                )
-            }
-        });
-
-        // Wait for the write to claim the slot.
-        for _ in 0..100 {
-            if h.ctx.snapshot_busy().is_some() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert!(h.ctx.snapshot_busy().is_some());
-        // Let the shell install the TERM trap.
-        std::thread::sleep(Duration::from_millis(150));
+        let h = TestHelperWithCtx::start_with_grace(NEVER_ESCALATE);
+        let w = HeldWrite::spawn(&h.ctx, HoldShape::IgnoringTerm);
 
         // Status before cancel: busy=true, cancel_pending=false.
-        {
-            let lines = h.helper.request(&h.status_json());
-            let result = TestHelperWithCtx::parse_result(&lines);
-            let data = result.data.as_ref().expect("status data");
-            assert_eq!(data["busy"], serde_json::Value::Bool(true));
-            assert_eq!(data["cancel_pending"], serde_json::Value::Bool(false));
-        }
-
-        // Send cancel (returns immediately).
-        let cancel_lines = h.helper.request(&h.cancel_json());
-        let cancel_result = TestHelperWithCtx::parse_result(&cancel_lines);
+        let data = h.status();
+        assert_eq!(data["busy"], serde_json::Value::Bool(true), "{data}");
         assert_eq!(
-            cancel_result
-                .data
-                .as_ref()
-                .and_then(|d| d["cancelled"].as_bool()),
-            Some(true),
+            data["cancel_pending"],
+            serde_json::Value::Bool(false),
+            "{data}"
         );
 
-        // Status during the SIGTERM-grace window: cancel_pending=true.
-        // The trap-ignore + 2s grace gives a wide observation window.
-        {
-            let lines = h.helper.request(&h.status_json());
-            let result = TestHelperWithCtx::parse_result(&lines);
-            let data = result.data.as_ref().expect("status data");
-            assert_eq!(data["busy"], serde_json::Value::Bool(true));
-            assert_eq!(
-                data["cancel_pending"],
-                serde_json::Value::Bool(true),
-                "expected cancel_pending=true during grace window, got: {data}"
-            );
-        }
+        h.cancel_in_flight();
 
-        // Wait for the write to terminate.
-        let write_result = write_handle.join().unwrap();
-        assert_eq!(write_result.error_kind.as_deref(), Some("cancelled"));
+        // Status after cancel returned, write still held: cancel_pending=true.
+        let data = h.status();
+        assert_eq!(data["busy"], serde_json::Value::Bool(true), "{data}");
+        assert_eq!(
+            data["cancel_pending"],
+            serde_json::Value::Bool(true),
+            "expected cancel_pending=true while the cancelled write is held: {data}"
+        );
+
+        w.release();
+        assert_cancelled(&w.join(), false);
 
         // Status after release: busy=false, cancel_pending=false, in_flight=null.
-        {
-            let lines = h.helper.request(&h.status_json());
-            let result = TestHelperWithCtx::parse_result(&lines);
-            let data = result.data.as_ref().expect("status data");
-            assert_eq!(data["busy"], serde_json::Value::Bool(false));
-            assert_eq!(data["cancel_pending"], serde_json::Value::Bool(false));
-            assert_eq!(data["in_flight"], serde_json::Value::Null);
-        }
+        let data = h.status();
+        assert_eq!(data["busy"], serde_json::Value::Bool(false), "{data}");
+        assert_eq!(
+            data["cancel_pending"],
+            serde_json::Value::Bool(false),
+            "{data}"
+        );
+        assert_eq!(data["in_flight"], serde_json::Value::Null, "{data}");
     }
 
     /// Iter-2: when busy but no cancel has been issued, status reports
@@ -1981,33 +1772,25 @@ mod concurrency_tests {
     #[test]
     fn test_cancel_pending_false_when_busy_not_cancelling() {
         let h = TestHelperWithCtx::start();
-        let write_handle = spawn_test_sleep_write(Arc::clone(&h.ctx), 3);
+        let w = HeldWrite::spawn(&h.ctx, HoldShape::Plain);
 
-        for _ in 0..100 {
-            if h.ctx.snapshot_busy().is_some() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert!(h.ctx.snapshot_busy().is_some());
+        let data = h.status();
+        assert_eq!(data["busy"], serde_json::Value::Bool(true), "{data}");
+        assert_eq!(
+            data["cancel_pending"],
+            serde_json::Value::Bool(false),
+            "{data}"
+        );
 
-        let lines = h.helper.request(&h.status_json());
-        let result = TestHelperWithCtx::parse_result(&lines);
-        let data = result.data.as_ref().expect("status data");
-        assert_eq!(data["busy"], serde_json::Value::Bool(true));
-        assert_eq!(data["cancel_pending"], serde_json::Value::Bool(false));
-
-        // Let the write complete naturally.
-        let _ = write_handle.join().unwrap();
+        w.release();
+        assert_eq!(w.join().exit_code, Some(0));
     }
 
     /// Iter-2: idle status emits `cancel_pending=false` (CR11 wire-determinism).
     #[test]
     fn test_cancel_pending_false_when_idle() {
         let h = TestHelperWithCtx::start();
-        let lines = h.helper.request(&h.status_json());
-        let result = TestHelperWithCtx::parse_result(&lines);
-        let data = result.data.as_ref().expect("status data");
+        let data = h.status();
         assert_eq!(data["busy"], serde_json::Value::Bool(false));
         assert_eq!(data["cancel_pending"], serde_json::Value::Bool(false));
         // Per CR11: cancel_pending is literally present (not absent) when idle.
@@ -2019,143 +1802,58 @@ mod concurrency_tests {
 
     /// Iter-2 (Obs O4 cancel-path extension): status's pending view, the
     /// cancel-command audit entry, and the writer's returned `CommandResult`
-    /// MUST agree across the cancel path. Specifically:
-    ///   (i)   status's `in_flight.{op,args}` during the SIGTERM-grace window
-    ///         matches the cancel audit entry's `target_args=<args>` token.
-    ///   (ii)  writer returns `error_kind == "cancelled"` and the eventual
-    ///         outcome translates to `OUTCOME_CANCELLED` per the
-    ///         handle_connection mapping at main.rs:402-417.
-    ///   (iii) writer's error string satisfies the Obs O3 prefix-`cancelled`
-    ///         invariant — both clean SIGTERM and SIGKILL-escalated produce
-    ///         a message starting with "cancelled". This stub forces the
-    ///         SIGKILL path (TERM-trapped shell) so the
-    ///         "(sigterm timeout, escalated to sigkill)" suffix is also
-    ///         covered against the prefix invariant.
+    /// MUST agree across the cancel path:
+    ///   (i)  status's `in_flight.{op,args}` while the cancel is pending
+    ///        matches the cancel audit entry's `error` (op) and
+    ///        `target_args=<args>`.
+    ///   (ii) the writer returns `error_kind == "cancelled"`, which
+    ///        handle_connection maps to `OUTCOME_CANCELLED`, with exactly
+    ///        `HelperError::Cancelled`'s string (what handle_connection copies
+    ///        into the audit entry's `error`; its Obs O3 `cancelled` prefix is
+    ///        pinned in error.rs). The SIGKILL-escalated form is asserted by
+    ///        `test_sigkill_escalation_logged`.
     ///
-    /// Note: the writer is invoked via `commands::execute()` directly because
-    /// `TestSleepIgnoringTerm` has no parse arm (release-only invariant).
-    /// The audit-log entry that handle_connection would emit for the writer
-    /// is therefore not present in this test's helper.log; (ii) and (iii)
-    /// are asserted against the writer's `CommandResult`, which is the
-    /// SAME source `handle_connection` reads to populate its audit entry
-    /// (main.rs:402-417). The agreement enforced here transitively pins
-    /// the audit-entry shape.
+    /// The writer is invoked via `commands::execute()` directly (`TestHold`
+    /// has no parse arm), so (ii) is asserted on the `CommandResult` — the
+    /// SAME source `handle_connection` reads to populate its audit entry.
     #[test]
     fn test_status_audit_drift_invariant_cancel_path() {
-        let h = TestHelperWithCtx::start();
-        let write_handle = std::thread::spawn({
-            let ctx = Arc::clone(&h.ctx);
-            move || {
-                let mut output = Vec::new();
-                commands::execute(
-                    &protocol::HelperCommand::TestSleepIgnoringTerm { seconds: 5 },
-                    &ctx,
-                    &mut output,
-                )
-            }
-        });
+        let h = TestHelperWithCtx::start_with_grace(NEVER_ESCALATE);
+        let w = HeldWrite::spawn(&h.ctx, HoldShape::IgnoringTerm);
 
-        // Wait for the slot claim.
-        for _ in 0..100 {
-            if h.ctx.snapshot_busy().is_some() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert!(h.ctx.snapshot_busy().is_some());
-        // Let the shell install the trap.
-        std::thread::sleep(Duration::from_millis(150));
-
-        // Cancel; immediately capture status's pending view during the
-        // SIGTERM-grace window.
-        let _ = h.helper.request(&h.cancel_json());
-        let lines = h.helper.request(&h.status_json());
-        let result = TestHelperWithCtx::parse_result(&lines);
-        let data = result.data.expect("status data");
-        assert_eq!(data["busy"], serde_json::Value::Bool(true));
+        h.cancel_in_flight();
+        let data = h.status();
+        assert_eq!(data["busy"], serde_json::Value::Bool(true), "{data}");
         assert_eq!(
             data["cancel_pending"],
             serde_json::Value::Bool(true),
-            "cancel_pending should be true during SIGTERM grace, got: {data}"
+            "cancel_pending should be true while the cancelled write is held: {data}"
         );
-        let status_args: Vec<String> = data["in_flight"]["args"]
-            .as_array()
-            .expect("in_flight.args present during pending cancel")
-            .iter()
-            .map(|v| v.as_str().unwrap().to_string())
-            .collect();
+        let status_args = string_args(&data["in_flight"]["args"]);
+        assert_eq!(status_args, w.args());
         let status_op = data["in_flight"]["op"]
             .as_str()
             .expect("in_flight.op present during pending cancel")
             .to_string();
 
-        // Wait for the writer to terminate (SIGKILL escalation).
-        let write_result = write_handle.join().unwrap();
-        std::thread::sleep(Duration::from_millis(100));
+        w.release();
+        let write_result = w.join();
 
-        // (i) args agreement — status's in_flight.args == cancel audit's
-        // target_args. The cancel command goes over the socket, so its
-        // audit entry IS recorded by handle_connection.
-        let entries = h.helper.read_audit_log();
-        let cancel_entry = entries
-            .iter()
-            .find(|e| e["cmd"] == "cancel" && e["outcome"] == "completed")
-            .expect("no completed cancel entry in audit log");
-        let cancel_target = cancel_entry["error"]
-            .as_str()
-            .expect("cancel entry's error carries cancelled-op identifier");
+        // (i) The cancel command went over the socket, so handle_connection
+        // recorded its audit entry.
+        let cancel_entry = completed_cancel_entry(&h);
         assert_eq!(
-            cancel_target, status_op,
+            cancel_entry["error"].as_str(),
+            Some(status_op.as_str()),
             "cancel audit entry's `error` (cancelled-op identifier) must match status's in_flight.op"
         );
-        let cancel_args: Vec<&str> = cancel_entry["args"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
-        let target_args = cancel_args
-            .iter()
-            .find(|s| s.starts_with("target_args="))
-            .expect("no target_args in cancel entry")
-            .strip_prefix("target_args=")
-            .unwrap();
         assert_eq!(
-            target_args,
+            cancel_target_args(&cancel_entry),
             status_args.join(" "),
-            "status's in_flight.args ({status_args:?}) does not match cancel audit's target_args ({target_args:?})"
+            "status's in_flight.args does not match cancel audit's target_args"
         );
 
-        // (ii) writer returns `error_kind == "cancelled"`. handle_connection
-        // (main.rs:402-417) maps this to OUTCOME_CANCELLED in the audit
-        // entry it would emit; the in-process invocation here can't trip
-        // that path (no parse arm), so we assert the source-of-truth
-        // CommandResult instead.
-        assert_eq!(
-            write_result.error_kind.as_deref(),
-            Some("cancelled"),
-            "writer must return error_kind=cancelled, got: {write_result:?}"
-        );
-
-        // (iii) Obs O3 prefix invariant — writer's error string starts with
-        // "cancelled". This is the string `handle_connection` would copy
-        // verbatim into the audit entry's `error` field at main.rs:411-418.
-        let writer_error = write_result
-            .error
-            .as_deref()
-            .expect("cancelled writer must carry an error string");
-        assert!(
-            writer_error.starts_with("cancelled"),
-            "writer error must start with `cancelled` (Obs O3 prefix invariant), got: {writer_error:?}"
-        );
-        // This stub forces the SIGKILL escalation path; confirm the
-        // suffix-distinguished message also satisfies the prefix invariant.
-        // Clean-SIGTERM coverage lives in test_cancel_kills_grandchild_holding_pipes
-        // (which also returns error_kind=cancelled with prefix-`cancelled`
-        // — message is "cancelled by client request" without the suffix).
-        assert!(
-            writer_error.starts_with("cancelled (sigterm timeout, escalated to sigkill)"),
-            "expected SIGKILL-escalated suffix in writer error, got: {writer_error:?}"
-        );
+        // (ii)
+        assert_cancelled(&write_result, false);
     }
 }

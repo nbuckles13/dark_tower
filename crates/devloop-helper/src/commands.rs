@@ -134,14 +134,19 @@ pub struct CancelSignal {
     pub shutdown: Arc<AtomicBool>,
     pub cancel: Arc<AtomicBool>,
     pub decisions: Arc<Mutex<WriteDecisions>>,
+    /// SIGTERM→SIGKILL grace on a per-write cancel. Production writes take it
+    /// from [`Context::cancel_grace`], which `main` sets to
+    /// [`CANCEL_GRACEFUL_TIMEOUT`].
+    pub grace: Duration,
 }
 
 impl CancelSignal {
-    pub fn new(shutdown: Arc<AtomicBool>, cancel: Arc<AtomicBool>) -> Self {
+    pub fn new(shutdown: Arc<AtomicBool>, cancel: Arc<AtomicBool>, grace: Duration) -> Self {
         Self {
             shutdown,
             cancel,
             decisions: Arc::new(Mutex::new(WriteDecisions::default())),
+            grace,
         }
     }
 
@@ -170,7 +175,13 @@ impl CancelSignal {
     /// `run_with_write_slot`.
     #[allow(dead_code)]
     pub fn shutdown_only(shutdown: Arc<AtomicBool>) -> Self {
-        Self::new(shutdown, Arc::new(AtomicBool::new(false)))
+        // No per-write token can be set, so the cancel grace is never consulted
+        // (shutdown is SIGKILL-immediate); the production value keeps it honest.
+        Self::new(
+            shutdown,
+            Arc::new(AtomicBool::new(false)),
+            CANCEL_GRACEFUL_TIMEOUT,
+        )
     }
 }
 
@@ -193,11 +204,20 @@ pub struct InFlightOp {
 /// observe state without contention.
 pub struct WriteState {
     pub in_flight: Option<InFlightOp>,
+    /// Count of cluster writes (see [`is_cluster_write`]) that have claimed
+    /// the slot over the helper's lifetime. Bumped in [`claim_slot`]. `status`
+    /// compares it across its probe window so a cluster write that starts AND
+    /// finishes inside one status call is still reported (see
+    /// [`cluster_write_during_probe`]). Internal: never serialized.
+    pub cluster_write_gen: u64,
 }
 
 impl WriteState {
     pub fn new() -> Self {
-        Self { in_flight: None }
+        Self {
+            in_flight: None,
+            cluster_write_gen: 0,
+        }
     }
 }
 
@@ -264,9 +284,34 @@ pub struct Context {
     /// held behind `Arc` and never cloned by value, so every connection observes
     /// this same atom.
     pub recreate_bound: AtomicBool,
+    /// SIGTERM→SIGKILL grace for a cancelled write. Production sets it from
+    /// [`CANCEL_GRACEFUL_TIMEOUT`] in `main` — there is no flag or env var for
+    /// it. Tests construct contexts with a grace chosen per test.
+    pub cancel_grace: Duration,
+}
+
+/// One observation of the write slot from `status`'s point of view: is a
+/// cluster write holding it, and how many cluster writes have ever claimed it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClusterWriteObservation {
+    pub in_progress: bool,
+    pub gen: u64,
 }
 
 impl Context {
+    /// Observe the slot for [`cluster_write_during_probe`] (lock held only for
+    /// the read).
+    pub fn observe_cluster_write(&self) -> ClusterWriteObservation {
+        let g = lock_recovered(&self.write_state);
+        ClusterWriteObservation {
+            in_progress: g
+                .in_flight
+                .as_ref()
+                .is_some_and(|o| is_cluster_write(&o.op)),
+            gen: g.cluster_write_gen,
+        }
+    }
+
     /// Snapshot the in-flight op (or `None` if idle). Lock is held only for
     /// the duration of the clone; the snapshot is returned by value.
     pub fn snapshot_busy(&self) -> Option<BusyHint> {
@@ -420,6 +465,36 @@ pub fn execute(cmd: &HelperCommand, ctx: &Context, writer: &mut dyn Write) -> Co
     }
 }
 
+/// Claim the write slot for `cmd`, or return `HelperError::Busy` naming the
+/// write already holding it. A claimed cluster write also bumps
+/// `cluster_write_gen` — under the same lock as the claim, so `status` can never
+/// observe the op without its generation (see [`cluster_write_during_probe`]).
+fn claim_slot<'a>(
+    ctx: &'a Context,
+    cmd: &HelperCommand,
+    cancel_token: &Arc<AtomicBool>,
+) -> Result<WriteSlotGuard<'a>, HelperError> {
+    let mut g = lock_recovered(&ctx.write_state);
+    if let Some(in_flight) = g.in_flight.as_ref() {
+        return Err(HelperError::Busy {
+            op: in_flight.op.clone(),
+            args: in_flight.args.clone(),
+        });
+    }
+    if is_cluster_write(cmd.name()) {
+        g.cluster_write_gen = g.cluster_write_gen.wrapping_add(1);
+    }
+    g.in_flight = Some(InFlightOp {
+        op: cmd.name().to_string(),
+        args: cmd.args_for_log(),
+        started_at: now_rfc3339(),
+        cancel_token: Arc::clone(cancel_token),
+    });
+    Ok(WriteSlotGuard {
+        state: &ctx.write_state,
+    })
+}
+
 /// Try to claim the write slot, run the command, release the slot via
 /// `WriteSlotGuard` on any exit path. Returns `HelperError::Busy` if another
 /// write is already in flight (per Security S1 + Obs O1 collision-pair).
@@ -437,31 +512,18 @@ fn run_with_write_slot(
 ) {
     let cancel_token = Arc::new(AtomicBool::new(false));
 
-    // Try to claim the slot.
-    {
-        let mut g = lock_recovered(&ctx.write_state);
-        if let Some(in_flight) = g.in_flight.as_ref() {
-            return (
-                Err(HelperError::Busy {
-                    op: in_flight.op.clone(),
-                    args: in_flight.args.clone(),
-                }),
-                WriteDecisions::default(),
-            );
-        }
-        g.in_flight = Some(InFlightOp {
-            op: cmd.name().to_string(),
-            args: cmd.args_for_log(),
-            started_at: now_rfc3339(),
-            cancel_token: Arc::clone(&cancel_token),
-        });
-    }
-    // RAII: clear the slot on any exit path (success/error/panic).
-    let _guard = WriteSlotGuard {
-        state: &ctx.write_state,
+    // Claim the slot; the guard clears it on any exit path
+    // (success/error/panic).
+    let _guard = match claim_slot(ctx, cmd, &cancel_token) {
+        Ok(guard) => guard,
+        Err(e) => return (Err(e), WriteDecisions::default()),
     };
 
-    let signal = CancelSignal::new(Arc::clone(&ctx.shutdown), Arc::clone(&cancel_token));
+    let signal = CancelSignal::new(
+        Arc::clone(&ctx.shutdown),
+        Arc::clone(&cancel_token),
+        ctx.cancel_grace,
+    );
 
     let result = match cmd {
         HelperCommand::Provision => cmd_provision(ctx, writer, &signal),
@@ -470,20 +532,13 @@ fn run_with_write_slot(
         HelperCommand::Recreate => cmd_recreate(ctx, writer, &signal),
         HelperCommand::RestoreKubeconfig => cmd_restore_kubeconfig(ctx, writer, &signal),
         #[cfg(test)]
-        HelperCommand::TestSleep { seconds } => {
-            cmd_test_sleep(ctx, *seconds, writer, &signal).map(|()| None)
-        }
-        #[cfg(test)]
-        HelperCommand::TestSleepIgnoringTerm { seconds } => {
-            cmd_test_sleep_ignoring_term(ctx, *seconds, writer, &signal).map(|()| None)
-        }
-        #[cfg(test)]
-        HelperCommand::TestSleepWithChild { seconds } => {
-            cmd_test_sleep_with_child(ctx, *seconds, writer, &signal).map(|()| None)
-        }
-        #[cfg(test)]
-        HelperCommand::TestSleepWithChildIgnoringTerm { seconds } => {
-            cmd_test_sleep_with_child_ignoring_term(ctx, *seconds, writer, &signal).map(|()| None)
+        HelperCommand::TestHold {
+            latch,
+            ready,
+            shape,
+        } => {
+            let mut child = hold_command(*shape, latch, ready, std::process::id());
+            run_command_streaming(&mut child, shape.op_name(), writer, &signal).map(|()| None)
         }
         // The match in `execute` above ensures non-write commands never reach here.
         other => Err(HelperError::InvalidRequest(format!(
@@ -515,92 +570,99 @@ fn run_with_write_slot(
     (result, decisions)
 }
 
-/// Test-only: run `sleep N` via run_command_streaming so the concurrency
-/// tests exercise the real cancel-token + child-kill path. Spawn `sleep`
-/// directly (NOT via /bin/sh) so SIGTERM goes to the actual sleeping
-/// process — some shells fork+wait instead of exec, which would mask
-/// signal delivery.
+/// Test-only: THE stock `Context` rooted at `dir` (typically a `TempDir`
+/// path), at the production cancel grace.
 #[cfg(test)]
-fn cmd_test_sleep(
-    ctx: &Context,
-    seconds: u64,
-    writer: &mut dyn Write,
-    signal: &CancelSignal,
-) -> Result<(), HelperError> {
-    eprintln!("[devloop-helper] test-sleep: sleeping for {seconds}s");
-    let _ = ctx; // unused
-    let mut cmd = Command::new("sleep");
-    cmd.arg(seconds.to_string());
-    run_command_streaming(&mut cmd, "test-sleep", writer, signal)
+pub(crate) fn test_context(dir: &Path) -> Context {
+    test_context_with_grace(dir, CANCEL_GRACEFUL_TIMEOUT)
 }
 
-/// Test-only: shell stub that traps SIGTERM and then sleeps. Forces
-/// `run_command_streaming` to wait `CANCEL_GRACEFUL_TIMEOUT` and escalate
-/// to SIGKILL — exercising the `escalated: true` branch of
-/// `HelperError::Cancelled` (Security S5).
+/// Test-only: [`test_context`] with the cancel grace the test chooses. Every
+/// test context is built here, so a new field edits one place.
 #[cfg(test)]
-fn cmd_test_sleep_ignoring_term(
-    ctx: &Context,
-    seconds: u64,
-    writer: &mut dyn Write,
-    signal: &CancelSignal,
-) -> Result<(), HelperError> {
-    eprintln!("[devloop-helper] test-sleep-ignoring-term: blocking for up to {seconds}s with TERM trapped");
-    let _ = ctx;
-    // Busy-loop in the shell itself (no `sleep` child) so SIGKILL on the
-    // shell terminates everything that holds the stdout/stderr pipes —
-    // otherwise an orphaned `sleep` keeps the pipes open and the reader
-    // threads never see EOF.
+pub(crate) fn test_context_with_grace(dir: &Path, cancel_grace: Duration) -> Context {
+    Context {
+        slug: "test".to_string(),
+        cluster_name: "devloop-test".to_string(),
+        project_root: PathBuf::from("/tmp/devloop-test-nonexistent"),
+        runtime_dir: dir.to_path_buf(),
+        registry_path: dir.join("port-registry.json"),
+        container_runtime: ContainerRuntime::Podman,
+        host_gateway_ip: None,
+        shutdown: Arc::new(AtomicBool::new(false)),
+        write_state: Arc::new(Mutex::new(WriteState::new())),
+        recreate_bound: AtomicBool::new(false),
+        cancel_grace,
+    }
+}
+
+/// Test-only: THE bound on every event wait in this crate's tests. A hang
+/// detector, not a timing assertion: each wait is for an event the test
+/// itself caused.
+#[cfg(test)]
+pub(crate) const WAIT_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Test-only: THE poll kernel — wait until `done()` or fail loudly naming
+/// `what` after [`WAIT_DEADLINE`].
+#[cfg(test)]
+pub(crate) fn poll_until(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + WAIT_DEADLINE;
+    while !done() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out after {WAIT_DEADLINE:?} waiting for: {what}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Test-only: THE hold loop (`sh` script; `$1` latch, `$2` ready, `$3` owner
+/// pid). Writes its own pid to `$2` (via rename, so a reader never sees it
+/// half-written), then holds until `$1` exists or `$3` is gone — never for a
+/// duration. Shared by [`hold_command`] and any test script stub that needs a
+/// child with a test-controlled lifetime.
+#[cfg(test)]
+pub(crate) const READY_AND_HOLD: &str = r#"echo $$ > "$2.tmp" && mv "$2.tmp" "$2"; while [ ! -e "$1" ] && kill -0 "$3" 2>/dev/null; do sleep 0.05; done"#;
+
+/// Test-only: the process behind [`HelperCommand::TestHold`]. A `/bin/sh` loop
+/// that holds until `latch` exists (then exits 0) or the process `owner_pid`
+/// is gone — so a test process that dies without running its cleanup (nextest
+/// SIGKILL, OOM, Ctrl-C) never leaves a hold polling forever. It never ends on
+/// a duration. The innermost holding process creates `ready` once it is set up
+/// (after `trap '' TERM` for the TERM-ignoring shapes; inside the backgrounded
+/// subshell for the child shapes, whose pid it writes there) — the event tests
+/// wait on instead of sleeping. Paths are positional args (`$1`/`$2`/`$3`),
+/// never interpolated into the script. `TERM` ignored by `trap ''` is inherited
+/// by the subshell and its `sleep`s, so only the process-group SIGKILL ends
+/// the `*IgnoringTerm` shapes.
+#[cfg(test)]
+pub(crate) fn hold_command(
+    shape: crate::protocol::HoldShape,
+    latch: &Path,
+    ready: &Path,
+    owner_pid: u32,
+) -> Command {
+    use crate::protocol::HoldShape;
+    let trap = match shape {
+        HoldShape::Plain | HoldShape::WithChild => "",
+        HoldShape::IgnoringTerm | HoldShape::WithChildIgnoringTerm => "trap '' TERM; ",
+    };
+    let script = match shape {
+        HoldShape::Plain | HoldShape::IgnoringTerm => format!("{trap}{READY_AND_HOLD}"),
+        // A separate `sh` (so `$$` is the holder's own pid), backgrounded so it
+        // inherits the stdout/stderr pipes; the parent just waits.
+        HoldShape::WithChild | HoldShape::WithChildIgnoringTerm => {
+            format!(r#"{trap}sh -c '{READY_AND_HOLD}' sh "$1" "$2" "$3" & wait"#)
+        }
+    };
     let mut cmd = Command::new("/bin/sh");
-    cmd.arg("-c").arg(format!(
-        "trap '' TERM; i=0; max=$(( {seconds} * 1000000 )); \
-         while [ $i -lt $max ]; do i=$(( i + 1 )); done"
-    ));
-    run_command_streaming(&mut cmd, "test-sleep-ignoring-term", writer, signal)
-}
-
-/// Test-only: spawn `bash -c 'sleep N & wait'` so a forked grandchild
-/// inherits stdout/stderr. Without process-group SIGTERM, killing only the
-/// immediate `bash` would leave the orphaned `sleep` holding the pipes
-/// open until natural exit (~N seconds). With `process_group(0)` +
-/// `kill(-pgid, SIGTERM)` the grandchild is reached and cancel completes
-/// promptly. This stub validates the iter-2 process-group cancel path.
-#[cfg(test)]
-fn cmd_test_sleep_with_child(
-    ctx: &Context,
-    seconds: u64,
-    writer: &mut dyn Write,
-    signal: &CancelSignal,
-) -> Result<(), HelperError> {
-    eprintln!("[devloop-helper] test-sleep-with-child: bash forking sleep {seconds}");
-    let _ = ctx;
-    let mut cmd = Command::new("bash");
-    cmd.arg("-c").arg(format!("sleep {seconds} & wait"));
-    run_command_streaming(&mut cmd, "test-sleep-with-child", writer, signal)
-}
-
-/// Test-only: TERM-trapped bash with a backgrounded `sleep` grandchild.
-/// Forces both the SIGKILL escalation branch AND the grandchild reach via
-/// process-group SIGKILL — so a successful cancel proves the SIGKILL path
-/// also signals via pgid (not just the cooperative SIGTERM path).
-#[cfg(test)]
-fn cmd_test_sleep_with_child_ignoring_term(
-    ctx: &Context,
-    seconds: u64,
-    writer: &mut dyn Write,
-    signal: &CancelSignal,
-) -> Result<(), HelperError> {
-    eprintln!("[devloop-helper] test-sleep-with-child-ignoring-term: trapped bash forking sleep {seconds}");
-    let _ = ctx;
-    let mut cmd = Command::new("bash");
     cmd.arg("-c")
-        .arg(format!("trap '' TERM; sleep {seconds} & wait"));
-    run_command_streaming(
-        &mut cmd,
-        "test-sleep-with-child-ignoring-term",
-        writer,
-        signal,
-    )
+        .arg(script)
+        .arg("sh")
+        .arg(latch)
+        .arg(ready)
+        .arg(owner_pid.to_string());
+    cmd
 }
 
 /// Cancel: signal the in-flight write to abort. Idempotent — returns no-op
@@ -1663,17 +1725,141 @@ fn is_cluster_write(op: &str) -> bool {
     matches!(op, "provision" | "deploy" | "recreate" | "teardown")
 }
 
+/// Was a cluster write in progress at any point of a status probe window?
+///
+/// True iff a cluster write held the slot at the window's start (`t0`) or end
+/// (`t1`), OR one claimed it in between (`gen` moved — e.g. a no-op `deploy`
+/// that starts and finishes inside one status call). This is deliberately
+/// NOT derived from status's `busy` field: the health facts status reports
+/// (`cluster_exists`, `pods_healthy`, `apiserver_reachable`) are gathered over
+/// the whole window, and its consumers (`scripts/layer7.sh::__cluster_ready`,
+/// the Phase-1e self-heal) gate on this field to decide whether those facts
+/// describe a cluster nobody was changing. A write that STARTS mid-window is
+/// the unsafe direction (pre-write health reported as settled); a write that
+/// ENDS mid-window only reads conservatively (true). So `busy:false` (the t0
+/// snapshot) next to `cluster_write_in_progress:true` is correct — a write
+/// began during the call; re-running status shows it. Do not "simplify" this
+/// back to the t0 snapshot.
+fn cluster_write_during_probe(t0: ClusterWriteObservation, t1: ClusterWriteObservation) -> bool {
+    t0.in_progress || t1.in_progress || t0.gen != t1.gen
+}
+
+/// Run `probe` and report, alongside its result, whether a cluster write was
+/// in progress at any point while it ran ([`cluster_write_during_probe`]).
+fn observe_cluster_writes_around<T>(ctx: &Context, probe: impl FnOnce() -> T) -> (T, bool) {
+    let t0 = ctx.observe_cluster_write();
+    let out = probe();
+    let t1 = ctx.observe_cluster_write();
+    (out, cluster_write_during_probe(t0, t1))
+}
+
 /// Status: read-only health check — cluster exists, pods healthy, ports.json.
 ///
 /// Snapshots `WriteState` at request time (per Security S4) so the busy hint
 /// is consistent: lock held only for the field clones, dropped before the
 /// kubectl call. Status NEVER blocks on the write mutex.
+///
+/// Two time bases, on purpose: `busy`/`in_flight`/`cancel_pending` are the
+/// snapshot taken at the START of the call (one consistent view of the
+/// in-flight op); `cluster_write_in_progress` covers the WHOLE probe window
+/// (`kind`/`kubectl`/inspect/TCP — uncontrolled latency) via
+/// [`observe_cluster_writes_around`]. They can legitimately disagree
+/// (`busy:false` + `cluster_write_in_progress:true` = a write began mid-call).
 fn cmd_status(ctx: &Context) -> Result<Option<serde_json::Value>, HelperError> {
+    status_with_probe(ctx, || probe_cluster_health(ctx))
+}
+
+/// `cmd_status` with its slow cluster reads injected — the seam that lets a
+/// test drive the real status assembly with a probe that starts and finishes a
+/// cluster write mid-call (`status_reports_a_cluster_write_inside_its_probe`).
+fn status_with_probe(
+    ctx: &Context,
+    probe: impl FnOnce() -> ClusterHealth,
+) -> Result<Option<serde_json::Value>, HelperError> {
     eprintln!("[devloop-helper] status: checking cluster health...");
 
-    // 0. Snapshot busy hint BEFORE any blocking work (lock dropped immediately).
+    // 1. Snapshot busy hint BEFORE any blocking work (lock dropped immediately).
     let busy = ctx.snapshot_busy();
 
+    // 2. Every slow cluster read (cluster exists, pod health, apiserver
+    // reachability), bracketed so a cluster write anywhere in the window is
+    // reported. `cluster_write_in_progress` is sourced from the mutex, not
+    // devloop.sh's `setup.pid` wrapper-lifecycle file; see `is_cluster_write`
+    // for the vocabulary and `cluster_write_during_probe` for why it spans the
+    // probe window rather than the step-1 snapshot.
+    let (health, cluster_write_in_progress) = observe_cluster_writes_around(ctx, probe);
+    let ClusterHealth {
+        cluster_exists,
+        pods_healthy,
+        pod_summary,
+        pod_error,
+        apiserver_reachable,
+    } = health;
+
+    // 3. Read ports.json if available
+    let ports_path = ctx.runtime_dir.join("ports.json");
+    let ports = if ports_path.exists() {
+        match fs::read_to_string(&ports_path) {
+            Ok(contents) => serde_json::from_str::<serde_json::Value>(&contents).ok(),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
+    // Build response data — construct fully to avoid indexing (clippy::indexing_slicing)
+    let pod_summary_val = pod_summary.map(|summary| {
+        serde_json::json!({
+            "total": summary.total,
+            "ready": summary.ready,
+            "not_ready": summary.not_ready,
+        })
+    });
+
+    // Per CR11: busy/in_flight always emitted (no skip_serializing_if), so
+    // newer clients can distinguish "old helper, field absent" from "new
+    // helper, idle" deterministically. `cancel_pending` follows the same
+    // wire-determinism rule and is emitted at the top level (not nested
+    // under in_flight) so the idle case has nowhere awkward for it to live.
+    let in_flight_val = busy.as_ref().map(|b| {
+        serde_json::json!({
+            "op": b.op,
+            "args": b.args,
+            "started_at": b.started_at,
+        })
+    });
+    let cancel_pending = busy.as_ref().is_some_and(|b| b.cancel_pending);
+
+    let data = serde_json::json!({
+        "cluster_exists": cluster_exists,
+        "pods_healthy": pods_healthy,
+        "apiserver_reachable": apiserver_reachable,
+        "cluster_write_in_progress": cluster_write_in_progress,
+        "checked_at": now_rfc3339(),
+        "pod_summary": pod_summary_val,
+        "pod_error": pod_error,
+        "ports": ports,
+        "busy": busy.is_some(),
+        "cancel_pending": cancel_pending,
+        "in_flight": in_flight_val,
+    });
+
+    Ok(Some(data))
+}
+
+/// The cluster facts `status` gathers by exec/network probe.
+struct ClusterHealth {
+    cluster_exists: bool,
+    pods_healthy: bool,
+    pod_summary: Option<PodHealthSummary>,
+    pod_error: Option<String>,
+    apiserver_reachable: &'static str,
+}
+
+/// The slow half of `status`: does the cluster exist, are its pods healthy,
+/// is its apiserver reachable. Execs `kind`/`kubectl`/`<runtime> inspect` and
+/// a TCP probe — uncontrolled latency.
+fn probe_cluster_health(ctx: &Context) -> ClusterHealth {
     // 1. Check if Kind cluster exists
     let cluster_exists = match cluster_already_exists(&ctx.cluster_name) {
         Ok(exists) => exists,
@@ -1721,45 +1907,6 @@ fn cmd_status(ctx: &Context) -> Result<Option<serde_json::Value>, HelperError> {
         (false, None, None)
     };
 
-    // 3. Read ports.json if available
-    let ports_path = ctx.runtime_dir.join("ports.json");
-    let ports = if ports_path.exists() {
-        match fs::read_to_string(&ports_path) {
-            Ok(contents) => serde_json::from_str::<serde_json::Value>(&contents).ok(),
-            Err(_) => None,
-        }
-    } else {
-        None
-    };
-
-    // 4. `cluster_write_in_progress` is true iff a cluster-changing write is
-    // holding the mutex (sourced from the mutex, not devloop.sh's `setup.pid`
-    // wrapper-lifecycle file). See `is_cluster_write` for the vocabulary.
-    let cluster_write_in_progress = busy.as_ref().is_some_and(|b| is_cluster_write(&b.op));
-
-    // Build response data — construct fully to avoid indexing (clippy::indexing_slicing)
-    let pod_summary_val = pod_summary.map(|summary| {
-        serde_json::json!({
-            "total": summary.total,
-            "ready": summary.ready,
-            "not_ready": summary.not_ready,
-        })
-    });
-
-    // Per CR11: busy/in_flight always emitted (no skip_serializing_if), so
-    // newer clients can distinguish "old helper, field absent" from "new
-    // helper, idle" deterministically. `cancel_pending` follows the same
-    // wire-determinism rule and is emitted at the top level (not nested
-    // under in_flight) so the idle case has nowhere awkward for it to live.
-    let in_flight_val = busy.as_ref().map(|b| {
-        serde_json::json!({
-            "op": b.op,
-            "args": b.args,
-            "started_at": b.started_at,
-        })
-    });
-    let cancel_pending = busy.as_ref().is_some_and(|b| b.cancel_pending);
-
     // Apiserver reachability (self-heal input). ADDITIVE string field — the three
     // COUPLED health lines + NDJSON shape are untouched, and a probe failure
     // degrades to `unknown` (never errors), so `__cluster_ready` (which greps
@@ -1768,21 +1915,13 @@ fn cmd_status(ctx: &Context) -> Result<Option<serde_json::Value>, HelperError> {
     // (see INSPECT_TIMEOUT_SECS / TCP_CONNECT_TIMEOUT).
     let apiserver_reachable = probe_apiserver_reachable(ctx).as_str();
 
-    let data = serde_json::json!({
-        "cluster_exists": cluster_exists,
-        "pods_healthy": pods_healthy,
-        "apiserver_reachable": apiserver_reachable,
-        "cluster_write_in_progress": cluster_write_in_progress,
-        "checked_at": now_rfc3339(),
-        "pod_summary": pod_summary_val,
-        "pod_error": pod_error,
-        "ports": ports,
-        "busy": busy.is_some(),
-        "cancel_pending": cancel_pending,
-        "in_flight": in_flight_val,
-    });
-
-    Ok(Some(data))
+    ClusterHealth {
+        cluster_exists,
+        pods_healthy,
+        pod_summary,
+        pod_error,
+        apiserver_reachable,
+    }
 }
 
 /// The two cluster-building scripts (ADR-0038 §1/§2). A CLOSED set: each maps
@@ -2136,7 +2275,8 @@ fn run_command_streaming(
         // 3. CANCEL vs SHUTDOWN: same kill mechanic (process-group signal),
         //    different timing.
         //    - Cancel-token (per-write, set by `cmd_cancel`): SIGTERM to
-        //      the group, CANCEL_GRACEFUL_TIMEOUT (2 s) grace, then
+        //      the group, `signal.grace` (production: CANCEL_GRACEFUL_TIMEOUT,
+        //      2 s) grace, then
         //      escalate to SIGKILL of the group. The 2 s window matches
         //      the cooperative shell/kubectl tree's typical SIGTERM
         //      response. A cancelled provision leaves no blueprint record,
@@ -2169,7 +2309,7 @@ fn run_command_streaming(
             } else if cancel_termed {
                 // Check escalation window.
                 if let Some(t0) = term_at {
-                    if t0.elapsed() >= CANCEL_GRACEFUL_TIMEOUT {
+                    if t0.elapsed() >= signal.grace {
                         // Child still alive after SIGTERM grace window — escalate.
                         match child.try_wait() {
                             Ok(Some(_)) => {
@@ -2525,18 +2665,7 @@ mod tests {
     #[test]
     fn test_execute_sends_command_started() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx = Context {
-            slug: "test".to_string(),
-            cluster_name: "devloop-test".to_string(),
-            project_root: std::path::PathBuf::from("/tmp/devloop-test-nonexistent"),
-            runtime_dir: dir.path().to_path_buf(),
-            registry_path: dir.path().join("port-registry.json"),
-            container_runtime: ContainerRuntime::Podman,
-            host_gateway_ip: None,
-            shutdown: Arc::new(AtomicBool::new(false)),
-            write_state: Arc::new(Mutex::new(WriteState::new())),
-            recreate_bound: AtomicBool::new(false),
-        };
+        let ctx = test_context(dir.path());
 
         let mut output = Vec::new();
         // Teardown will fail (no kind binary) but CommandStarted is sent first
@@ -3085,7 +3214,7 @@ current-context: kind-devloop-test
     fn test_evidence_bundle_matches_allowlist_and_has_no_credentials() {
         use std::collections::BTreeSet;
         let dir = tempfile::tempdir().unwrap();
-        let ctx = test_ctx(dir.path());
+        let ctx = test_context(dir.path());
         let leaf = capture_evidence_bundle(&ctx);
         assert!(
             leaf.starts_with("self-heal-evidence-"),
@@ -3195,7 +3324,7 @@ current-context: kind-devloop-test
     #[test]
     fn test_read_k8s_api_port_from_ports_json() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx = test_ctx(dir.path());
+        let ctx = test_context(dir.path());
         // Missing ports.json ⇒ None.
         assert_eq!(read_k8s_api_port(&ctx), None);
         // Present with a real port ⇒ Some.
@@ -3374,7 +3503,7 @@ current-context: kind-devloop-test
     #[test]
     fn script_command_provision_argv_env() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx = test_ctx(dir.path());
+        let ctx = test_context(dir.path());
         let cmd = script_command(&ctx, Script::Provision).unwrap();
         assert_eq!(
             cmd.get_program(),
@@ -3389,7 +3518,7 @@ current-context: kind-devloop-test
     #[test]
     fn script_command_deploy_argv_env() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx = test_ctx(dir.path());
+        let ctx = test_context(dir.path());
         let cmd = script_command(&ctx, Script::Deploy).unwrap();
         assert_eq!(
             cmd.get_program(),
@@ -3406,7 +3535,7 @@ current-context: kind-devloop-test
     #[test]
     fn script_command_identical_except_path() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx = test_ctx(dir.path());
+        let ctx = test_context(dir.path());
         let p = script_command(&ctx, Script::Provision).unwrap();
         let d = script_command(&ctx, Script::Deploy).unwrap();
         assert_eq!(cmd_argv(&p), cmd_argv(&d));
@@ -3417,7 +3546,7 @@ current-context: kind-devloop-test
     #[test]
     fn script_command_rejects_invalid_gateway() {
         let dir = tempfile::tempdir().unwrap();
-        let mut ctx = test_ctx(dir.path());
+        let mut ctx = test_context(dir.path());
         ctx.host_gateway_ip = Some("0.0.0.0".to_string());
         assert!(script_command(&ctx, Script::Provision).is_err());
         assert!(script_command(&ctx, Script::Deploy).is_err());
@@ -3434,11 +3563,17 @@ current-context: kind-devloop-test
             "restore-kubeconfig",
             "status",
             "cancel",
-            "test-sleep",
             "setup",
             "rebuild-all",
             "",
         ] {
+            assert!(!is_cluster_write(op), "{op} must not count");
+        }
+        // The test writes the concurrency tests hold the slot with (and
+        // assert `cluster_write_in_progress:false` against), derived from
+        // the variant rather than retyped.
+        for shape in crate::protocol::HoldShape::ALL {
+            let op = shape.op_name();
             assert!(!is_cluster_write(op), "{op} must not count");
         }
     }
@@ -3462,7 +3597,7 @@ current-context: kind-devloop-test
             .status()
             .unwrap();
         assert!(status.success(), "installing the stub script failed");
-        let mut ctx = test_ctx(dir);
+        let mut ctx = test_context(dir);
         ctx.project_root = dir.join("root");
         ctx
     }
@@ -3506,7 +3641,7 @@ current-context: kind-devloop-test
     #[test]
     fn script_label_is_derived_from_the_exec_argv() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx = test_ctx(dir.path());
+        let ctx = test_context(dir.path());
         for script in [Script::Provision, Script::Deploy] {
             let cmd = script_command(&ctx, script).unwrap();
             let expected = std::iter::once(script.rel_path().to_string())
@@ -3576,74 +3711,255 @@ current-context: kind-devloop-test
 
     /// A cancelled deploy kills the deploy.sh process GROUP, including a
     /// grandchild (the script's own kubectl/podman children in real use).
+    /// The grandchild holds (`READY_AND_HOLD`) until the test's latch or the
+    /// test process is gone — never for a duration — so only the cancel's
+    /// process-group signal can end the deploy; a regression fails at the
+    /// `WAIT_DEADLINE` (latch released to unwind) rather than on a clock.
     #[test]
     fn cmd_deploy_cancel_kills_script_child() {
         let dir = tempfile::tempdir().unwrap();
-        let pidfile = dir.path().join("child.pid");
+        let latch = dir.path().join("latch");
+        let ready = dir.path().join("child.pid");
         let ctx = stub_script_ctx(
             dir.path(),
             Script::Deploy,
-            &format!("sleep 30 & echo $! > {}; wait", pidfile.display()),
+            &format!(
+                "sh -c '{READY_AND_HOLD}' sh '{}' '{}' {} & wait",
+                latch.display(),
+                ready.display(),
+                std::process::id()
+            ),
         );
         let cancel = Arc::new(AtomicBool::new(false));
-        let signal = CancelSignal::new(Arc::new(AtomicBool::new(false)), Arc::clone(&cancel));
-        let setter = {
-            let cancel = Arc::clone(&cancel);
-            let pidfile = pidfile.clone();
-            std::thread::spawn(move || {
-                let deadline = Instant::now() + Duration::from_secs(10);
-                while !pidfile.exists() && Instant::now() < deadline {
-                    std::thread::sleep(Duration::from_millis(20));
+        let signal = CancelSignal::new(
+            Arc::new(AtomicBool::new(false)),
+            Arc::clone(&cancel),
+            CANCEL_GRACEFUL_TIMEOUT,
+        );
+        let result = std::thread::scope(|scope| {
+            // Any panic in this closure (a failed ready wait, the deadline)
+            // unwinds this guard BEFORE `scope` joins the deploy thread, so the
+            // hold ends instead of the join hanging. Disarmed on success so the
+            // latch-never-created check below stays meaningful.
+            let release = ReleaseOnDrop::new(latch.clone());
+            let (tx, rx) = mpsc::channel();
+            let (ctx, signal) = (&ctx, &signal);
+            scope.spawn(move || {
+                let mut output = Vec::new();
+                let _ = tx.send(cmd_deploy(ctx, &mut output, signal));
+            });
+            poll_until("deploy.sh's grandchild to be ready", || ready.exists());
+            cancel.store(true, Ordering::Relaxed);
+            let result = rx.recv_timeout(WAIT_DEADLINE).unwrap_or_else(|e| {
+                #[expect(clippy::panic, reason = "test: fail loudly with context")]
+                {
+                    panic!("cancel did not stop deploy.sh within {WAIT_DEADLINE:?}: {e}")
                 }
-                std::thread::sleep(Duration::from_millis(100));
-                cancel.store(true, Ordering::Relaxed);
-            })
-        };
-        let started = Instant::now();
-        let mut output = Vec::new();
-        let result = cmd_deploy(&ctx, &mut output, &signal);
-        setter.join().unwrap();
+            });
+            release.disarm();
+            result
+        });
         assert!(
             matches!(result, Err(HelperError::Cancelled { .. })),
             "expected Cancelled, got {result:?}"
         );
         assert!(
-            started.elapsed() < Duration::from_secs(20),
-            "cancel did not stop deploy.sh"
+            !latch.exists(),
+            "the deploy must end by the cancel, not the latch"
         );
-        let pid: i32 = fs::read_to_string(&pidfile)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut alive = true;
-        while Instant::now() < deadline {
-            alive = process_alive(pid);
-            if !alive {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        assert!(
-            !alive,
-            "deploy.sh's grandchild (pid {pid}) survived the cancel"
+        let pid: i32 = fs::read_to_string(&ready).unwrap().trim().parse().unwrap();
+        poll_until(
+            &format!("deploy.sh's grandchild (pid {pid}) to die after the cancel"),
+            || !process_alive(pid),
         );
     }
 
-    /// Minimal Context for the pure-fn tests that need one (`read_k8s_api_port`).
-    fn test_ctx(dir: &std::path::Path) -> Context {
-        Context {
-            slug: "test".to_string(),
-            cluster_name: "devloop-test".to_string(),
-            project_root: PathBuf::from("/tmp/devloop-test-nonexistent"),
-            runtime_dir: dir.to_path_buf(),
-            registry_path: dir.join("port-registry.json"),
-            container_runtime: ContainerRuntime::Podman,
-            host_gateway_ip: None,
-            shutdown: Arc::new(AtomicBool::new(false)),
-            write_state: Arc::new(Mutex::new(WriteState::new())),
-            recreate_bound: AtomicBool::new(false),
+    fn obs(in_progress: bool, gen: u64) -> ClusterWriteObservation {
+        ClusterWriteObservation { in_progress, gen }
+    }
+
+    /// The full truth table of the probe-window fold. `in_progress` here is
+    /// already "a CLUSTER write holds the slot" (a non-cluster write such as
+    /// `restore-kubeconfig` observes as `false` — pinned by
+    /// `claim_slot_bumps_gen_only_for_cluster_writes`).
+    #[test]
+    fn cluster_write_during_probe_truth_table() {
+        // idle at both ends, nothing claimed in between
+        assert!(!cluster_write_during_probe(obs(false, 3), obs(false, 3)));
+        // cluster write at t0 only (ended mid-call): conservative true
+        assert!(cluster_write_during_probe(obs(true, 3), obs(false, 3)));
+        // cluster write at t1 only (STARTED mid-call): the unsafe direction
+        assert!(cluster_write_during_probe(obs(false, 3), obs(true, 4)));
+        // at both ends
+        assert!(cluster_write_during_probe(obs(true, 3), obs(true, 3)));
+        // idle at both ends but a cluster write started AND finished inside
+        // the window (e.g. a no-op deploy): only the generation shows it
+        assert!(cluster_write_during_probe(obs(false, 3), obs(false, 4)));
+    }
+
+    #[test]
+    fn claim_slot_bumps_gen_only_for_cluster_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_context(dir.path());
+        let token = Arc::new(AtomicBool::new(false));
+        assert_eq!(ctx.observe_cluster_write(), obs(false, 0));
+        {
+            let _g = claim_slot(&ctx, &HelperCommand::RestoreKubeconfig, &token).unwrap();
+            assert_eq!(ctx.observe_cluster_write(), obs(false, 0));
+        }
+        for (n, cmd) in [
+            HelperCommand::Provision,
+            HelperCommand::Deploy,
+            HelperCommand::Teardown,
+            HelperCommand::Recreate,
+        ]
+        .iter()
+        .enumerate()
+        {
+            let gen = u64::try_from(n).unwrap() + 1;
+            {
+                let _g = claim_slot(&ctx, cmd, &token).unwrap();
+                assert_eq!(ctx.observe_cluster_write(), obs(true, gen), "{cmd:?}");
+            }
+            assert_eq!(ctx.observe_cluster_write(), obs(false, gen), "{cmd:?}");
+        }
+    }
+
+    /// Wiring: the window `cmd_status` brackets its probe with sees a cluster
+    /// write that claims AND releases the slot entirely inside the probe —
+    /// the case neither a t0 nor a t1 snapshot alone can see. (`cmd_status`
+    /// reaches the probe only through `observe_cluster_writes_around`.)
+    #[test]
+    fn observe_cluster_writes_around_sees_a_write_inside_the_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_context(dir.path());
+        let token = Arc::new(AtomicBool::new(false));
+
+        let ((), quiet) = observe_cluster_writes_around(&ctx, || ());
+        assert!(!quiet, "positive control: no write => false");
+
+        let ((), seen) = observe_cluster_writes_around(&ctx, || {
+            let _g = claim_slot(&ctx, &HelperCommand::Deploy, &token).unwrap();
+        });
+        assert!(
+            seen,
+            "a deploy claimed and released mid-probe must be reported"
+        );
+
+        // A cluster write that STARTS mid-probe and is still running at t1.
+        let (guard, started) = observe_cluster_writes_around(&ctx, || {
+            claim_slot(&ctx, &HelperCommand::Provision, &token).unwrap()
+        });
+        assert!(started, "a provision started mid-probe must be reported");
+        drop(guard);
+    }
+
+    /// Creates the latch file on drop — including on unwind — so a held
+    /// child can never outlive a failing test's wait.
+    struct ReleaseOnDrop(Option<PathBuf>);
+
+    impl ReleaseOnDrop {
+        fn new(latch: PathBuf) -> Self {
+            Self(Some(latch))
+        }
+
+        /// The held child already ended another way; don't create the latch.
+        fn disarm(mut self) {
+            self.0 = None;
+        }
+    }
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            if let Some(latch) = &self.0 {
+                let _ = fs::write(latch, b"");
+            }
+        }
+    }
+
+    /// Kills and reaps the child on drop (best effort; it may already be gone).
+    struct KillOnDrop(Child);
+
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn stub_health() -> ClusterHealth {
+        ClusterHealth {
+            cluster_exists: true,
+            pods_healthy: true,
+            pod_summary: None,
+            pod_error: None,
+            apiserver_reachable: "reachable",
+        }
+    }
+
+    /// Wiring, at the JSON level: `status` built around a probe during which
+    /// a cluster write starts AND finishes reports
+    /// `cluster_write_in_progress: true` next to `busy: false` (its t0
+    /// snapshot). Reverting status to the t0 snapshot alone turns this red.
+    #[test]
+    fn status_reports_a_cluster_write_inside_its_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_context(dir.path());
+        let token = Arc::new(AtomicBool::new(false));
+
+        let quiet = status_with_probe(&ctx, stub_health).unwrap().unwrap();
+        assert_eq!(
+            quiet["cluster_write_in_progress"], false,
+            "control: {quiet}"
+        );
+        assert_eq!(quiet["busy"], false, "control: {quiet}");
+
+        let data = status_with_probe(&ctx, || {
+            let _g = claim_slot(&ctx, &HelperCommand::Deploy, &token).unwrap();
+            stub_health()
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(data["busy"], false, "t0 snapshot was idle: {data}");
+        assert_eq!(data["in_flight"], serde_json::Value::Null, "{data}");
+        assert_eq!(
+            data["cluster_write_in_progress"], true,
+            "a deploy inside the probe window must be reported: {data}"
+        );
+    }
+
+    /// The `TestHold` stub never outlives its owner: with the latch never
+    /// created, each shape's holder exits on its own once the owner pid is
+    /// gone (the guard against a killed `cargo test` leaving a shell polling
+    /// forever). The ready marker carries the INNERMOST holder's pid, so for
+    /// the child shapes this proves the grandchild exits, not just the parent.
+    #[test]
+    fn hold_command_exits_when_owner_is_gone() {
+        use crate::protocol::HoldShape;
+        for &shape in HoldShape::ALL {
+            let dir = tempfile::tempdir().unwrap();
+            let latch = dir.path().join("latch");
+            let ready = dir.path().join("ready");
+            // Killed in a guard so a failing wait below leaks neither the
+            // owner nor (via `kill -0`) the hold stub.
+            let mut owner = KillOnDrop(Command::new("sleep").arg("600").spawn().unwrap());
+            let mut hold = hold_command(shape, &latch, &ready, owner.0.id())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            poll_until(&format!("{shape:?} to be ready"), || ready.exists());
+            let holder: i32 = fs::read_to_string(&ready).unwrap().trim().parse().unwrap();
+            assert!(process_alive(holder), "{shape:?}: holder not running");
+            owner.0.kill().unwrap();
+            owner.0.wait().unwrap();
+            poll_until(
+                &format!("{shape:?} holder {holder} to exit after its owner"),
+                || !process_alive(holder),
+            );
+            assert!(!latch.exists(), "{shape:?}: exit must not be via the latch");
+            let status = hold.wait().unwrap();
+            assert!(status.success(), "{shape:?}: {status:?}");
         }
     }
 }
