@@ -23,9 +23,12 @@ pub const MAX_REQUEST_SIZE: u64 = 1_048_576;
 #[rustfmt::skip]
 pub const VERBS: &[&str] = &["provision", "deploy", "teardown", "recreate", "restore-kubeconfig", "status", "cancel"];
 
-/// Commands the helper can execute. None takes an argument: the wire request
-/// is `{token, command}` and nothing else (ADR-0038 step 3), so no
-/// client-supplied string can reach a script's argv or env.
+/// Commands the helper can execute. No wire verb takes an argument: the wire
+/// request is `{token, command}` and nothing else (ADR-0038 step 3), so no
+/// client-supplied string can reach a script's argv or env. (The `cfg(test)`
+/// `TestHold` variant carries test-owned paths into its stub's argv; it is
+/// constructed only in-process and has no parse arm — pinned by
+/// `test_only_commands_are_unreachable_from_the_wire`.)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HelperCommand {
     /// Make sure a cluster matching the blueprint exists: allocate ports,
@@ -50,34 +53,63 @@ pub enum HelperCommand {
     Status,
     /// Interrupt the in-flight write handler (idempotent: no-op when idle).
     Cancel,
-    /// Test-only: sleep for N seconds via /bin/sh.
-    /// Variant exists only under `cfg(test)`; there is NO `Request::parse_command`
-    /// arm so the wire surface stays clean. Tests construct it directly.
+    /// Test-only write whose lifetime the TEST controls: its stub runs until
+    /// the test creates `latch` (clean exit 0), the write is cancelled, or the
+    /// test process is gone — never for a fixed duration. The stub creates
+    /// `ready` from its innermost process once it is set up (TERM trap
+    /// installed / grandchild forked), so tests wait on an event, not a sleep.
+    /// `cfg(test)`-only with NO `Request::parse_command` arm.
     #[cfg(test)]
-    TestSleep { seconds: u64 },
-    /// Test-only: run a /bin/sh stub that traps SIGTERM (`trap "" TERM`) and
-    /// then sleeps. Used by `test_sigkill_escalation_logged` to exercise the
-    /// 2s SIGTERM-grace-then-SIGKILL path in `run_command_streaming`. Same
-    /// `cfg(test)`-only / no-parse-arm posture as `TestSleep`.
-    #[cfg(test)]
-    TestSleepIgnoringTerm { seconds: u64 },
-    /// Test-only: spawn `bash -c 'sleep <N> & wait'` so a forked grandchild
-    /// inherits stdout/stderr — exercising the iter-2 process-group cancel
-    /// path. Without `process_group(0)` + `kill(-pgid, ...)`, killing the
-    /// immediate `bash` would leave `sleep` holding the pipes open.
-    #[cfg(test)]
-    TestSleepWithChild { seconds: u64 },
-    /// Test-only: spawn `bash -c 'trap "" TERM; sleep <N> & wait'`. SIGTERM-
-    /// trapped bash forces the SIGKILL escalation branch AND there's a
-    /// grandchild — covers both the escalation path and the grandchild reach
-    /// via process-group SIGKILL.
-    #[cfg(test)]
-    TestSleepWithChildIgnoringTerm { seconds: u64 },
+    TestHold {
+        latch: std::path::PathBuf,
+        ready: std::path::PathBuf,
+        shape: HoldShape,
+    },
+}
+
+/// Declares [`HoldShape`] and its `ALL`/`op_name` from ONE list, so a shape
+/// cannot exist without being in `HoldShape::ALL` (which the wire-exposure
+/// pin iterates) — completeness by construction, not by a second list.
+#[cfg(test)]
+macro_rules! hold_shapes {
+    ($($(#[$doc:meta])* $variant:ident => $op:literal,)+) => {
+        /// Process shape of a [`HelperCommand::TestHold`] stub — each exercises
+        /// a different branch of the cancel path in `run_command_streaming`.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum HoldShape {
+            $($(#[$doc])* $variant,)+
+        }
+
+        impl HoldShape {
+            /// Every shape (generated from the same list as the enum).
+            pub const ALL: &'static [HoldShape] = &[$(Self::$variant),+];
+
+            /// The op name a `TestHold` of this shape logs under.
+            pub fn op_name(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $op,)+
+                }
+            }
+        }
+    };
+}
+
+#[cfg(test)]
+hold_shapes! {
+    /// One shell; SIGTERM ends it (the clean-cancel path).
+    Plain => "test-hold",
+    /// One shell with `trap '' TERM`; only the SIGKILL escalation ends it.
+    IgnoringTerm => "test-hold-ignoring-term",
+    /// A shell whose backgrounded subshell (inheriting stdout/stderr) does
+    /// the holding — only a process-GROUP signal reaches it.
+    WithChild => "test-hold-with-child",
+    /// `WithChild` with TERM ignored by both: process-group SIGKILL path.
+    WithChildIgnoringTerm => "test-hold-with-child-ignoring-term",
 }
 
 impl HelperCommand {
     /// Get the command name for logging (and the wire spelling — every
-    /// non-test name is a member of [`VERBS`]).
+    /// wire command's name is a member of [`VERBS`]).
     pub fn name(&self) -> &'static str {
         match self {
             Self::Provision => "provision",
@@ -88,13 +120,7 @@ impl HelperCommand {
             Self::Status => "status",
             Self::Cancel => "cancel",
             #[cfg(test)]
-            Self::TestSleep { .. } => "test-sleep",
-            #[cfg(test)]
-            Self::TestSleepIgnoringTerm { .. } => "test-sleep-ignoring-term",
-            #[cfg(test)]
-            Self::TestSleepWithChild { .. } => "test-sleep-with-child",
-            #[cfg(test)]
-            Self::TestSleepWithChildIgnoringTerm { .. } => "test-sleep-with-child-ignoring-term",
+            Self::TestHold { shape, .. } => shape.op_name(),
         }
     }
 
@@ -109,13 +135,7 @@ impl HelperCommand {
             | Self::Status
             | Self::Cancel => vec![],
             #[cfg(test)]
-            Self::TestSleep { seconds } => vec![seconds.to_string()],
-            #[cfg(test)]
-            Self::TestSleepIgnoringTerm { seconds } => vec![seconds.to_string()],
-            #[cfg(test)]
-            Self::TestSleepWithChild { seconds } => vec![seconds.to_string()],
-            #[cfg(test)]
-            Self::TestSleepWithChildIgnoringTerm { seconds } => vec![seconds.to_string()],
+            Self::TestHold { latch, .. } => vec![latch.display().to_string()],
         }
     }
 
@@ -130,13 +150,29 @@ impl HelperCommand {
             | Self::Recreate
             | Self::RestoreKubeconfig => true,
             Self::Status | Self::Cancel => false,
-            // TestSleep is a write so the test stub exercises the real
+            // TestHold is a write so the test stub exercises the real
             // write-lock + cancel-token + child-kill paths.
             #[cfg(test)]
-            Self::TestSleep { .. }
-            | Self::TestSleepIgnoringTerm { .. }
-            | Self::TestSleepWithChild { .. }
-            | Self::TestSleepWithChildIgnoringTerm { .. } => true,
+            Self::TestHold { .. } => true,
+        }
+    }
+
+    /// True for commands reachable from the wire (`parse_command`), false for
+    /// in-process test-only commands. An exhaustive match with NO `_` arm, so
+    /// every future variant must be classified here at compile time — the
+    /// test-only half is then pinned unreachable by
+    /// `test_only_commands_are_unreachable_from_the_wire`.
+    #[cfg(test)]
+    pub fn is_wire_verb(&self) -> bool {
+        match self {
+            Self::Provision
+            | Self::Deploy
+            | Self::Teardown
+            | Self::Recreate
+            | Self::RestoreKubeconfig
+            | Self::Status
+            | Self::Cancel => true,
+            Self::TestHold { .. } => false,
         }
     }
 }
@@ -394,8 +430,9 @@ mod tests {
         }
     }
 
-    /// The wire allowlist: `parse_command` accepts EXACTLY [`VERBS`], and each
-    /// accepted command's `name()` is the wire spelling it was parsed from.
+    /// The wire allowlist: `parse_command` accepts EXACTLY [`VERBS`], each
+    /// accepted command's `name()` is the wire spelling it was parsed from,
+    /// and it is classified a wire verb by the exhaustive `is_wire_verb`.
     #[test]
     fn test_parse_command_accepts_exactly_verbs() {
         assert_eq!(
@@ -409,9 +446,10 @@ mod tests {
             let cmd = parsed.unwrap();
             assert_eq!(cmd.name(), *verb, "name() must round-trip the wire verb");
             assert_eq!(cmd.to_string(), *verb, "Display carries no args");
+            assert!(cmd.is_wire_verb(), "{verb} parsed but is_wire_verb=false");
         }
-        // Every non-test variant is reachable from the wire (no verb exists
-        // that the allowlist forgot).
+        // Every wire variant is reachable from the wire (no verb exists that
+        // the allowlist forgot).
         for cmd in [
             HelperCommand::Provision,
             HelperCommand::Deploy,
@@ -421,6 +459,7 @@ mod tests {
             HelperCommand::Status,
             HelperCommand::Cancel,
         ] {
+            assert!(cmd.is_wire_verb(), "{} not classified wire", cmd.name());
             assert!(
                 VERBS.contains(&cmd.name()),
                 "{} missing from VERBS",
@@ -515,22 +554,29 @@ mod tests {
         );
     }
 
-    /// Security S6 + CR5 + Test #1 regression: the cfg(test) `TestSleep`,
-    /// `TestSleepIgnoringTerm`, `TestSleepWithChild`, and
-    /// `TestSleepWithChildIgnoringTerm` variants exist in the enum but MUST
-    /// NOT have parse arms. Any client sending the matching `command` strings
-    /// over the socket gets `invalid_command`, even with `cfg(test)` enabled.
-    /// The fall-through arm in `parse_command` already provides the structural
-    /// guarantee; this test pins all four literal names so a future refactor
-    /// that accidentally adds a parse arm is caught explicitly.
+    /// Every in-process test-only command (each `TestHold` shape — the list a
+    /// test-only variant must join, since `is_wire_verb` is an exhaustive
+    /// match) is classified non-wire, absent from `VERBS`, and rejected by
+    /// `parse_command` as `invalid_command` (Security S6 + CR5).
+    fn test_only_commands() -> Vec<HelperCommand> {
+        HoldShape::ALL
+            .iter()
+            .map(|&shape| HelperCommand::TestHold {
+                latch: "/nonexistent/latch".into(),
+                ready: "/nonexistent/ready".into(),
+                shape,
+            })
+            .collect()
+    }
+
     #[test]
-    fn test_release_does_not_expose_test_commands() {
-        for name in [
-            "test-sleep",
-            "test-sleep-ignoring-term",
-            "test-sleep-with-child",
-            "test-sleep-with-child-ignoring-term",
-        ] {
+    fn test_only_commands_are_unreachable_from_the_wire() {
+        let cmds = test_only_commands();
+        assert_eq!(cmds.len(), HoldShape::ALL.len(), "positive control");
+        for cmd in cmds {
+            let name = cmd.name();
+            assert!(!cmd.is_wire_verb(), "{name} classified as a wire verb");
+            assert!(!VERBS.contains(&name), "{name} is in VERBS");
             let json = format!(r#"{{"token":"abcdef","command":"{name}"}}"#);
             let req: Request = serde_json::from_str(&json).unwrap();
             let err = req.parse_command().unwrap_err();
@@ -548,25 +594,24 @@ mod tests {
         assert!(HelperCommand::RestoreKubeconfig.is_write());
         assert!(!HelperCommand::Status.is_write());
         assert!(!HelperCommand::Cancel.is_write());
-        // TestSleep variants are classified as writes so the stubs exercise
-        // the real write-lock + cancel paths.
-        assert!(HelperCommand::TestSleep { seconds: 1 }.is_write());
-        assert!(HelperCommand::TestSleepIgnoringTerm { seconds: 1 }.is_write());
-        assert!(HelperCommand::TestSleepWithChild { seconds: 1 }.is_write());
-        assert!(HelperCommand::TestSleepWithChildIgnoringTerm { seconds: 1 }.is_write());
+        // TestHold is classified as a write so the stub exercises the real
+        // write-lock + cancel paths.
+        for cmd in test_only_commands() {
+            assert!(cmd.is_write(), "{} must be a write", cmd.name());
+        }
     }
 
     #[test]
     fn test_busy_response_data_carries_op_and_args() {
         let err = HelperError::Busy {
-            op: "test-sleep".to_string(),
+            op: "test-hold".to_string(),
             args: vec!["30".to_string()],
         };
         let resp = Response::err(&err);
         assert!(!resp.success);
         assert_eq!(resp.error_kind.as_deref(), Some("busy"));
         let data = resp.data.expect("busy response must include data");
-        assert_eq!(data["op"], "test-sleep");
+        assert_eq!(data["op"], "test-hold");
         assert_eq!(data["args"][0], "30");
     }
 
