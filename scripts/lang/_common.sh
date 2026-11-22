@@ -225,6 +225,12 @@ run_cargo_fetch_all_platforms() {
 # a serial run would and its STATUS lines reach tee_collect_statuses unchanged. A script
 # that dies before run_and_emit reports (killed, or the subshell aborted) gets an explicit
 # `STATUS=FAIL REASON=<prefix>-runner-died`: a missing STATUS line must never read as a pass.
+# Each entry ends its stderr with ONE `LAYER=<n> STEP=<prefix> DURATION=<s>` line
+# (emit_step_duration, the shape Layer 7's phases use), timed INSIDE the entry's subshell — never
+# at flush, which waits for earlier entries — so a slow entry is named by the one `DURATION=`
+# grep; the layer total cannot say which entry grew (setup.test.sh went 30s -> 118s unnoticed
+# inside an already-over-budget Layer 3). A runner that dies emits none (its runner-died STATUS
+# line is the signal). Informational only: no threshold, no WARN.
 #
 # Only for scripts that share no mutable state; anything that writes a fixed path or a real
 # repo file must stay serial (or be fixed to use its own temp dir).
@@ -258,8 +264,10 @@ parallel_queue_run() {
       kill -0 "${pids[i]}" 2>/dev/null && running=$((running + 1))
     done
     while (( launched < n && running < jobs )); do
-      ( run_and_emit "${__PQ_NAMES[launched]}" "${__PQ_SCRIPTS[launched]}" \
+      ( __pq_t0="$(layer_now)"
+        run_and_emit "${__PQ_NAMES[launched]}" "${__PQ_SCRIPTS[launched]}" \
           >"${dir}/${launched}.out" 2>"${dir}/${launched}.err" </dev/null || true
+        emit_step_duration "${__PQ_NAMES[launched]}" "$__pq_t0" 2>>"${dir}/${launched}.err"
         : >"${dir}/${launched}.reported" ) &
       pids[launched]=$!
       launched=$((launched + 1)) running=$((running + 1)) progressed=1
@@ -787,7 +795,8 @@ __run_layer_cleanups() {
   return 0
 }
 
-# Per-step wall-clock for multi-phase layers (Layer 7's cluster bring-up phases). The layer
+# Per-step wall-clock: multi-phase layers (Layer 7's cluster bring-up phases) and every
+# parallel_queue_run entry (Layer 3's self-tests, one line each). The layer
 # captures a start with `$(layer_now)` and calls emit_step_duration when the step finishes.
 # BOTH live here (the lifecycle helper) so layer bodies never call `date` directly — that is
 # the _layer_skeleton.test.sh invariant ("lifecycle owns timestamps"); a layer doing its own

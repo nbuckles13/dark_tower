@@ -225,6 +225,8 @@ WARN BUDGET_TOTAL_BREACH GUARD_AUDIT_DURATION=<s> BUDGET=90    (guard+audit fast
 
 `WARN BUDGET_*` is informational only — it does not change exit code. A breach is the signal to revisit budgets (ADR-0033 §4 budget target; §14 flake-rate budget for adjacent context) or investigate a regression.
 
+**Investigating a Layer 3 breach.** Layer 3's stderr (`layer-3.stderr.log` under `DEVLOOP_TMP`) carries one `LAYER=3 STEP=<entry> DURATION=<s>` line per self-test; an entry that died emits none (its `STATUS=FAIL REASON=<entry>-runner-died` line says so). Rank them with `grep '^LAYER=3 STEP=' layer-3.stderr.log | sort -t= -k4 -n -r` and compare with a previous run. The layer's wall time is about the larger of (an entry's start + its duration) and (the sum of all entries / `DEVLOOP_LAYER3_JOBS`, default 4), so check the whole list: an entry that grew costs about a quarter of its growth even when it is not the slowest. Entries are registered heaviest first in `scripts/layer3.sh`; re-rank there if the order no longer matches the measurements.
+
 ### Fail-fast vs run-all (`layer-all.sh`, 2026-08-21)
 
 `layer-all.sh` runs one of two modes, decided by `_common.sh::fail_fast_mode()` and announced on

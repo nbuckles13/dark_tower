@@ -622,6 +622,12 @@ __pq_out="$(echo stdin-leaked | DEVLOOP_TMP="$__pq/tmp" bash -c '
 set -e
 __pq_want=$'a-out\nSTATUS=OK REASON=a-passed\nb-out\nSTATUS=FAIL REASON=b-failed\nc-eof\nSTATUS=OK REASON=c-passed\nSTATUS=FAIL REASON=d-runner-died'
 assert_pq "registration-order" "$([[ "$__pq_out" == "$__pq_want" ]] && echo 1 || echo 0)" "stdout=[${__pq_out}]"
+# One per-step duration line per entry on stderr, in registration order, in the pipeline's
+# `LAYER=<n> STEP=<name> DURATION=<s>` shape (no lifecycle here, so LAYER=?) — and NONE for d,
+# which died before it could emit one (its runner-died STATUS line is the signal).
+__pq_durs="$(grep -E '^LAYER=[?] STEP=[a-d] DURATION=[0-9]+$' "$__pq/stderr" | sed -E 's/^LAYER=[?] STEP=([a-d]) .*/\1/' | tr -d '\n')"
+assert_pq "duration-lines" "$([[ "$__pq_durs" == "abc" ]] && echo 1 || echo 0)" "STEP lines for: '${__pq_durs}' (want abc, none for d)"
+assert_pq "duration-none-for-died" "$(grep -q 'STEP=d ' "$__pq/stderr" && echo 0 || echo 1)" "a STEP line was emitted for the dead runner d"
 assert_pq "returns-0" "$([[ "$__pq_rc" == 0 ]] && echo 1 || echo 0)" "rc=${__pq_rc}"
 assert_pq "stderr-replayed" "$(grep -qx 'a-err' "$__pq/stderr" && echo 1 || echo 0)" "a's stderr missing"
 assert_pq "died-named" "$(grep -q "d.sh exited before reporting" "$__pq/stderr" && echo 1 || echo 0)" "no runner-died note"
@@ -633,6 +639,13 @@ DEVLOOP_TMP="$__pq/tmp" bash -c '
   parallel_queue_run 2' _ "${__here}/_common.sh" "$__pq" >/dev/null 2>&1
 __pq_max="$(sort -n "$__pq/capdir/seen" | tail -n1)"
 assert_pq "cap-holds" "$([[ "$__pq_max" == 2 ]] && echo 1 || echo 0)" "max concurrent=${__pq_max}, want 2 (cap 2, 5 jobs)"
+
+# The duration is measured, not printed as a constant: an entry that sleeps 1.2s reports >= 1.
+printf '#!/usr/bin/env bash\nsleep 1.2\n' > "$__pq/slow.sh"; chmod +x "$__pq/slow.sh"
+__pq_slow="$(DEVLOOP_TMP="$__pq/tmp" bash -c 'source "$1"; __LAYER_NUM=3; parallel_queue_add slow "$2/slow.sh"; parallel_queue_run 1' \
+  _ "${__here}/_common.sh" "$__pq" 2>&1 >/dev/null)"
+__pq_slow_d="$(sed -n 's/^LAYER=3 STEP=slow DURATION=\([0-9][0-9]*\)$/\1/p' <<< "$__pq_slow")"
+assert_pq "duration-measured" "$([[ -n "$__pq_slow_d" && "$__pq_slow_d" -ge 1 ]] && echo 1 || echo 0)" "stdout=[${__pq_slow}]"
 
 set +e
 __pq_bad="$(DEVLOOP_TMP="$__pq/tmp" bash -c 'source "$1"; parallel_queue_add x /bin/true; parallel_queue_run 0' \

@@ -63,17 +63,58 @@ deploy_tree_copy() {
 #     pipefail`) and its top-level logic (provision.sh: AUTO_YES from `[[ -t 0 ]]`) — a snippet
 #     that needs a failing rc must capture it with `|| rc=$?`.
 #   - `-u VAR` unsets VAR for the run (e.g. an ambient DT_HOST_GATEWAY_IP must not leak in).
+#   - `-t SECS` bounds the run: `timeout --kill-after=5 SECS` (no --foreground, no setsid), which
+#     signals its WHOLE process group, so the case and every stub under it die together and a
+#     never-ending wait fails as a case instead of hanging Layer 3.
 #   - Env for the run is passed as temporary assignments: `FOO=1 src_run …`.
+#   - A snippet that calls `main` is an END-TO-END run of <script>: it is recorded for the e2e
+#     run budget (e2e_record, below).
 src_run() {
-  local -a unset_vars=()
-  while [[ "${1:-}" == "-u" ]]; do unset_vars+=("$2"); shift 2; done
+  local -a unset_vars=() bound=()
+  while [[ "${1:-}" == -[ut] ]]; do
+    if [[ "$1" == -u ]]; then unset_vars+=("$2"); else bound=(timeout --kill-after=5 "$2"); fi
+    shift 2
+  done
   local sp="$1" snip="$2"; shift 2
+  [[ ! "$snip" =~ (^|[^[:alnum:]_-])main([^[:alnum:]_-]|$) ]] || e2e_record "${sp##*/}"
   (
     for v in "${unset_vars[@]}"; do unset "$v"; done
-    exec bash -c 'sp="$1"; snip="$2"; shift 2; ARGS=("$@"); set --; source "$sp" >/dev/null 2>&1; eval "$snip"' \
+    exec "${bound[@]}" bash -c 'sp="$1"; snip="$2"; shift 2; ARGS=("$@"); set --; source "$sp" >/dev/null 2>&1; eval "$snip"' \
       _ "$sp" "$snip" "$@"
   )
 }
+
+# --- The e2e run budget: e2e is for main's ORCHESTRATION only ------------------------------
+# Every end-to-end run of a Kind script's main costs a whole converge (deploy.sh ~1.6s,
+# provision.sh more), so a single step's behaviour is tested by calling THAT step (dstep /
+# ptrap / psrc), never through main. Unchecked, each new branch became one more converge:
+# setup.test.sh went ~30s -> ~118s in story 4 (85e28783, 9106aee9) that way, after the same
+# mechanism had already cost (P) ~7 minutes (2026-09-30). The count is asserted EQUAL to the
+# budget at the end of the suite: converting a case to a direct call LOWERS the number here;
+# a NEW orchestration assertion (step order, a stop point, the EXIT trap) RAISES it, with a
+# comment saying what it orchestrates.
+# Recorded where main actually runs: src_run (a snippet calling `main`) and run_main (every
+# executed `bash <script>`); a static check below fails on any `bash` run of these scripts
+# outside run_main. Limits: setup.sh's own runs are not budgeted; the count does not see a
+# converge getting DEARER (the other half of the story-4 growth) — the per-entry
+# `LAYER=3 STEP=<entry> DURATION=<s>` line Layer 3 prints is the signal for that.
+declare -A E2E_BUDGET=(
+  # (D8) 3 full converges (deploy-rc: step order, renders-once, pool after root; unchanged
+  # redeploy; unreadable history) + 16 stop points / EXIT-trap classifications (root render,
+  # postgres, apply rejected x3, hung probes x2, disk, image-ref, no-runtime, no-timeout,
+  # migration, debug-image FATAL x2, collector, mc-0) + node-has-ref + kind-list-fail; the
+  # blueprint guard x5 (changed/missing/unreadable, host remedy, match); no cluster; 3 retired
+  # flags; main-migrate-failure.
+  [deploy.sh]=31
+  # (P) main's orchestration cases (fresh, no-op, stage failures, destroy/decline, TTY, ...)
+  # + (C) the provision.sh entry-point name-length rejection.
+  [provision.sh]=25
+)
+# e2e_record <script-basename>: one line per main run (the caller's line stack, for diagnosis),
+# under $WORK (removed by the EXIT trap).
+e2e_record() { { printf 'lines'; printf ' %s' "${BASH_LINENO[@]}"; printf '\n'; } >> "${E2E_DIR:?e2e_record before WORK}/$1"; }
+# run_main <script> [args...]: THE way to execute a budgeted Kind script (`bash <script>`).
+run_main() { e2e_record "${1##*/}"; bash "$@"; }
 
 # Source deploy.sh (src_run; its BASH_SOURCE guard suppresses main), then call the guard with
 # the runtime arg. The guard's stderr banner is what we capture.
@@ -131,6 +172,10 @@ for __d in "${__path_dirs[@]}"; do
 done
 unset __path_dirs __d __f __n
 export PATH="$TOOLBOX"
+# ...and a sealed KUBECONFIG: no fixture can reach the host's real kubeconfig (or $HOME's), so
+# a step that misses its kubectl stub fails closed instead of talking to a live cluster.
+export KUBECONFIG="${WORK}/no-such-kubeconfig"
+E2E_DIR="${WORK}/e2e-runs"; mkdir -p "$E2E_DIR"
 
 # --- PATH stubs --------------------------------------------------------------
 # Each stub drops a marker when invoked. Markers, not exit codes, are the evidence here: a
@@ -462,7 +507,7 @@ assert_rc     "namelen-setup-accept-exit0"    0 "$c_acc_rc"
 assert_absent "namelen-setup-accept-no-token" "CLUSTER_NAME_TOO_LONG" "$c_acc_out"   # not rejecting on some other axis
 # The entry points really apply it: provision.sh with a 50-char DT_CLUSTER_NAME is rejected
 # before it creates anything.
-prov_long="$(DT_CLUSTER_NAME="$NAME50" bash "$PROVISION" --check 2>&1)"
+prov_long="$(DT_CLUSTER_NAME="$NAME50" run_main "$PROVISION" --check 2>&1)"
 assert_status "namelen-provision-entry-rejects" "CLUSTER_NAME_TOO_LONG SUBJECT=cluster-name NAME=${NAME50}" "$prov_long"
 # Sourcing the lib runs nothing (teardown.sh relies on it: its validation deliberately differs).
 # NOT src_run, deliberately: this case asserts on what SOURCING itself prints, which src_run
@@ -831,18 +876,21 @@ EOF
 chmod +x "${PBIN}"/*
 
 RWORK_P="${WORK}/prender"; mkdir -p "$RWORK_P"
-# prov [args...]: run the copy's provision.sh END TO END. Sets P_RC / P_OUT. DT_CLUSTER_NAME
-# defaults to `pcluster` (P_CLUSTER overrides); stub knobs are temporary assignments.
-prov() {
-  P_OUT="$(PATH="${PBIN}:${PATH}" TMPDIR="$RWORK_P" DT_CLUSTER_NAME="${P_CLUSTER-pcluster}" \
-    bash "$PROV_COPY" "$@" 2>&1 </dev/null)"; P_RC=$?
+# penv <cmd...>: THE (P) environment (one home for prov, psrc and the hand-run cases): <cmd>
+# in a subshell with the P stubs first on PATH, TMPDIR in the render work dir, and
+# DT_CLUSTER_NAME=`pcluster` (P_CLUSTER overrides; P_NO_CLUSTER_NAME=1 unsets it). Stub knobs
+# are temporary assignments. The caller owns stdin.
+penv() {
+  ( export PATH="${PBIN}:${PATH}" TMPDIR="$RWORK_P"
+    if [[ -n "${P_NO_CLUSTER_NAME:-}" ]]; then unset DT_CLUSTER_NAME; else export DT_CLUSTER_NAME="${P_CLUSTER-pcluster}"; fi
+    "$@" )
 }
-# psrc '<snippet>' [args...]: src_run over the copy's provision.sh, same env as prov (stdin
-# /dev/null, so AUTO_YES=true as for prov). Output passes through; the caller captures it.
-psrc() {
-  PATH="${PBIN}:${PATH}" TMPDIR="$RWORK_P" DT_CLUSTER_NAME="${P_CLUSTER-pcluster}" \
-    src_run "$PROV_COPY" "$@" </dev/null
-}
+# prov [args...]: run the copy's provision.sh END TO END, stdin /dev/null (AUTO_YES=true, as
+# main sees it non-interactively). Sets P_RC / P_OUT.
+prov() { P_OUT="$(penv run_main "$PROV_COPY" "$@" 2>&1 </dev/null)"; P_RC=$?; }
+# psrc '<snippet>' [args...]: src_run over the copy's provision.sh, in penv, stdin /dev/null.
+# Output passes through; the caller captures it.
+psrc() { penv src_run "$PROV_COPY" "$@" </dev/null; }
 # psrc_rt '<snippet>' [args...]: psrc with the container runtime detected first (what main does
 # before anything renders: blueprint_render needs KIND_EXPERIMENTAL_PROVIDER).
 psrc_rt() { local snip="$1"; shift; psrc "detect_container_runtime >/dev/null; ${snip}" "$@"; }
@@ -1145,14 +1193,14 @@ STUB_KIND_LIST_FAIL=1 decide
 assert_status "prov-kind-list-fail-is-unreadable" "DECIDE REASON=unreadable" "$(decide_line)"
 # (P9, T4) a non-interactive destroy of an UNNAMED cluster refuses (operator-declined).
 make_ptree; printf 'dark-tower\n' > "$PSTATE/clusters"; reset_marks
-P_OUT="$(PATH="${PBIN}:${PATH}" TMPDIR="$RWORK_P" env -u DT_CLUSTER_NAME bash "$PROV_COPY" --yes 2>&1 </dev/null)"; P_RC=$?
+P_OUT="$(P_NO_CLUSTER_NAME=1 penv run_main "$PROV_COPY" --yes 2>&1 </dev/null)"; P_RC=$?
 assert_rc "prov-unnamed-destroy-refused-rc" 1 "$([[ "$P_RC" -ne 0 ]] && echo 1 || echo 0)"
 assert_status "prov-unnamed-destroy-operator-declined" "PROVISION_FAILED REASON=operator-declined" "$P_OUT"
 assert_status "prov-unnamed-destroy-refused-says-why" "never falls back to the default name" "$P_OUT"
 assert_no_marker "prov-unnamed-destroy-no-delete" "$MARK" "ran.kind_delete"
 # ...but CREATING the default cluster (nothing to destroy) still works for the host.
 make_ptree; reset_marks
-P_OUT="$(PATH="${PBIN}:${PATH}" TMPDIR="$RWORK_P" env -u DT_CLUSTER_NAME bash "$PROV_COPY" --yes 2>&1 </dev/null)"; P_RC=$?
+P_OUT="$(P_NO_CLUSTER_NAME=1 penv run_main "$PROV_COPY" --yes 2>&1 </dev/null)"; P_RC=$?
 assert_rc "prov-unnamed-create-ok" 0 "$P_RC"
 
 # port-held: a real listener on a host port the kind config maps → the environment, before
@@ -1331,8 +1379,9 @@ unset P_CLUSTER
 # --- (P10, test a) interactive `N` never destroys ---------------------------------------------
 make_ptree; seed_record
 printf '# edit\n' >> "$PTREE/infra/kind/kind-config.yaml"; reset_marks
-P_OUT="$(PATH="${PBIN}:${PATH}" TMPDIR="$RWORK_P" DT_CLUSTER_NAME=pcluster \
-  script -qec "bash '$PROV_COPY'" /dev/null <<< "n" 2>&1)"; P_RC=$?
+# On a TTY (script(1)), so not through run_main: recorded by hand (whether or not script exists).
+e2e_record provision.sh
+P_OUT="$(penv script -qec "bash '$PROV_COPY'" /dev/null <<< "n" 2>&1)"; P_RC=$?
 if command -v script >/dev/null 2>&1; then
   assert_status "prov-tty-no-refuses" "Not rebuilding" "$P_OUT"
   assert_status "prov-tty-no-operator-declined" "PROVISION_FAILED REASON=operator-declined" "$P_OUT"
@@ -1880,6 +1929,7 @@ case "\${args[0]:-}" in
         printf '%s\n' "\$body" > "${MARK}/applied.root.json"
       elif [[ "\$(jq -r '.metadata.name' <<< "\$body")" == "mh-template" ]]; then
         printf '%s\n' "\$body" > "${MARK}/applied.mh-template.json"
+        printf 'mh-template-written\n' >> "${MARK}/events"
       fi
       exit 0
     fi
@@ -1903,6 +1953,7 @@ case "\${args[0]:-}" in
     case "\${args[1]:-}" in
       restart) printf '%s\n' "\${args[2]}" >> "${MARK}/restarted"; exit 0 ;;
       status)
+        printf 'rollout-status %s\n' "\${args[2]:-}" >> "${MARK}/events"
         [[ -n "\${STUB_ROLLOUT_FAIL:-}" && "\${args[2]:-}" == "\${STUB_ROLLOUT_FAIL}" ]] && { echo "kubectl stub: rollout of \${args[2]} timed out" >&2; exit 1; }
         exit 0 ;;
     esac ;;
@@ -2065,6 +2116,7 @@ D4_MH="${D4_BIN}/mh.sh"
 cat > "$D4_MH" <<STUB
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "${MARK}/mh.calls"
+printf 'mh.sh %s\n' "\$1" >> "${MARK}/events"
 verb="\$1"
 cnt="\$(cat "${MARK}/mh.count" 2>/dev/null || echo "\${STUB_MH_INITIAL:-0}")"
 if [[ -n "\${STUB_MH_FAIL:-}" && "\${STUB_MH_FAIL%%:*}" == "\$verb" ]]; then
@@ -2088,13 +2140,32 @@ case "\$verb" in
 esac
 STUB
 chmod +x "$D4_MH"
+# d4 <cmd...>: THE deploy-test environment — every deploy.sh invocation over the D4 stubs runs
+# through it (dep, dstep, res, mig, the apply/contract cases, the hand-run main cases), so no
+# vehicle can drift off the stub seal. <cmd> runs in a subshell with DT_HOST_GATEWAY_IP and
+# DT_KIND_CONFIG unset (an ambient value must not leak in) and the D4 env exported. Per-call
+# variation ONLY through these harness-named overrides (never an ambient name):
+#   D4_PATH         replaces "${D4_BIN}:${PATH}" (a stubs-only PATH, or a fake clock in front)
+#   D4_CLUSTER      DT_CLUSTER_NAME (default d4cluster)
+#   D4_MIN_DISK_GB  DEVLOOP_MIN_DISK_GB (default 0: the disk guard never trips)
+#   D4_GATEWAY / D4_KIND_CONFIG   set DT_HOST_GATEWAY_IP / DT_KIND_CONFIG (a devloop cluster)
+# Stub knobs (STUB_*) and other deploy inputs are temporary assignments: `STUB_X=1 d4 …`.
+d4() {
+  ( unset DT_HOST_GATEWAY_IP DT_KIND_CONFIG
+    [[ -z "${D4_GATEWAY:-}" ]] || export DT_HOST_GATEWAY_IP="$D4_GATEWAY"
+    [[ -z "${D4_KIND_CONFIG:-}" ]] || export DT_KIND_CONFIG="$D4_KIND_CONFIG"
+    export PATH="${D4_PATH:-${D4_BIN}:${PATH}}" TMPDIR="$RWORK" DT_CLUSTER_NAME="${D4_CLUSTER:-d4cluster}" \
+      DEVLOOP_MIN_DISK_GB="${D4_MIN_DISK_GB:-0}" DT_JOB_POLL_SECONDS=0 DT_MH_SETTLE_POLL_SECONDS=0 \
+      DT_MH_SETTLE_FRESH_SECONDS=0 DT_MH_SH="$D4_MH"
+    "$@" )
+}
 BUILT_TAG="sha-bbbbbbbbbbbbbbbb"
 DEPLOYED_TAG="sha-aaaaaaaaaaaaaaaa"
 D4_REFS='for r in $(root_repos); do IMAGE_REFS[$r]="$r:sha-0123456789abcdef"; done'
 RUN_APPLY='cache_renders; '"${D4_REFS}"'; apply_env_root'
 
 reset_marks
-PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" src_run -u DT_HOST_GATEWAY_IP -u DT_KIND_CONFIG "$DEPLOY" "$RUN_APPLY" >/dev/null 2>&1
+d4 src_run "$DEPLOY" "$RUN_APPLY" >/dev/null 2>&1
 assert_rc "apply-root-plain-rc" 0 $?
 assert_absent "apply-root-plain-never-the-bare-root" "$ROOT_DIR" "$(cat "${MARK}/applied" 2>/dev/null)"
 assert_status "apply-root-plain-applied-the-tagged-wrapper" "localhost/mc-service:sha-0123456789abcdef" "$(cat "${MARK}/applied.root.json" 2>/dev/null)"
@@ -2105,9 +2176,8 @@ assert_no_marker "apply-root-deletes-nothing" "$MARK" "deleted"
 assert_rc "apply-root-plain-tempdir-removed" 1 "$(compgen -G "${RWORK}/dt-env-root.*" >/dev/null && echo 0 || echo 1)"
 
 reset_marks
-PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" DT_HOST_GATEWAY_IP=10.1.2.3 MC_0_WEBTRANSPORT_PORT=24433 \
-  MC_1_WEBTRANSPORT_PORT=24435 DT_KIND_CONFIG="$GW_KIND_CONFIG" \
-  src_run "$DEPLOY" "$RUN_APPLY" >/dev/null 2>&1
+D4_GATEWAY=10.1.2.3 MC_0_WEBTRANSPORT_PORT=24433 MC_1_WEBTRANSPORT_PORT=24435 D4_KIND_CONFIG="$GW_KIND_CONFIG" \
+  d4 src_run "$DEPLOY" "$RUN_APPLY" >/dev/null 2>&1
 assert_rc "apply-root-gateway-rc" 0 $?
 assert_absent "apply-root-gateway-not-the-plain-root" "$ROOT_DIR" "$(cat "${MARK}/applied" 2>/dev/null)"
 assert_status "apply-root-gateway-applied-the-wrapper" "https://10.1.2.3:24433" "$(cat "${MARK}/applied.root.json" 2>/dev/null)"
@@ -2115,8 +2185,7 @@ assert_status "apply-root-gateway-wrapper-tagged" "localhost/mc-service:sha-0123
 assert_rc "apply-root-gateway-tempdir-removed" 1 "$(compgen -G "${RWORK}/dt-env-root.*" >/dev/null && echo 0 || echo 1)"
 
 reset_marks
-out="$(PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" DT_HOST_GATEWAY_IP=10.1.2.3 DT_KIND_CONFIG="$GW_KIND_CONFIG" \
-  src_run "$DEPLOY" "$RUN_APPLY" 2>&1)"; rc=$?
+out="$(D4_GATEWAY=10.1.2.3 D4_KIND_CONFIG="$GW_KIND_CONFIG" d4 src_run "$DEPLOY" "$RUN_APPLY" 2>&1)"; rc=$?
 assert_rc "apply-root-render-failure-aborts" 1 "$rc"
 assert_no_marker "apply-root-render-failure-applies-nothing" "$MARK" "applied"
 assert_status "apply-root-render-failure-says-no-fallback" "NOT applying" "$out"
@@ -2127,7 +2196,7 @@ assert_rc "apply-root-failure-tempdir-removed" 1 "$(compgen -G "${RWORK}/dt-env-
 # copied): proves the contract, not the spelling.
 MH_SH_REAL="${REPO_ROOT}/infra/kind/scripts/mh.sh"
 reset_marks
-PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" src_run -u DT_HOST_GATEWAY_IP -u DT_KIND_CONFIG "$DEPLOY" "$RUN_APPLY" >/dev/null 2>&1
+d4 src_run "$DEPLOY" "$RUN_APPLY" >/dev/null 2>&1
 assert_rc "contract-apply-rc" 0 $?
 assert_marker "contract-mh-template-written" "$MARK" "applied.mh-template.json"
 tpl_verdict="$(src_run "$MH_SH_REAL" 'jq -c --arg port "$MH_WT_PORT_NAME" --arg env "$MH_ADDRESS_KEY" --arg lre "$MH_LABEL_VALUE_RE" "$(template_jq)" "${ARGS[0]}"' "${MARK}/applied.mh-template.json" 2>&1)"
@@ -2148,18 +2217,18 @@ old_rev="$(jq -r '.data.revision' "${MARK}/applied.mh-template.json")"
 jq -c '.data.revision = "0000000000000000" | .data["deployment.json"] = ({spec:{template:{spec:{containers:[{image:"localhost/mh-service:sha-dddddddddddddddd"}]}}}} | tojson)' \
   "${MARK}/applied.mh-template.json" > "${WORK}/old-tpl-changed.json"
 reset_marks
-STUB_MH_TEMPLATE_OLD="${WORK}/old-tpl-changed.json" PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" src_run -u DT_HOST_GATEWAY_IP -u DT_KIND_CONFIG "$DEPLOY" "$RUN_APPLY" >/dev/null 2>&1
+STUB_MH_TEMPLATE_OLD="${WORK}/old-tpl-changed.json" d4 src_run "$DEPLOY" "$RUN_APPLY" >/dev/null 2>&1
 assert_rc "contract-prev-images-on-change" 0 "$([[ "$(jq -r '.data.previous_images' "${MARK}/applied.mh-template.json" 2>/dev/null)" == "localhost/mh-service:sha-dddddddddddddddd" ]] && echo 0 || echo 1)"
 jq -c --arg r "$old_rev" '.data.revision = $r | .data.previous_images = "localhost/mh-service:sha-eeeeeeeeeeeeeeee"' \
   "${MARK}/applied.mh-template.json" > "${WORK}/old-tpl-same.json"
 reset_marks
-STUB_MH_TEMPLATE_OLD="${WORK}/old-tpl-same.json" PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" src_run -u DT_HOST_GATEWAY_IP -u DT_KIND_CONFIG "$DEPLOY" "$RUN_APPLY" >/dev/null 2>&1
+STUB_MH_TEMPLATE_OLD="${WORK}/old-tpl-same.json" d4 src_run "$DEPLOY" "$RUN_APPLY" >/dev/null 2>&1
 assert_rc "contract-prev-images-carried-forward" 0 "$([[ "$(jq -r '.data.previous_images' "${MARK}/applied.mh-template.json" 2>/dev/null)" == "localhost/mh-service:sha-eeeeeeeeeeeeeeee" ]] && echo 0 || echo 1)"
 # A superseded slot generation is UN-LABELLED (mh.sh would see a duplicate), never deleted.
 cur_slot_cms="$(jq -r --arg l dark-tower.io/mh-slot '.items[] | select(.kind == "ConfigMap" and ((.metadata.labels // {})[$l] // "") != "") | .metadata.name' "${MARK}/applied.root.json" 2>/dev/null)"
 assert_rc "contract-current-slot-cms-known" 0 "$([[ -n "$cur_slot_cms" ]] && echo 0 || echo 1)"
 reset_marks
-STUB_SLOT_CMS="mh-slot-0-config-oldgen1234\n$(printf '%s\\n' $cur_slot_cms)" PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" src_run -u DT_HOST_GATEWAY_IP -u DT_KIND_CONFIG "$DEPLOY" "$RUN_APPLY" >/dev/null 2>&1
+STUB_SLOT_CMS="mh-slot-0-config-oldgen1234\n$(printf '%s\\n' $cur_slot_cms)" d4 src_run "$DEPLOY" "$RUN_APPLY" >/dev/null 2>&1
 assert_status "contract-stale-slot-cm-unlabelled" "label configmap mh-slot-0-config-oldgen1234 -n dark-tower dark-tower.io/mh-slot-" "$(cat "${MARK}/labelled" 2>/dev/null)"
 for cm in $cur_slot_cms; do
   assert_absent "contract-current-slot-cm-kept-labelled-${cm%-*}" "configmap ${cm} " "$(cat "${MARK}/labelled" 2>/dev/null)"
@@ -2196,7 +2265,7 @@ assert_status "cache-primed-first-party-repos-derives" "localhost/db-migrate" "$
 # IMAGE_UNRESOLVED path). The pre-converge ref is still READ — it is the previous generation the
 # prune keeps — and an unreadable cluster fails with its own token.
 RUN_RES='cache_renders; for r in $(first_party_repos); do [[ "$r" == "${SKIP_REPO:-}" ]] || BUILT_REFS[$r]="$r:'"${BUILT_TAG:-sha-bbbbbbbbbbbbbbbb}"'"; done; resolve_image_refs || exit 1; for r in "${!IMAGE_REFS[@]}"; do echo "$r=${IMAGE_REFS[$r]} prev=${DEPLOYED_REFS[$r]:-none}"; done | sort'
-res() { PATH="${D4_BIN}:${PATH}" DT_CLUSTER_NAME=d4cluster src_run "$DEPLOY" "$RUN_RES" 2>&1; }
+res() { d4 src_run "$DEPLOY" "$RUN_RES" 2>&1; }
 JOBS_OK="1 localhost/db-migrate:${DEPLOYED_TAG}\n"
 reset_marks
 out="$(STUB_JOBS="$JOBS_OK" res)"; rc=$?
@@ -2219,7 +2288,7 @@ assert_status "resolve-kubectl-read-failure-distinct" "REASON=image-ref-read-fai
 
 # --- (D7) run_migration_job: fails LOUDLY; an unchanged set is a no-op -----------------------
 RUN_MIG='IMAGE_REFS[localhost/db-migrate]="localhost/db-migrate:'"${DEPLOYED_TAG}"'"; run_migration_job'
-mig() { PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" DT_CLUSTER_NAME=d4cluster DT_JOB_POLL_SECONDS=0 src_run "${1:-$DEPLOY}" "$RUN_MIG" 2>&1; }
+mig() { d4 src_run "${1:-$DEPLOY}" "$RUN_MIG" 2>&1; }
 reset_marks
 out="$(mig)"; rc=$?
 assert_rc "migrate-complete-rc0" 0 "$rc"
@@ -2295,12 +2364,64 @@ assert_status "migrate-existing-complete-still-prunes-older" "metadata.name!=db-
 # --- (D8) deploy.sh main: every run builds everything, applies the one root, restarts nothing --
 # main() runs SOURCED with check_blueprint overridden (the guard itself is pinned just below with
 # a stubbed provision.sh) — a harness-side override, not a production seam.
+# The (P) rule holds here too: a whole converge (dep) ONLY where the assertion is main's
+# orchestration (step order, a stop point, the EXIT trap); one step's behaviour goes through
+# dstep. Every dep counts against E2E_BUDGET (beside src_run).
 builds() { grep '^build ' "${MARK}/podman.calls" 2>/dev/null | grep -o 'infra/docker/[a-z-]*/Dockerfile' | sort | tr '\n' ' '; }
 RUN_DEPLOY='check_blueprint() { : > "'"${MARK}"'/ran.blueprint-check"; }; main'
-dep() {
-  PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" DT_CLUSTER_NAME=d4cluster DEVLOOP_MIN_DISK_GB=0 DT_JOB_POLL_SECONDS=0 \
-    DT_MH_SETTLE_POLL_SECONDS=0 DT_MH_SETTLE_FRESH_SECONDS=0 DT_MH_SH="$D4_MH" src_run -u DT_HOST_GATEWAY_IP -u DT_KIND_CONFIG "$DEPLOY" "$RUN_DEPLOY" 2>&1
+dep() { d4 src_run "$DEPLOY" "$RUN_DEPLOY" 2>&1; }
+
+# dstep <fn> [args...]: ONE deploy.sh step the way main runs it — the real __deploy_exit_trap,
+# `step <fn>` under the sourced script's set -e, in d4 — the deploy twin of (P)'s ptrap. The
+# cases below that exercise ONE step (the MH pool, the removed-MH settle, the MH prune, the
+# debug-image preload) call it; a whole converge (dep) is for main's orchestration only (the
+# e2e run budget). What main would have produced upstream is SEEDED, never re-derived:
+#   - the render cache (main runs cache_renders before any step): ROOT_RENDER,
+#     MIGRATE_BASE_RENDER and RENDERS_CACHED, from files deploy.sh's OWN cache_renders wrote
+#     once (below). These are deploy.sh internals; the read-back control turns a rename of
+#     any of them into a loud failure.
+#   - DSTEP_IMAGE_REFS="<repo>=<ref> ..." -> IMAGE_REFS (what resolve_image_refs sets).
+#   - every run is BOUNDED (src_run -t; DSTEP_TIMEOUT, default 60s): a step that never returns
+#     (e.g. a settle wait whose deadline check broke) fails its case instead of hanging Layer 3.
+# The real hand-offs these seeds stand in for are asserted by the kept e2e cases (deploy-rc).
+DSTEP_SEED_ROOT="${RWORK}/dstep-seed-root.yaml"
+DSTEP_SEED_MIGRATE="${RWORK}/dstep-seed-migrate-base.yaml"
+DSTEP_SEED='ROOT_RENDER="$(<"'"${DSTEP_SEED_ROOT}"'")"; MIGRATE_BASE_RENDER="$(<"'"${DSTEP_SEED_MIGRATE}"'")"; RENDERS_CACHED=true; for kv in ${DSTEP_IMAGE_REFS:-}; do IMAGE_REFS["${kv%%=*}"]="${kv#*=}"; done; '
+dstep() {
+  d4 src_run -t "${DSTEP_TIMEOUT:-60}" "$DEPLOY" "${DSTEP_SEED}"'trap __deploy_exit_trap EXIT; step "${ARGS[@]}"' "$@" 2>&1
 }
+reset_marks
+d4 src_run "$DEPLOY" 'cache_renders; cached_render root > "${ARGS[0]}"; cached_render migrate-base > "${ARGS[1]}"' \
+  "$DSTEP_SEED_ROOT" "$DSTEP_SEED_MIGRATE" >/dev/null 2>&1
+assert_rc "dstep-seed-written-by-cache-renders" 0 $?
+assert_status "dstep-seed-root-nonempty" "kind: Deployment" "$(cat "$DSTEP_SEED_ROOT" 2>/dev/null)"
+assert_status "dstep-seed-migrate-base-nonempty" "kind: Job" "$(cat "$DSTEP_SEED_MIGRATE" 2>/dev/null)"
+# Read-back control: a seeded step sees EXACTLY what cache_renders cached. A renamed internal
+# (ROOT_RENDER, MIGRATE_BASE_RENDER, RENDERS_CACHED) leaves the seed unread and fails here.
+for r in "root|${DSTEP_SEED_ROOT}" "migrate-base|${DSTEP_SEED_MIGRATE}"; do
+  got="$(dstep cached_render "${r%%|*}")"
+  assert_rc "dstep-seed-${r%%|*}-reads-back" 0 "$([[ -s "${r#*|}" && "$got" == "$(<"${r#*|}")" ]] && echo 0 || echo "1 (${#got} bytes read back)")"
+done
+
+# A fake clock for the settle-wait DEADLINE cases: `date +%s` advances 1s per read, so the wait
+# reaches its deadline after a fixed number of polls instead of spinning on the wall clock. Its
+# own dir under $WORK, put in front of PATH ONLY by those cases (D4_PATH); every other form
+# execs the real date by the absolute path captured here (never a PATH lookup: no recursion).
+# The counter lives under $MARK (reset per case).
+CLOCK_BIN="${WORK}/fakeclock"; mkdir -p "$CLOCK_BIN"
+REAL_DATE="$(command -v date)"
+assert_rc "fake-clock-real-date-resolved" 0 "$([[ "$REAL_DATE" == /* && "$REAL_DATE" != "${CLOCK_BIN}/"* ]] && echo 0 || echo "1 (${REAL_DATE})")"
+cat > "${CLOCK_BIN}/date" <<STUB
+#!/usr/bin/env bash
+if [[ "\$*" == "+%s" ]]; then
+  n="\$(cat "${MARK}/fake-clock" 2>/dev/null || echo 1000000000)"
+  echo "\$((n + 1))" > "${MARK}/fake-clock"; echo "\$n"; exit 0
+fi
+exec "${REAL_DATE}" "\$@"
+STUB
+chmod +x "${CLOCK_BIN}/date"
+# The D4 PATH with the fake clock in front, for D4_PATH= on exactly the deadline cases.
+FAKE_CLOCK_PATH="${CLOCK_BIN}:${D4_BIN}:${PATH}"
 ALL_DOCKERFILES="infra/docker/ac-service/Dockerfile infra/docker/db-migrate/Dockerfile infra/docker/gc-service/Dockerfile infra/docker/mc-service/Dockerfile infra/docker/mh-service/Dockerfile "
 reset_marks
 GC_NODE_IMAGES="IMAGE TAG ID\nlocalhost/gc-service ${BUILT_TAG} x\nlocalhost/gc-service ${DEPLOYED_TAG} y\nlocalhost/gc-service sha-cccccccccccccccc z\nlocalhost/mc-service ${BUILT_TAG} w\n"
@@ -2351,6 +2472,14 @@ assert_absent "deploy-no-label-selector-pod-wait" "wait --for=condition=Ready po
 assert_rc "deploy-mh-pool-upgrade-then-top-up" 0 "$([[ "$(grep -oE '^(upgrade|up)' "${MARK}/mh.calls" 2>/dev/null | tr '\n' ' ')" == "upgrade up up " ]] && echo 0 || echo "1 ($(tr '\n' ';' < "${MARK}/mh.calls" 2>/dev/null))")"
 assert_status "deploy-mh-pool-top-up-owner-baseline" "up --owner baseline --json" "$(cat "${MARK}/mh.calls" 2>/dev/null)"
 assert_status "deploy-mh-pool-reported" "MH pool: 2 baseline MHs serving" "$out"
+# The hand-offs the dstep pool cases stand in for, from ONE ordered events log the stubs share:
+# the MH template is WRITTEN (apply_env_root) and every root workload's rollout is WAITED ON
+# (wait_for_env_root) before the pool's first mh.sh call.
+ev_line() { grep -n -m1 "$1" "${MARK}/events" 2>/dev/null | cut -d: -f1; }
+d8_first_mh="$(ev_line '^mh\.sh ')"; d8_tpl="$(ev_line '^mh-template-written$')"
+d8_last_wait="$(grep -n '^rollout-status ' "${MARK}/events" 2>/dev/null | tail -n1 | cut -d: -f1)"
+assert_rc "deploy-writes-mh-template-before-pool" 0 "$([[ -n "$d8_tpl" && -n "$d8_first_mh" ]] && (( d8_tpl < d8_first_mh )) && echo 0 || echo "1 (template line ${d8_tpl:-none}, first mh.sh line ${d8_first_mh:-none})")"
+assert_rc "deploy-mh-pool-after-root-wait" 0 "$([[ -n "$d8_last_wait" && -n "$d8_first_mh" ]] && (( d8_last_wait < d8_first_mh )) && echo 0 || echo "1 (last rollout wait line ${d8_last_wait:-none}, first mh.sh line ${d8_first_mh:-none})")"
 # The MH template is never waited on as a root workload (it is never applied).
 assert_absent "deploy-never-waits-on-mh-template" "rollout status deployment/mh-template" "$(cat "${MARK}/kubectl.calls" 2>/dev/null)"
 
@@ -2374,7 +2503,7 @@ L7_REASON_SED="$(sed -nE "s/^ *reason=\"\\\$\(sed -E '(.*)' <<<\"\\\$line\"\)\"$
 assert_rc "mh-pool-layer7-relay-regex-extracted" 0 "$([[ -n "$L7_RE" && -n "$L7_REASON_SED" ]] && echo 0 || echo "1 (re='${L7_RE}' sed='${L7_REASON_SED}')")"
 # --- (D8b) The MH pool converge: B baseline MHs, every mh.sh failure mapped by the ONE table ----
 reset_marks
-out="$(STUB_JOBS="$JOBS_OK" STUB_MH_INITIAL=2 dep)"; rc=$?
+out="$(STUB_JOBS="$JOBS_OK" STUB_MH_INITIAL=2 dstep converge_mh_pool)"; rc=$?
 assert_rc "mh-pool-already-at-baseline-rc" 0 "$rc"
 assert_absent "mh-pool-already-at-baseline-no-up" "up --owner" "$(cat "${MARK}/mh.calls" 2>/dev/null)"
 # Positive control for the no-wait assertion below: upgrade WAS issued (and replaced nothing).
@@ -2383,7 +2512,7 @@ assert_status "mh-pool-already-at-baseline-upgrade-issued" "upgrade --json" "$(c
 assert_no_marker "mh-pool-noop-converge-no-gc-wait" "$MARK" "gc-metrics.calls"
 reset_marks
 # Shrink (drain one); both GC pods count the drained MH healthy for two polls, then forget it.
-out="$(STUB_JOBS="$JOBS_OK" STUB_MH_INITIAL=3 STUB_GC_HEALTHY_SEQ="3 3 3 2" dep)"; rc=$?
+out="$(STUB_JOBS="$JOBS_OK" STUB_MH_INITIAL=3 STUB_GC_HEALTHY_SEQ="3 3 3 2" dstep converge_mh_pool)"; rc=$?
 assert_rc "mh-pool-above-baseline-rc" 0 "$rc"
 assert_status "mh-pool-above-baseline-drains-highest" "drain 2 --owner baseline --json" "$(cat "${MARK}/mh.calls" 2>/dev/null)"
 # --- (D8c) A REMOVED MH must be unselectable in GC before deploy returns (until MH-3) ----------
@@ -2399,28 +2528,28 @@ assert_status "mh-removed-reads-live-pod-via-proxy" "/api/v1/namespaces/dark-tow
 assert_absent "mh-removed-skips-terminating-pod" "gc-service-old" "$(cat "${MARK}/gc-metrics.calls" 2>/dev/null)"
 # T1 — per pod, NEVER summed: A settles at once, B still counts the dead row for two polls.
 reset_marks
-out="$(STUB_JOBS="$JOBS_OK" STUB_MH_INITIAL=3 STUB_GC_HEALTHY_SEQ_A="2" STUB_GC_HEALTHY_SEQ_B="3 3 3 2" dep)"; rc=$?
+out="$(STUB_JOBS="$JOBS_OK" STUB_MH_INITIAL=3 STUB_GC_HEALTHY_SEQ_A="2" STUB_GC_HEALTHY_SEQ_B="3 3 3 2" dstep converge_mh_pool)"; rc=$?
 assert_rc "mh-removed-per-pod-rc" 0 "$rc"
 assert_rc "mh-removed-per-pod-waits-for-the-slow-pod" 0 "$([[ "$(reads gc-service-b)" -eq 4 ]] && echo 0 || echo "1 (b=$(reads gc-service-b))")"
 # Both pods exactly AT live (2 each) settle at the first eligible poll; a cross-pod sum (4 > 2) would not.
 reset_marks
-out="$(STUB_JOBS="$JOBS_OK" STUB_MH_INITIAL=3 STUB_GC_HEALTHY_SEQ="2" dep)"; rc=$?
+out="$(STUB_JOBS="$JOBS_OK" STUB_MH_INITIAL=3 STUB_GC_HEALTHY_SEQ="2" dstep converge_mh_pool)"; rc=$?
 assert_rc "mh-removed-at-live-not-summed-rc" 0 "$rc"
 # (2 reads per pod: the first-read baseline, then one poll whose counter is already +10.)
 assert_rc "mh-removed-at-live-not-summed-one-poll" 0 "$([[ "$(reads gc-service-a)" -eq 2 && "$(reads gc-service-b)" -eq 2 ]] && echo 0 || echo "1 (a=$(reads gc-service-a) b=$(reads gc-service-b))")"
 # T2 — the live set is `serving` ONLY: a starting and a draining slot are not registered live MHs.
 reset_marks
-out="$(STUB_JOBS="$JOBS_OK" STUB_MH_INITIAL=3 STUB_MH_EXTRA="starting draining" dep)"; rc=$?
+out="$(STUB_JOBS="$JOBS_OK" STUB_MH_INITIAL=3 STUB_MH_EXTRA="starting draining" dstep converge_mh_pool)"; rc=$?
 assert_status "mh-removed-live-is-serving-only" "(registered live MHs: 2;" "$out"
 # A dead `healthy` row must not hide behind a just-registered `pending` replacement: healthy 2
 # + pending 1 > 2 registered live MHs keeps waiting until the dead row leaves (healthy 1).
 reset_marks
-out="$(STUB_JOBS="$JOBS_OK" STUB_MH_INITIAL=3 STUB_GC_PENDING=1 STUB_GC_HEALTHY_SEQ="2 2 2 1" dep)"; rc=$?
+out="$(STUB_JOBS="$JOBS_OK" STUB_MH_INITIAL=3 STUB_GC_PENDING=1 STUB_GC_HEALTHY_SEQ="2 2 2 1" dstep converge_mh_pool)"; rc=$?
 assert_rc "mh-removed-pending-counted-rc" 0 "$rc"
 assert_rc "mh-removed-pending-counted-waited" 0 "$([[ "$(reads gc-service-a)" -eq 4 ]] && echo 0 || echo "1 (a=$(reads gc-service-a))")"
 # Upgrade that replaced an MH also waits (its old MH is the removed one).
 reset_marks
-out="$(STUB_JOBS="$JOBS_OK" STUB_MH_INITIAL=2 STUB_MH_REPLACED='[{"old":0,"new":2}]' dep)"; rc=$?
+out="$(STUB_JOBS="$JOBS_OK" STUB_MH_INITIAL=2 STUB_MH_REPLACED='[{"old":0,"new":2}]' dstep converge_mh_pool)"; rc=$?
 assert_rc "mh-removed-upgrade-rc" 0 "$rc"
 assert_status "mh-removed-upgrade-waits" "Waiting for GC to stop selecting the 1 removed MH(s)" "$out"
 assert_marker "mh-removed-upgrade-read-gc" "$MARK" "gc-metrics.calls"
@@ -2428,18 +2557,20 @@ assert_marker "mh-removed-upgrade-read-gc" "$MARK" "gc-metrics.calls"
 # count_available_mh success counter has advanced >= 2 past its first-read baseline. Positive
 # twin: advancing +2 settles (at the read that reaches it).
 reset_marks
-out="$(STUB_JOBS="$JOBS_OK" STUB_MH_INITIAL=3 STUB_GC_SUCCESS_SEQ="5 6 7" dep)"; rc=$?
+out="$(STUB_JOBS="$JOBS_OK" STUB_MH_INITIAL=3 STUB_GC_SUCCESS_SEQ="5 6 7" dstep converge_mh_pool)"; rc=$?
 assert_rc "mh-removed-recompute-plus2-settles-rc" 0 "$rc"
 assert_rc "mh-removed-recompute-plus2-settles-at-plus2" 0 "$([[ "$(reads gc-service-a)" -eq 3 ]] && echo 0 || echo "1 (a=$(reads gc-service-a))")"
 # A GC container restart mid-wait (the per-process counter drops BELOW its baseline) re-baselines
 # at 0: the new process recomputing twice settles it (never a false red until the deadline), and
 # not before — at success=1 it is still unrecomputed.
 reset_marks
-out="$(STUB_JOBS="$JOBS_OK" STUB_MH_INITIAL=3 STUB_GC_SUCCESS_SEQ="500 1 2" dep)"; rc=$?
+out="$(STUB_JOBS="$JOBS_OK" STUB_MH_INITIAL=3 STUB_GC_SUCCESS_SEQ="500 1 2" dstep converge_mh_pool)"; rc=$?
 assert_rc "mh-removed-gc-restart-rebaselined-rc" 0 "$rc"
 assert_rc "mh-removed-gc-restart-needs-two-recomputes" 0 "$([[ "$(reads gc-service-a)" -eq 3 ]] && echo 0 || echo "1 (a=$(reads gc-service-a))")"
 reset_marks
-out="$(STUB_JOBS="$JOBS_OK" STUB_MH_INITIAL=3 STUB_GC_SUCCESS_SEQ="500 1" STUB_GC_STALENESS=0 DT_MH_SETTLE_MARGIN_SECONDS=0 dep)"; rc=$?
+# This one also ends at the deadline: on the fake clock (one poll).
+out="$(STUB_JOBS="$JOBS_OK" STUB_MH_INITIAL=3 STUB_GC_SUCCESS_SEQ="500 1" STUB_GC_STALENESS=0 DT_MH_SETTLE_MARGIN_SECONDS=0 \
+  D4_PATH="$FAKE_CLOCK_PATH" DSTEP_TIMEOUT=10 dstep converge_mh_pool)"; rc=$?
 assert_status "mh-removed-gc-restart-one-recompute-not-enough" "gc-service-a=unrecomputed(success=1,baseline=0" "$out"
 # Timeout: past B (from the GC pod's OWN gauge) + margin, a loud failure with its own token.
 # Every vacuous-pass shape is one: still counted; gauge absent; recompute never succeeded
@@ -2454,13 +2585,17 @@ for c in 'still-counted|STUB_GC_HEALTHY_SEQ=3|gc-service-a=3(error=0)' \
   IFS='|' read -r cname cenv cwant <<< "$c"
   reset_marks
   # cenv: the case's own stub knobs, as shell assignments (a value may hold spaces).
+  # On the fake clock (deadline = first read + 1s: exactly one poll); bounded like every dstep.
   out="$(eval "export ${cenv}"; STUB_JOBS="$JOBS_OK" STUB_MH_INITIAL=3 STUB_GC_STALENESS=0 \
-    DT_MH_SETTLE_MARGIN_SECONDS=0 dep)"; rc=$?
+    DT_MH_SETTLE_MARGIN_SECONDS=0 D4_PATH="$FAKE_CLOCK_PATH" DSTEP_TIMEOUT=10 dstep converge_mh_pool)"; rc=$?
   line="DEPLOY_FAILED REASON=mh-removed-still-selectable MH_TOKEN=- SLOT=- WORKLOADS=deployment/gc-service"
   assert_rc "mh-removed-${cname}-rc" 1 "$([[ "$rc" -ne 0 ]] && echo 1 || echo 0)"
   assert_status "mh-removed-${cname}-token" "$line" "$out"
   assert_rc "mh-removed-${cname}-one-line" 1 "$(grep -c '^DEPLOY_FAILED' <<< "$out")"
   assert_status "mh-removed-${cname}-bound-from-gauge" "After B (1s, rounded up) + 0s" "$out"
+  # Positive control on the fake clock: the baseline read + ONE poll per pod, so the stub
+  # clock (read through PATH) is what ended the wait.
+  assert_rc "mh-removed-${cname}-fake-clock-one-poll" 0 "$([[ "$(reads gc-service-a)" -eq 2 && "$(reads gc-service-b)" -eq 2 && -s "${MARK}/fake-clock" ]] && echo 0 || echo "1 (a=$(reads gc-service-a) b=$(reads gc-service-b))")"
   assert_status "mh-removed-${cname}-named" "$cwant" "$out"
   relayed="$(grep -m1 -oE "DEPLOY_FAILED ${L7_RE}" <<< "$out" || true)"
   assert_rc "mh-removed-${cname}-layer7-relays-whole-line" 0 "$([[ "$relayed" == "$line" ]] && echo 0 || echo "1 (relayed='${relayed}')")"
@@ -2470,20 +2605,20 @@ assert_status "mh-removed-timeout-names-error-series" 'gc_db_queries_total{opera
 # An apiserver that dies mid-wait is the ENVIRONMENT (operator lane), never the settle token:
 # the metrics read fails AND the readyz probe fails.
 reset_marks
-out="$(STUB_JOBS="$JOBS_OK" STUB_MH_INITIAL=3 STUB_GC_METRICS_FAIL=1 STUB_READYZ_FAIL=1 dep)"; rc=$?
+out="$(STUB_JOBS="$JOBS_OK" STUB_MH_INITIAL=3 STUB_GC_METRICS_FAIL=1 STUB_READYZ_FAIL=1 dstep converge_mh_pool)"; rc=$?
 assert_status "mh-removed-env-down-classified" "DEPLOY_FAILED REASON=apiserver-unreachable MH_TOKEN=- SLOT=- WORKLOADS=deployment/gc-service" "$out"
 assert_rc "mh-removed-env-down-one-line" 1 "$(grep -c '^DEPLOY_FAILED' <<< "$out")"
 assert_absent "mh-removed-env-down-not-the-settle-token" "REASON=mh-removed-still-selectable" "$out"
 assert_marker "mh-removed-env-down-probed" "$MARK" "ran.readyz"
 # The same unreadable /metrics with the apiserver UP is the settle token, at once (no wait).
 reset_marks
-out="$(STUB_JOBS="$JOBS_OK" STUB_MH_INITIAL=3 STUB_GC_METRICS_FAIL=1 dep)"; rc=$?
+out="$(STUB_JOBS="$JOBS_OK" STUB_MH_INITIAL=3 STUB_GC_METRICS_FAIL=1 dstep converge_mh_pool)"; rc=$?
 assert_status "mh-removed-metrics-unreadable-token" "DEPLOY_FAILED REASON=mh-removed-still-selectable MH_TOKEN=- SLOT=- WORKLOADS=deployment/gc-service" "$out"
 assert_status "mh-removed-metrics-unreadable-named" "Could not read /metrics of GC pod dark-tower/gc-service-a" "$out"
 assert_absent "mh-removed-metrics-unreadable-no-wait" "Waiting for GC to stop selecting" "$out"
 # upgrade OK without its contract `replaced` array: cannot tell whether it removed an MH.
 reset_marks
-out="$(STUB_JOBS="$JOBS_OK" STUB_MH_INITIAL=2 STUB_MH_REPLACED=null dep)"; rc=$?
+out="$(STUB_JOBS="$JOBS_OK" STUB_MH_INITIAL=2 STUB_MH_REPLACED=null dstep converge_mh_pool)"; rc=$?
 assert_status "mh-removed-upgrade-no-replaced-array" "DEPLOY_FAILED REASON=mh-pool-failed MH_TOKEN=- SLOT=- WORKLOADS=-" "$out"
 assert_status "mh-removed-upgrade-no-replaced-array-says-so" "without a 'replaced' array" "$out"
 # The tick margin is read from GC's source constant (its one home), never retyped: an
@@ -2503,7 +2638,7 @@ for c in "upgrade:mh-rollout-failed|mh-rollout-failed|3" "up:not-available-timeo
   IFS='|' read -r fail want slot <<< "$c"
   tok="${fail#*:}"
   reset_marks
-  out="$(STUB_JOBS="$JOBS_OK" STUB_MH_FAIL="$fail" dep)"; rc=$?
+  out="$(STUB_JOBS="$JOBS_OK" STUB_MH_FAIL="$fail" dstep converge_mh_pool)"; rc=$?
   line="DEPLOY_FAILED REASON=${want} MH_TOKEN=${tok} SLOT=${slot} WORKLOADS=mh-s${slot}"
   assert_rc "mh-pool-${fail}-rc" 1 "$([[ "$rc" -ne 0 ]] && echo 1 || echo 0)"
   assert_status "mh-pool-${fail}-token" "$line" "$out"
@@ -2515,19 +2650,19 @@ done
 # An UNMAPPED mh.sh token while the apiserver is gone is the ENVIRONMENT (operator lane), never
 # a pool fault: deploy classifies it like every other step, keeping mh.sh's token on the line.
 reset_marks
-out="$(STUB_JOBS="$JOBS_OK" STUB_MH_FAIL=upgrade:kubectl-failed STUB_READYZ_FAIL=1 dep)"; rc=$?
+out="$(STUB_JOBS="$JOBS_OK" STUB_MH_FAIL=upgrade:kubectl-failed STUB_READYZ_FAIL=1 dstep converge_mh_pool)"; rc=$?
 assert_status "mh-pool-env-down-classified" "DEPLOY_FAILED REASON=apiserver-unreachable MH_TOKEN=kubectl-failed SLOT=3 WORKLOADS=mh-s3" "$out"
 assert_rc "mh-pool-env-down-one-line" 1 "$(grep -c '^DEPLOY_FAILED' <<< "$out")"
 assert_marker "mh-pool-env-down-probed" "$MARK" "ran.readyz"
 # B = 0 (or any non-integer) never "converges" to zero MHs: a loud pool failure.
 reset_marks
-out="$(STUB_JOBS="$JOBS_OK" STUB_MH_BASELINE=0 dep)"; rc=$?
+out="$(STUB_JOBS="$JOBS_OK" STUB_MH_BASELINE=0 dstep converge_mh_pool)"; rc=$?
 assert_status "mh-pool-baseline-zero-token" "DEPLOY_FAILED REASON=mh-pool-failed MH_TOKEN=- SLOT=- WORKLOADS=-" "$out"
 assert_rc "mh-pool-baseline-zero-one-line" 1 "$(grep -c '^DEPLOY_FAILED' <<< "$out")"
 assert_absent "mh-pool-baseline-zero-no-upgrade" "upgrade" "$(cat "${MARK}/mh.calls" 2>/dev/null)"
 # Headroom: B + 1 > K refuses BEFORE touching any MH (no upgrade/up/drain issued).
 reset_marks
-out="$(STUB_JOBS="$JOBS_OK" STUB_MH_BASELINE=6 STUB_MH_K=6 dep)"; rc=$?
+out="$(STUB_JOBS="$JOBS_OK" STUB_MH_BASELINE=6 STUB_MH_K=6 dstep converge_mh_pool)"; rc=$?
 assert_status "mh-pool-headroom-token" "DEPLOY_FAILED REASON=mh-no-free-slot MH_TOKEN=- SLOT=- WORKLOADS=-" "$out"
 assert_rc "mh-pool-headroom-one-line" 1 "$(grep -c '^DEPLOY_FAILED' <<< "$out")"
 assert_rc "mh-pool-headroom-touches-nothing" 0 "$([[ -z "$(grep -vE '^list' "${MARK}/mh.calls" 2>/dev/null)" ]] && echo 0 || echo 1)"
@@ -2536,7 +2671,7 @@ assert_rc "mh-pool-headroom-touches-nothing" 0 "$([[ -z "$(grep -vE '^list' "${M
 MH_NODE_IMAGES="IMAGE TAG ID\nlocalhost/mh-service ${BUILT_TAG} a\nlocalhost/mh-service sha-dddddddddddddddd b\nlocalhost/mh-service sha-eeeeeeeeeeeeeeee c\nlocalhost/mh-service sha-ffffffffffffffff d\n"
 jq -cn '{data: {"deployment.json": ({spec:{template:{spec:{containers:[{image:"localhost/mh-service:sha-dddddddddddddddd"}]}}}} | tojson), revision: "1111111111111111", baseline: "2", previous_images: "localhost/mh-service:sha-eeeeeeeeeeeeeeee"}}' > "${WORK}/prune-tpl.json"
 reset_marks
-out="$(STUB_JOBS="$JOBS_OK" STUB_NODE_IMAGES="$MH_NODE_IMAGES" STUB_MH_TEMPLATE_OLD="${WORK}/prune-tpl.json" dep)"; rc=$?
+out="$(STUB_JOBS="$JOBS_OK" STUB_NODE_IMAGES="$MH_NODE_IMAGES" STUB_MH_TEMPLATE_OLD="${WORK}/prune-tpl.json" DSTEP_IMAGE_REFS="localhost/mh-service=localhost/mh-service:${BUILT_TAG}" dstep prune_superseded_images)"; rc=$?
 assert_rc "prune-mh-rc" 0 "$rc"
 assert_status "prune-mh-evicts-outside-keep-set" "localhost/mh-service:sha-ffffffffffffffff" "$(cat "${MARK}/node-rmi" 2>/dev/null)"
 for keep in "${BUILT_TAG}" sha-dddddddddddddddd sha-eeeeeeeeeeeeeeee; do
@@ -2546,16 +2681,16 @@ done
 MH_NODE_IMAGES2="${MH_NODE_IMAGES}localhost/mh-service sha-1111111111111111 e\n"
 reset_marks
 out="$(STUB_JOBS="$JOBS_OK" STUB_NODE_IMAGES="$MH_NODE_IMAGES2" STUB_MH_TEMPLATE_OLD="${WORK}/prune-tpl.json" \
-  STUB_MH_POD_IMAGES="localhost/mh-service:sha-ffffffffffffffff\n" dep)"; rc=$?
+  STUB_MH_POD_IMAGES="localhost/mh-service:sha-ffffffffffffffff\n" DSTEP_IMAGE_REFS="localhost/mh-service=localhost/mh-service:${BUILT_TAG}" dstep prune_superseded_images)"; rc=$?
 assert_absent "prune-mh-keeps-live-pod-image" "localhost/mh-service:sha-ffffffffffffffff" "$(cat "${MARK}/node-rmi" 2>/dev/null)"
 assert_status "prune-mh-live-pod-control-evicts-other" "localhost/mh-service:sha-1111111111111111" "$(cat "${MARK}/node-rmi" 2>/dev/null)"
 # The live-pod read fails: loud skip, no MH eviction.
 reset_marks
-out="$(STUB_JOBS="$JOBS_OK" STUB_NODE_IMAGES="$MH_NODE_IMAGES" STUB_MH_TEMPLATE_OLD="${WORK}/prune-tpl.json" STUB_MH_PODS_FAIL=1 dep)"; rc=$?
+out="$(STUB_JOBS="$JOBS_OK" STUB_NODE_IMAGES="$MH_NODE_IMAGES" STUB_MH_TEMPLATE_OLD="${WORK}/prune-tpl.json" STUB_MH_PODS_FAIL=1 DSTEP_IMAGE_REFS="localhost/mh-service=localhost/mh-service:${BUILT_TAG}" dstep prune_superseded_images)"; rc=$?
 assert_status "prune-mh-live-pods-unreadable-skips-loudly" "PRUNE_SKIPPED SERVICE=mh REASON=live-pods-unreadable" "$out"
 assert_absent "prune-mh-live-pods-unreadable-evicts-no-mh" "localhost/mh-service" "$(cat "${MARK}/node-rmi" 2>/dev/null)"
 reset_marks
-out="$(STUB_JOBS="$JOBS_OK" STUB_NODE_IMAGES="$MH_NODE_IMAGES" dep)"; rc=$?
+out="$(STUB_JOBS="$JOBS_OK" STUB_NODE_IMAGES="$MH_NODE_IMAGES" DSTEP_IMAGE_REFS="localhost/mh-service=localhost/mh-service:${BUILT_TAG}" dstep prune_superseded_images)"; rc=$?
 assert_status "prune-mh-template-unreadable-skips-loudly" "PRUNE_SKIPPED SERVICE=mh REASON=template-unreadable" "$out"
 assert_absent "prune-mh-template-unreadable-evicts-no-mh" "localhost/mh-service" "$(cat "${MARK}/node-rmi" 2>/dev/null)"
 
@@ -2613,8 +2748,7 @@ for probe in runtime readyz; do
 done
 # Environment reasons are classified at the source, each with its own token.
 reset_marks
-out="$(PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" DT_CLUSTER_NAME=d4cluster DEVLOOP_MIN_DISK_GB=999999999 DT_JOB_POLL_SECONDS=0 \
-  STUB_JOBS="$JOBS_OK" src_run -u DT_HOST_GATEWAY_IP "$DEPLOY" "$RUN_DEPLOY" 2>&1)"; rc=$?
+out="$(D4_MIN_DISK_GB=999999999 STUB_JOBS="$JOBS_OK" dep)"; rc=$?
 assert_status "deploy-insufficient-disk-token" "DEPLOY_FAILED REASON=insufficient-disk WORKLOADS=-" "$out"
 assert_rc "deploy-insufficient-disk-one-line" 1 "$(grep -c '^DEPLOY_FAILED' <<< "$out")"
 reset_marks
@@ -2629,8 +2763,7 @@ for t in bash awk grep sed sort mktemp cat cut head tail tr sha256sum date dirna
   ln -sf "$(command -v "$t")" "$NORT_BIN/$t"
 done
 reset_marks
-out="$(PATH="${NORT_BIN}" TMPDIR="$RWORK" DT_CLUSTER_NAME=d4cluster DEVLOOP_MIN_DISK_GB=0 \
-  src_run -u DT_HOST_GATEWAY_IP "$DEPLOY" "$RUN_DEPLOY" 2>&1)"; rc=$?
+out="$(D4_PATH="${NORT_BIN}" dep)"; rc=$?
 assert_status "deploy-prerequisite-missing-token" "DEPLOY_FAILED REASON=prerequisite-missing WORKLOADS=-" "$out"
 assert_rc "deploy-prerequisite-missing-one-line" 1 "$(grep -c '^DEPLOY_FAILED' <<< "$out")"
 assert_status "deploy-prerequisite-missing-names-runtime" "a container runtime (podman or docker) is not installed" "$out"
@@ -2642,8 +2775,7 @@ for t in bash awk grep sed sort mktemp cat cut head tail tr sha256sum date dirna
   ln -sf "$(command -v "$t")" "$NOTO_BIN/$t"
 done
 reset_marks
-out="$(PATH="${NOTO_BIN}" TMPDIR="$RWORK" DT_CLUSTER_NAME=d4cluster DEVLOOP_MIN_DISK_GB=0 \
-  src_run -u DT_HOST_GATEWAY_IP "$DEPLOY" "$RUN_DEPLOY" 2>&1)"; rc=$?
+out="$(D4_PATH="${NOTO_BIN}" dep)"; rc=$?
 assert_status "deploy-no-timeout-prerequisite-missing" "DEPLOY_FAILED REASON=prerequisite-missing WORKLOADS=-" "$out"
 assert_status "deploy-no-timeout-names-it" "timeout is not installed" "$out"
 assert_absent "deploy-no-timeout-never-runtime-unreachable" "runtime-unreachable" "$out"
@@ -2658,7 +2790,7 @@ assert_status "deploy-migration-failure-step-line" "DEPLOY_FAILED REASON=step-fa
 assert_status "deploy-migration-failure-own-banner" "REASON=migration-failed" "$out"
 # `kind get clusters` failing is UNREADABLE, never "missing".
 reset_marks
-out="$(PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" DT_CLUSTER_NAME=d4cluster STUB_KIND_LIST_FAIL=1 bash "$DEPLOY" 2>&1)"; rc=$?
+out="$(STUB_KIND_LIST_FAIL=1 d4 run_main "$DEPLOY" 2>&1)"; rc=$?
 assert_rc "deploy-kind-list-fail-rc" 1 "$rc"
 assert_status "deploy-kind-list-fail-unreadable" "DEPLOY_FAILED REASON=blueprint-unreadable" "$out"
 assert_absent "deploy-kind-list-fail-not-missing" "blueprint-missing" "$out"
@@ -2674,12 +2806,14 @@ assert_status "deploy-node-has-ref-others-still-loaded" "save localhost/mc-servi
 # THE NODE when absent, skipped when present, and FATAL at a named step when it cannot be had.
 DEBUG_IMG="$(bash -c 'source "$1" >/dev/null 2>&1; printf %s "$MH_DEBUG_IMAGE"' _ "${REPO_ROOT}/infra/kind/scripts/mh.sh")"
 assert_rc "deploy-debug-image-read-non-vacuous" 0 "$([[ "$DEBUG_IMG" =~ @sha256:[0-9a-f]{64}$ ]] && echo 0 || echo "1 (${DEBUG_IMG})")"
+# Cold / warm are the step's own behaviour (dstep); the FATAL cases stay end to end: main
+# must stop BEFORE the build.
 reset_marks
-out="$(STUB_JOBS="$JOBS_OK" dep)"; rc=$?
+out="$(dstep preload_debug_image)"; rc=$?
 assert_rc "deploy-debug-image-cold-rc" 0 "$rc"
 assert_rc "deploy-debug-image-cold-node-pulls-the-pinned-ref" "$DEBUG_IMG" "$(cat "${MARK}/node-pull.calls" 2>/dev/null)"
 reset_marks
-out="$(STUB_JOBS="$JOBS_OK" STUB_NODE_HAS="$DEBUG_IMG" dep)"; rc=$?
+out="$(STUB_NODE_HAS="$DEBUG_IMG" dstep preload_debug_image)"; rc=$?
 assert_rc "deploy-debug-image-warm-rc" 0 "$rc"
 assert_no_marker "deploy-debug-image-warm-no-pull" "$MARK" "node-pull.calls"
 for knob in STUB_NODE_PULL_FAIL STUB_NODE_PULL_INVISIBLE; do
@@ -2717,8 +2851,7 @@ RUN_GUARDED='PROVISION_SH="${ARGS[0]}"; main'
 for reason in changed missing unreadable; do
   reset_marks
   # Run as the devloop helper does, so the remedy is the container's command.
-  out="$(PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" DT_CLUSTER_NAME=d4cluster STUB_BP_REASON="$reason" \
-    DT_CALLER=devloop-helper src_run "$DEPLOY" "$RUN_GUARDED" "$PSTUB" 2>&1)"; rc=$?
+  out="$(STUB_BP_REASON="$reason" DT_CALLER=devloop-helper d4 src_run "$DEPLOY" "$RUN_GUARDED" "$PSTUB" 2>&1)"; rc=$?
   assert_rc "deploy-guard-${reason}-rc" 1 "$([[ "$rc" -ne 0 ]] && echo 1 || echo 0)"
   assert_status "deploy-guard-${reason}-token" "DEPLOY_FAILED REASON=blueprint-${reason}" "$out"
   assert_status "deploy-guard-${reason}-names-provision" "dev-cluster provision" "$out"
@@ -2727,23 +2860,21 @@ for reason in changed missing unreadable; do
 done
 # The same guard run by a person on the host names the host command, not the container's.
 reset_marks
-out="$(PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" DT_CLUSTER_NAME=d4cluster STUB_BP_REASON=changed \
-  src_run -u DT_CALLER "$DEPLOY" "$RUN_GUARDED" "$PSTUB" 2>&1)"
+out="$(STUB_BP_REASON=changed d4 src_run -u DT_CALLER "$DEPLOY" "$RUN_GUARDED" "$PSTUB" 2>&1)"
 assert_status "deploy-guard-host-names-setup" "./infra/kind/scripts/setup.sh" "$out"
 assert_absent "deploy-guard-host-not-container-cmd" "dev-cluster provision" "$out"
 reset_marks
-out="$(PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" DT_CLUSTER_NAME=d4cluster DEVLOOP_MIN_DISK_GB=0 DT_JOB_POLL_SECONDS=0 STUB_BP_REASON=match STUB_JOBS="$JOBS_OK" \
-  DT_MH_SH="$D4_MH" src_run -u DT_HOST_GATEWAY_IP -u DT_KIND_CONFIG "$DEPLOY" "$RUN_GUARDED" "$PSTUB" 2>&1)"; rc=$?
+out="$(STUB_BP_REASON=match STUB_JOBS="$JOBS_OK" d4 src_run "$DEPLOY" "$RUN_GUARDED" "$PSTUB" 2>&1)"; rc=$?
 assert_rc "deploy-guard-match-proceeds" 0 "$rc"
 # No cluster at all: fails before the check, still naming provision, building nothing.
 reset_marks
-out="$(PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" DT_CLUSTER_NAME=nosuchcluster bash "$DEPLOY" 2>&1)"; rc=$?
+out="$(D4_CLUSTER=nosuchcluster d4 run_main "$DEPLOY" 2>&1)"; rc=$?
 assert_rc "deploy-no-cluster-rc" 1 "$rc"
 assert_status "deploy-no-cluster-token" "DEPLOY_FAILED REASON=blueprint-missing" "$out"
 assert_rc "deploy-no-cluster-builds-nothing" 0 "$([[ -z "$(builds)" ]] && echo 0 || echo "1 ($(builds))")"
 # The retired flags are rejected, never silently ignored.
 for f in --only --skip-build --rebuild-all; do
-  bash "$DEPLOY" "$f" >/dev/null 2>&1; assert_rc "deploy-rejects-retired${f}" 1 $?
+  d4 run_main "$DEPLOY" "$f" >/dev/null 2>&1; assert_rc "deploy-rejects-retired${f}" 1 $?
   bash "$SETUP" "$f" >/dev/null 2>&1; assert_rc "setup-rejects-retired${f}" 1 $?
 done
 
@@ -3307,8 +3438,7 @@ fi
 
 # --- An empty --iidfile never becomes a guessed tag ------------------------------------------
 reset_marks
-out="$(PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" DEVLOOP_MIN_DISK_GB=0 STUB_IID="" \
-  src_run "$DEPLOY" 'KIND_EXPERIMENTAL_PROVIDER=podman; build_content_tagged_image localhost/gc-service' 2>&1)"; rc=$?
+out="$(STUB_IID="" d4 src_run "$DEPLOY" 'KIND_EXPERIMENTAL_PROVIDER=podman; build_content_tagged_image localhost/gc-service' 2>&1)"; rc=$?
 assert_rc "iidfile-empty-fails" 1 "$rc"
 assert_status "iidfile-empty-says-so" "wrote no image ID" "$out"
 assert_absent "iidfile-empty-never-tags" "tag " "$(cat "${MARK}/podman.calls" 2>/dev/null | grep -v '^build')"
@@ -3319,14 +3449,12 @@ PREBUILT="${WORK}/prebuilt-images.txt"
 RUN_PREBUILT='KIND_EXPERIMENTAL_PROVIDER=podman; build_content_tagged_image localhost/gc-service && echo "ref=${BUILT_REFS[localhost/gc-service]}"'
 printf 'localhost/gc-service %s\n' "$LOCAL_IID" > "$PREBUILT"
 reset_marks
-out="$(PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" DT_PREBUILT_IMAGES="$PREBUILT" STUB_LOCAL_IMAGES="$LOCAL_IID" \
-  src_run "$DEPLOY" "$RUN_PREBUILT" 2>&1)"; rc=$?
+out="$(DT_PREBUILT_IMAGES="$PREBUILT" STUB_LOCAL_IMAGES="$LOCAL_IID" d4 src_run "$DEPLOY" "$RUN_PREBUILT" 2>&1)"; rc=$?
 assert_rc "prebuilt-local-id-ok" 0 "$rc"
 assert_status "prebuilt-local-id-content-tagged" "ref=localhost/gc-service:sha-cccccccccccccccc" "$out"
 assert_rc "prebuilt-local-id-never-pulls-or-builds" 0 "$([[ -z "$(grep -sE '^(pull|build)' "${MARK}/podman.calls")" ]] && echo 0 || echo 1)"
 reset_marks
-out="$(PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" DT_PREBUILT_IMAGES="$PREBUILT" STUB_LOCAL_IMAGES="" \
-  src_run "$DEPLOY" "$RUN_PREBUILT" 2>&1)"; rc=$?
+out="$(DT_PREBUILT_IMAGES="$PREBUILT" STUB_LOCAL_IMAGES="" d4 src_run "$DEPLOY" "$RUN_PREBUILT" 2>&1)"; rc=$?
 assert_rc "prebuilt-local-id-absent-fails" 1 "$rc"
 assert_status "prebuilt-local-id-absent-says-so" "is not in the local store" "$out"
 assert_rc "prebuilt-local-id-absent-never-pulls-or-builds" 0 "$([[ -z "$(grep -sE '^(pull|build)' "${MARK}/podman.calls")" ]] && echo 0 || echo 1)"
@@ -3334,8 +3462,7 @@ assert_rc "prebuilt-local-id-absent-never-pulls-or-builds" 0 "$([[ -z "$(grep -s
 for bad in "ghcr.io/o/dark-tower-ci/gc-service:git-x" "sha256:cccc" "@${LOCAL_IID}"; do
   printf 'localhost/gc-service %s\n' "$bad" > "$PREBUILT"
   reset_marks
-  out="$(PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" DT_PREBUILT_IMAGES="$PREBUILT" STUB_LOCAL_IMAGES="$LOCAL_IID" \
-    src_run "$DEPLOY" "$RUN_PREBUILT" 2>&1)"; rc=$?
+  out="$(DT_PREBUILT_IMAGES="$PREBUILT" STUB_LOCAL_IMAGES="$LOCAL_IID" d4 src_run "$DEPLOY" "$RUN_PREBUILT" 2>&1)"; rc=$?
   assert_rc "prebuilt-unpinned-refused (${bad})" 1 "$rc"
   assert_status "prebuilt-unpinned-says-so (${bad})" "refusing to build or guess" "$out"
 done
@@ -3344,6 +3471,64 @@ done
 entry_code="$(grep -vE '^[[:space:]]*#' "${REPO_ROOT}/infra/devloop/entrypoint.sh")"
 assert_absent "entrypoint-has-no-sqlx-migrate" "sqlx migrate" "$entry_code"
 assert_absent "entrypoint-has-no-masked-migration" "may already be applied" "$entry_code"
+
+# === (H) the host seal + the e2e run budget (whole-suite invariants) ==========================
+# A deploy.sh kubectl call that misses its stub reaches NO kubeconfig: not an ambient
+# KUBECONFIG (the devloop container exports a REAL one) and not $HOME/.kube (a decoy here).
+assert_rc "kubeconfig-sealed-to-a-missing-file" 0 "$([[ "${KUBECONFIG:-}" == "${WORK}/no-such-kubeconfig" && ! -e "$KUBECONFIG" ]] && echo 0 || echo "1 (KUBECONFIG=${KUBECONFIG:-unset})")"
+DECOY_HOME="${WORK}/decoy-home"; mkdir -p "${DECOY_HOME}/.kube"
+cat > "${DECOY_HOME}/.kube/config" <<'KCFG'
+apiVersion: v1
+kind: Config
+clusters: [{name: decoy, cluster: {server: "https://127.0.0.1:1"}}]
+contexts: [{name: kind-d4cluster, context: {cluster: decoy, user: decoy}}]
+current-context: kind-d4cluster
+users: [{name: decoy, user: {}}]
+KCFG
+KCFG_PROBE='${KUBECTL} config view --minify -o jsonpath="{.clusters[0].cluster.server}"'
+# Positive control: the SAME probe, unsealed, DOES read a kubeconfig (the decoy) — so kubectl is
+# on the sealed PATH, KUBECTL resolves and the probe works; without this, a missing kubectl
+# (rc 127, no decoy URL) would read as "sealed". `config view` never contacts the server.
+out="$(HOME="$DECOY_HOME" DT_CLUSTER_NAME=d4cluster src_run -u KUBECONFIG "$DEPLOY" "$KCFG_PROBE" 2>&1)"; rc=$?
+assert_rc "kubeconfig-probe-positive-control-rc" 0 "$rc"
+assert_status "kubeconfig-probe-positive-control-reads-decoy" "https://127.0.0.1:1" "$out"
+out="$(HOME="$DECOY_HOME" DT_CLUSTER_NAME=d4cluster src_run "$DEPLOY" "$KCFG_PROBE" 2>&1)"; rc=$?
+assert_rc "kubeconfig-sealed-stubless-kubectl-fails-closed" 1 "$([[ "$rc" -ne 0 ]] && echo 1 || echo 0)"
+assert_absent "kubeconfig-sealed-decoy-home-not-read" "https://127.0.0.1:1" "$out"
+
+# src_run -t kills the WHOLE process group of a timed-out run: a background child (a stub) must
+# not outlive it. A `--foreground` or `setsid` added to the bound would leave it running.
+pidf="${WORK}/src-run-t-child.pid"
+src_run -t 1 "$LIB_COMMON" 'sleep 30 & echo $! > "${ARGS[0]}"; wait' "$pidf" >/dev/null 2>&1; rc=$?
+assert_rc "src-run-t-times-out" 124 "$rc"
+child="$(cat "$pidf" 2>/dev/null)"
+for _ in $(seq 1 60); do [[ -n "$child" ]] && kill -0 "$child" 2>/dev/null || break; sleep 0.1; done
+assert_rc "src-run-t-kills-the-whole-group" 0 "$([[ "$child" =~ ^[0-9]+$ ]] && ! kill -0 "$child" 2>/dev/null && echo 0 || echo "1 (child '${child}' still alive or never started)")"
+[[ ! "$child" =~ ^[0-9]+$ ]] || kill "$child" 2>/dev/null
+
+# The e2e run budget (E2E_BUDGET, beside src_run): main runs counted == budget, per script.
+for sc in "${!E2E_BUDGET[@]}"; do
+  got="$(grep -c . "${E2E_DIR}/${sc}" 2>/dev/null || echo 0)"
+  if [[ "$got" == "${E2E_BUDGET[$sc]}" ]]; then PASS=$((PASS + 1)); else
+    FAIL=$((FAIL + 1))
+    FAILURES+=("[e2e-budget-${sc%.sh}] ${got} end-to-end runs of ${sc}'s main, budget ${E2E_BUDGET[$sc]}: e2e is for main's ORCHESTRATION only — call the step directly (dstep / ptrap / psrc). Converted a case? Lower the budget. A NEW orchestration assertion (step order, a stop point, the EXIT trap)? Raise E2E_BUDGET beside src_run, with a comment saying what it orchestrates.")
+  fi
+done
+# A recorded script with NO budget entry is a failure too, not an uncounted run: the tripwire
+# covers every script whose main this suite runs, not only the ones listed above.
+for rec in "$E2E_DIR"/*; do
+  [[ -e "$rec" ]] || continue
+  sc="${rec##*/}"
+  if [[ -n "${E2E_BUDGET[$sc]+set}" ]]; then PASS=$((PASS + 1)); else
+    FAIL=$((FAIL + 1))
+    FAILURES+=("[e2e-budget-unbudgeted] ${sc}: $(grep -c . "$rec") end-to-end main run(s), no E2E_BUDGET entry — call the step directly, or add ${sc} to E2E_BUDGET beside src_run with a comment saying what its runs orchestrate.")
+  fi
+done
+# ...and no run escapes the count: every executed `bash` run of a budgeted script goes through
+# run_main (a TTY case records itself by hand and is listed here).
+# Any spelling: "$DEPLOY", "${DEPLOY}", $DEPLOY, quoted or not.
+bypass="$(grep -nE "bash +[\"']?[\$][{]?(DEPLOY|PROV_COPY|PROVISION)([^A-Za-z0-9_]|$)" "${BASH_SOURCE[0]}" | grep -vE 'script -qec' || true)"
+assert_rc "e2e-budget-no-unrecorded-bash-run" 0 "$([[ -z "$bypass" ]] && echo 0 || echo "1 (${bypass//$'\n'/; })")"
 
 # === (G) a remedy names the command its caller can run ========================================
 # provision.sh/deploy.sh always run on the host; who reads the message differs. The devloop

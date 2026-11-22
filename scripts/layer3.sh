@@ -19,9 +19,9 @@ layer_lifecycle_begin 3
 
 # Every entry runs through run_and_emit (dry-reviewer F2) — single source of truth for
 # STATUS line emission + exit-code mapping — CONCURRENTLY: parallel_queue_run (_common.sh)
-# runs DEVLOOP_LAYER3_JOBS of them at a time (default 4; Layer 3 is bounded by its longest
-# suite, setup.test.sh, at that width) and replays each one's output in the order listed
-# here. That is only sound because every entry is hermetic: its own temp dirs, no fixed
+# runs DEVLOOP_LAYER3_JOBS of them at a time (default 4; the wall time is set by the latest
+# start + duration and by the serial sum / jobs — see HEAVIEST FIRST below) and replays each
+# one's output in the order listed here. That is only sound because every entry is hermetic: its own temp dirs, no fixed
 # shared path, no write to a real repo file. A suite that needs any of those must be fixed,
 # not added here.
 # The audit-suppressions guard is auto-discovered by run-guards.sh (simple/*.sh); its
@@ -38,13 +38,49 @@ layer_lifecycle_begin 3
 # consumes them — so do not "consolidate" that one here to match the pattern. The reasoning
 # lives once, at its invocation in compile.sh.
 {
-  parallel_queue_add "guards" "${__here}/guards/run-guards.sh"
-  parallel_queue_add "changed-helpers-test" "${__here}/lang/_changed_helpers.test.sh"
-  parallel_queue_add "audit-suppressions-selftest" "${__here}/audit-suppressions-check.test.sh"
-  parallel_queue_add "audit-gate-test" "${__here}/lang/_audit_gate.test.sh"
-  parallel_queue_add "ts-audit-decision-test" "${__here}/lang/ts/audit.test.sh"
-  parallel_queue_add "pnpm-helpers-test" "${__here}/lang/_pnpm.test.sh"
-  parallel_queue_add "layer7-selftest" "${__here}/layer7.test.sh"
+  # HEAVIEST FIRST (operations, 2026-11-22): the queue runs DEVLOOP_LAYER3_JOBS entries at a
+  # time, so the layer's wall time is about max(an entry's start + its duration, the serial sum /
+  # jobs); a slow entry registered late starts late and sets the wall. Re-rank from the
+  # per-entry lines a run prints: grep '^LAYER=3 STEP=' layer-3.stderr.log | sort -t= -k4 -n -r.
+  # Disk-guard self-test (envtest-infra-reliability devloop): forces
+  # check_build_disk_space's trip branch so the `REASON=insufficient-disk` operator contract
+  # (§6.7) is covered — Gate-2's rebuild only hits the guard's pass path. No cluster needed
+  # (real df, absurd DEVLOOP_MIN_DISK_GB).
+  parallel_queue_add "setup-disk-guard-selftest" "${__here}/setup.test.sh"
+  # Story-runner self-test (ADR-0035 §12): the runner drives unattended
+  # skip-permissions sessions and reaches `git reset --hard` + `git clean -fdq`
+  # from a classification decision, with zero tests before this file. Hermetic —
+  # real runner, throwaway fixture repo via the DEVLOOP_TEST-gated
+  # STORY_REPO_ROOT/DT_STORY seams; stub claude/sleep/date, real git, real
+  # dt-story. No cluster, no network, no real sessions.
+  parallel_queue_add "run-story-selftest" "${__here}/workflow/run-story.test.sh"
+  # Frame-vector drift guard SELF-TEST (story task 8, extended at task 15). The
+  # guard itself is auto-discovered by run-guards.sh (the `guards` entry) and passes on every
+  # devloop — but a passing guard exercises none of its failure branches, and
+  # those branches are its entire value. This drives every vacuity PRECONDITION,
+  # every VIOLATION, and all four g14 arms.
+  #
+  # NO CASE COUNT HERE ON PURPOSE. It used to say "all 33" against an actual 41,
+  # having drifted by eight without anything noticing — two encodings of one
+  # number, which is the defect this whole guard family exists to prevent. The
+  # count now lives in exactly one place, `EXPECTED_CASES` inside the suite, which
+  # fails loudly if the tally moves.
+  #
+  # Since task 15 both codecs are gated in tree, so g14's ungated arms describe a
+  # state the repository has LEFT BEHIND and the fixtures synthesize it. That
+  # includes `todo-tracking-entry-missing`, whose guard branch is now unreachable
+  # on any real run — this suite is its only exerciser.
+  #
+  # Two arms exist because the obvious "fixes" are wrong: making g14 exit nonzero
+  # while a codec was ungated would have made DELETING the guard the fastest route
+  # to green, and a guard that redded on the fully-gated end state would only have
+  # been discovered when reaching it. It also pins that the banner keeps its
+  # `^WARN ` prefix, which run-guards.sh's exit-0 arm greps for —
+  # run-guards.test.sh's stub is synthetic and cannot reach that leg. Hermetic via
+  # the DEVLOOP_TEST-gated FRAME_VECTORS_ROOT seam; no cluster, no network, no
+  # cargo. Deliberately NOT under guards/simple/ for the same `find -name '*.sh'`
+  # reason as its neighbours above.
+  parallel_queue_add "frame-vectors-guard-selftest" "${__here}/guards/validate-frame-vectors.test.sh"
   # MH pool tool self-test (story 4 I-5): infra/kind/scripts/mh.sh's machine contract (one
   # MH_RESULT line, grouped exit codes, next-fit, the mh-pool Lease, drain/upgrade refusals) is
   # consumed by deploy.sh, the env-test mh_pool fixture and the ops runbook, and nothing calls the
@@ -53,6 +89,17 @@ layer_lifecycle_begin 3
   # doc's token list in both directions. Its groups run concurrently inside the suite (the
   # timeout cases wait real seconds), so its wall time is its longest group.
   parallel_queue_add "mh-pool-tool-selftest" "${__here}/../infra/kind/scripts/mh.test.sh"
+  parallel_queue_add "layer7-selftest" "${__here}/layer7.test.sh"
+  # Orchestrator lane-integrity (task #56): exercises layer-all's exit-code/summary/budget/
+  # bypass-closure behavior end-to-end via the DEVLOOP_TEST-gated LAYER_SCRIPT_DIR stub seam
+  # — the layer-all-level seams layer7.test.sh structurally cannot reach. No cluster.
+  parallel_queue_add "layer-all-orchestrator-test" "${__here}/layer-all.test.sh"
+  parallel_queue_add "guards" "${__here}/guards/run-guards.sh"
+  parallel_queue_add "changed-helpers-test" "${__here}/lang/_changed_helpers.test.sh"
+  parallel_queue_add "audit-suppressions-selftest" "${__here}/audit-suppressions-check.test.sh"
+  parallel_queue_add "audit-gate-test" "${__here}/lang/_audit_gate.test.sh"
+  parallel_queue_add "ts-audit-decision-test" "${__here}/lang/ts/audit.test.sh"
+  parallel_queue_add "pnpm-helpers-test" "${__here}/lang/_pnpm.test.sh"
   # Org-subdomain drift guard SELF-TEST (story R-7, task #3). The guard itself is
   # auto-discovered by run-guards.sh above and runs on every devloop — but a PASSING guard
   # exercises none of its failure branches, and those branches are its entire value: a check
@@ -94,19 +141,10 @@ layer_lifecycle_begin 3
   # are exercised here against synthetic roots. Deliberately NOT under guards/simple/ (the
   # find -name '*.sh' reason). No cluster.
   parallel_queue_add "counter-zero-init-selftest" "${__here}/guards/counter-zero-init.test.sh"
-  # Disk-guard self-test (envtest-infra-reliability devloop): forces
-  # check_build_disk_space's trip branch so the `REASON=insufficient-disk` operator contract
-  # (§6.7) is covered — Gate-2's rebuild only hits the guard's pass path. No cluster needed
-  # (real df, absurd DEVLOOP_MIN_DISK_GB).
-  parallel_queue_add "setup-disk-guard-selftest" "${__here}/setup.test.sh"
   # The Rust test verb (ADR-0038 devloop 2): dispatcher arg-passthrough, and the unit-test
   # DB migration failing LOUDLY before cargo (sqlx absent / migrate run failing) with a
   # positive control. PATH-shimmed cargo/sqlx/pg_isready; no DB, no real cargo.
   parallel_queue_add "rust-test-verb-selftest" "${__here}/lang/rust/behavior-equivalence.test.sh"
-  # Orchestrator lane-integrity (task #56): exercises layer-all's exit-code/summary/budget/
-  # bypass-closure behavior end-to-end via the DEVLOOP_TEST-gated LAYER_SCRIPT_DIR stub seam
-  # — the layer-all-level seams layer7.test.sh structurally cannot reach. No cluster.
-  parallel_queue_add "layer-all-orchestrator-test" "${__here}/layer-all.test.sh"
   # Long-running entry scripts (devloop.sh, run-story.sh) are wrapped `{ ... exit; }` so an
   # edit landing mid-run cannot shift bash's read offset. Static; no cluster.
   parallel_queue_add "parse-whole-script-test" "${__here}/parse-whole-script.test.sh"
@@ -123,13 +161,6 @@ layer_lifecycle_begin 3
   # or podman call; the happy path clones the PR head and pushes back through the exit menu.
   # Hermetic — real devloop.sh and git, bare fixture origin, PATH-stubbed gh/podman, no kind.
   parallel_queue_add "devloop-pr-selftest" "${__here}/../infra/devloop/devloop-pr.test.sh"
-  # Story-runner self-test (ADR-0035 §12): the runner drives unattended
-  # skip-permissions sessions and reaches `git reset --hard` + `git clean -fdq`
-  # from a classification decision, with zero tests before this file. Hermetic —
-  # real runner, throwaway fixture repo via the DEVLOOP_TEST-gated
-  # STORY_REPO_ROOT/DT_STORY seams; stub claude/sleep/date, real git, real
-  # dt-story. No cluster, no network, no real sessions.
-  parallel_queue_add "run-story-selftest" "${__here}/workflow/run-story.test.sh"
   # Devloop log reader self-test: a synthetic stream-json session pins each phase signal
   # against its false-positive twin, the view filters, and the follow loop moving to the
   # next task's log. Hermetic; no cluster.
@@ -147,33 +178,6 @@ layer_lifecycle_begin 3
   # NOT under guards/simple/ — run-guards.sh's `find simple -name '*.sh'` would auto-run it as
   # a guard too. No cluster.
   parallel_queue_add "run-guards-selftest" "${__here}/guards/run-guards.test.sh"
-  # Frame-vector drift guard SELF-TEST (story task 8, extended at task 15). The
-  # guard itself is auto-discovered by run-guards.sh above and passes on every
-  # devloop — but a passing guard exercises none of its failure branches, and
-  # those branches are its entire value. This drives every vacuity PRECONDITION,
-  # every VIOLATION, and all four g14 arms.
-  #
-  # NO CASE COUNT HERE ON PURPOSE. It used to say "all 33" against an actual 41,
-  # having drifted by eight without anything noticing — two encodings of one
-  # number, which is the defect this whole guard family exists to prevent. The
-  # count now lives in exactly one place, `EXPECTED_CASES` inside the suite, which
-  # fails loudly if the tally moves.
-  #
-  # Since task 15 both codecs are gated in tree, so g14's ungated arms describe a
-  # state the repository has LEFT BEHIND and the fixtures synthesize it. That
-  # includes `todo-tracking-entry-missing`, whose guard branch is now unreachable
-  # on any real run — this suite is its only exerciser.
-  #
-  # Two arms exist because the obvious "fixes" are wrong: making g14 exit nonzero
-  # while a codec was ungated would have made DELETING the guard the fastest route
-  # to green, and a guard that redded on the fully-gated end state would only have
-  # been discovered when reaching it. It also pins that the banner keeps its
-  # `^WARN ` prefix, which run-guards.sh's exit-0 arm greps for —
-  # run-guards.test.sh's stub is synthetic and cannot reach that leg. Hermetic via
-  # the DEVLOOP_TEST-gated FRAME_VECTORS_ROOT seam; no cluster, no network, no
-  # cargo. Deliberately NOT under guards/simple/ for the same `find -name '*.sh'`
-  # reason as its neighbours above.
-  parallel_queue_add "frame-vectors-guard-selftest" "${__here}/guards/validate-frame-vectors.test.sh"
   # dev-web preflight contract self-test (release-premise-and-preflight-guards devloop):
   # pins the WARN→HARD-FAIL escalation of the MC/MH WebTransport checks, which an
   # exit-code assertion structurally CANNOT pin — `check_port` sets HARD_FAIL without
