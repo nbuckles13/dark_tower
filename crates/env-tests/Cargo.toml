@@ -111,7 +111,7 @@ serial_test = "4.0"
 # (`src/resilience_hygiene.rs`): attribute order, `serial(group)` and
 # `serial_test::serial` must not defeat it, which a line grep cannot promise.
 # Already in Cargo.lock (proc-macro dependency of the workspace).
-syn = { version = "2", features = ["full", "visit"] }
+syn = { version = "3", features = ["full", "visit"] }
 
 # Time utilities for timestamp checks
 chrono = { workspace = true }
