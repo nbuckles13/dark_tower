@@ -242,7 +242,7 @@ regex = "1.10"
 serde_norway = "0.9.42"
 
 # Testing
-criterion = "0.5"
+criterion = "0.8"
 wiremock = "0.6"
 tempfile = "3"
 assert_cmd = "2"
